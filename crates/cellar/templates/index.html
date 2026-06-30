@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Registry · Cellar · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/" aria-label="HOLDFAST Registry">
+        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
+        <span class="brand__word">HOLDFAST</span>
+      </a>
+      <div class="topbar__right">{{USERBOX}}</div>
+    </div>
+  </header>
+
+  <main class="console">
+    <div class="console__head">
+      <h1>Container registry</h1>
+      <p class="sub">A sovereign OCI registry for the keep. Sign in to browse images; push and pull
+        over the Docker Registry V2 protocol with <code>docker login {{HOST}}</code>.</p>
+    </div>
+
+    <div class="cmd-strip">
+      <span class="cmd-label">Endpoint</span>
+      <code>{{HOST}}</code>
+      <span class="cmd-label">Push</span>
+      <code>docker push {{HOST}}/&lt;name&gt;:&lt;tag&gt;</code>
+    </div>
+
+    <div class="section-head">
+      <h2>Repositories</h2>
+      <span class="count-badge">{{COUNT}}</span>
+    </div>
+
+    <div class="table-wrap">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th>Images</th>
+            <th>Tags</th>
+            <th>Size</th>
+            <th>Last pushed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ROWS}}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>

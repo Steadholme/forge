@@ -1,0 +1,33 @@
+[package]
+name = "forge"
+version = "0.1.0"
+edition = "2021"
+description = "Forge — one deployable hosting the HOLDFAST devplatform surfaces (git forge / container registry / infrastructure catalog) behind a Host-based vhost demux. Each surface keeps its own database, routes, subdomain and on-disk data volume; this binary just composes the three library crates so the estate runs one container instead of three."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+# The three devplatform surfaces, vendored as path-dep library crates and reused VERBATIM (their
+# code, schemas, routes, templates and tests are unchanged). Forge only adds the vhost demux, so
+# each surface behaves exactly as its standalone service did — Loom still serves git smart-HTTP
+# under /git/, Cellar still speaks the Docker Registry V2 protocol under /v2/ with its OWN Basic
+# auth, and Atlas still reads the gateway routes table read-only.
+loom = { path = "crates/loom" }
+cellar = { path = "crates/cellar" }
+atlas = { path = "crates/atlas" }
+
+# HTTP framework — the outer Host-demux router + the per-surface routers returned by each crate's
+# `app()`. Same axum the surfaces use.
+axum = "0.8"
+# Async runtime: connect/migrate the three Postgres stores at startup, open Cellar's blob volume,
+# ensure Loom's repos root, start Atlas's audit emitter, then serve. `net` backs the dependency-free
+# `healthcheck` subcommand's loopback probe; `fs` ensures the on-disk data roots exist.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "fs"] }
+# `ServiceExt::oneshot` drives the chosen per-surface Router for one request inside the demux.
+tower = { version = "0.5", features = ["util"] }
+# Structured logging (shared with the surfaces).
+tracing = "0.1"
+tracing-subscriber = "0.3"

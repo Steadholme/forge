@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Topology · Atlas</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+{{TOPBAR}}
+<main class="console">
+  <div class="console__head console__head--row">
+    <div>
+      <h1>Estate Topology</h1>
+      <p class="sub">The gateway at the center, with one edge to each of the {{COUNT}} upstream services — colored by auth mode.</p>
+    </div>
+    <a class="btn btn-secondary" href="/">Catalog</a>
+  </div>
+  <section class="card">
+    <div class="card__body">
+      <div class="topology-wrap">
+        {{SVG}}
+      </div>
+      <div class="legend">
+        <span class="legend__item"><span class="legend__swatch" style="background:#4F46E5"></span> SSO</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:#16A34A"></span> Public</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:#D97706"></span> Bearer</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:#64748B"></span> Other</span>
+      </div>
+    </div>
+  </section>
+</main>
+</body>
+</html>

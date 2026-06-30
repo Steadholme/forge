@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Catalog · Atlas · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+{{TOPBAR}}
+<main class="console">
+  <div class="console__head console__head--row">
+    <div>
+      <h1>Estate Catalog</h1>
+      <p class="sub">Every public service in the HOLDFAST estate — discovered from the gateway route table, overlaid with live status and operator notes.</p>
+    </div>
+    <div class="console__actions">
+      <a class="btn btn-secondary" href="/graph">Topology</a>
+      <a class="btn btn-ghost" href="/api/inventory">Inventory JSON</a>
+    </div>
+  </div>
+  {{BANNER}}
+  {{SUMMARY}}
+  <div class="svc-grid">
+    {{SERVICES}}
+  </div>
+</main>
+</body>
+</html>

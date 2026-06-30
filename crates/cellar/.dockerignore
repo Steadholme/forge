@@ -1,0 +1,11 @@
+# Build artifacts and VCS — never needed in the build context.
+target/
+data/
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+**/*.rs.bk
+.DS_Store
+*.swp

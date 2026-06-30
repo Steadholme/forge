@@ -1,0 +1,11 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local blob volume (dev)
+/data
+
+# Editor / OS
+.DS_Store
+*.swp

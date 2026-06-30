@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{DISPLAY_NAME}} · Atlas</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+{{TOPBAR}}
+<main class="console console--narrow">
+  <a class="back-link" href="/">&larr; Back to the catalog</a>
+  <div class="console__head console__head--row">
+    <div>
+      <h1>{{DISPLAY_NAME}}</h1>
+      <p class="sub"><span class="svc-card__key">{{KEY}}</span> &middot; annotation last edited {{UPDATED}}</p>
+    </div>
+    <div>{{STATUS_PILL}}</div>
+  </div>
+
+  <section class="card">
+    <div class="card__body">
+      <h2 class="card__title">Public routes</h2>
+      <table class="rtable">
+        <thead><tr><th>Public URL</th><th>Auth</th><th>WAF</th></tr></thead>
+        <tbody>{{ROUTES}}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card__body">
+      <h2 class="card__title">Operator annotation</h2>
+      <p class="sub">Metadata layered over the discovered service. Saved to the Atlas catalog (not the gateway).</p>
+      <form class="editor" method="post" action="/api/annotate">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <input type="hidden" name="key" value="{{KEY}}">
+        <div class="field">
+          <label for="display_name">Display name</label>
+          <input type="text" id="display_name" name="display_name" maxlength="256" placeholder="{{KEY}}" value="{{F_DISPLAY}}">
+          <p class="hint">Also used to match this service to a Beacon status component.</p>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="owner">Owner</label>
+            <input type="text" id="owner" name="owner" maxlength="256" placeholder="team / person" value="{{F_OWNER}}">
+          </div>
+          <div class="field">
+            <label for="tier">Tier</label>
+            <input type="text" id="tier" name="tier" maxlength="256" placeholder="content / security / core" value="{{F_TIER}}">
+          </div>
+        </div>
+        <div class="field">
+          <label for="notes">Notes</label>
+          <textarea id="notes" name="notes" class="editor__body editor__body--short" maxlength="4096" placeholder="What is this service for? Dependencies, runbook links, caveats&hellip;">{{F_NOTES}}</textarea>
+        </div>
+        <div class="editor__actions">
+          <button class="btn btn-primary" type="submit">Save annotation</button>
+          <a class="btn btn-ghost" href="/">Cancel</a>
+        </div>
+      </form>
+    </div>
+  </section>
+</main>
+</body>
+</html>
