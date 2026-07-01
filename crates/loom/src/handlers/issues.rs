@@ -224,7 +224,11 @@ fn render_issue_row(repo: &Repo, issue: &Issue, csrf: &str) -> String {
     let body = if issue.body.trim().is_empty() {
         String::new()
     } else {
-        format!("<p class=\"issue-item__body\">{}</p>", esc(&issue.body))
+        // Sanitised markdown (raw HTML downgraded to text, unsafe link schemes defused).
+        format!(
+            "<div class=\"issue-item__body markdown-body\">{}</div>",
+            crate::markdown::render(&issue.body)
+        )
     };
     format!(
         r##"<li class="issue-item">

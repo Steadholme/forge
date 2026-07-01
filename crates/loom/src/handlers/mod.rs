@@ -8,8 +8,10 @@
 //!
 //! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
 //! matching the HOLDFAST enterprise brand. All producer-supplied text (repo names, descriptions,
-//! file contents, commit subjects, issue bodies) is HTML-escaped on render — Loom injects NO raw
-//! HTML and serves no executable file content from the browser-facing surface.
+//! file contents, commit subjects) is HTML-escaped on render. Markdown surfaces (README files,
+//! `.md` blobs, issue bodies) are rendered through the sanitising [`crate::markdown`] pipeline
+//! (raw HTML downgraded to text, unsafe link schemes defused) — Loom serves no executable file
+//! content from the browser-facing surface.
 
 pub mod health;
 pub mod issues;

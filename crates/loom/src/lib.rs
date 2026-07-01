@@ -19,6 +19,7 @@ pub mod config;
 pub mod error;
 pub mod gitops;
 pub mod handlers;
+pub mod markdown;
 pub mod model;
 pub mod store;
 

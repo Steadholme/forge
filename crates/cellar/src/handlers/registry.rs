@@ -20,12 +20,12 @@ use axum::response::{IntoResponse, Response};
 use crate::auth::{check_basic, Cred};
 use crate::digest::{is_valid_digest, sha256_digest};
 use crate::error::{RegError, API_VERSION};
-use crate::model::ManifestRec;
+use crate::model::{is_manifest_media_type, ManifestRec, MEDIA_OCI_MANIFEST};
 use crate::names::{is_valid_name, is_valid_reference, reference_is_digest};
 use crate::{now_secs, AppState};
 
 /// Default manifest media type when a `PUT` omits `Content-Type` (rare — clients always send it).
-const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+const DEFAULT_MANIFEST_TYPE: &str = MEDIA_OCI_MANIFEST;
 
 const H_CONTENT_DIGEST: &str = "docker-content-digest";
 const H_UPLOAD_UUID: &str = "docker-upload-uuid";
@@ -303,6 +303,16 @@ async fn handle(
                 .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| DEFAULT_MANIFEST_TYPE.to_string());
+
+            // Accept only real manifest media types: single-platform image manifests AND the
+            // multi-arch manifest-list / image-index types (so `docker push` of a multi-arch build
+            // stores its index verbatim and `docker pull` on any arch resolves it). Anything else
+            // is not a manifest.
+            if !is_manifest_media_type(&media_type) {
+                return Err(RegError::ManifestInvalid(format!(
+                    "unsupported manifest media type {media_type}"
+                )));
+            }
 
             // A push BY DIGEST must match the body's actual digest.
             if reference_is_digest(&reference) && reference != digest {

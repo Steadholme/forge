@@ -168,6 +168,133 @@ async fn full_push_pull_lifecycle() {
     assert!(detail.text().contains("docker pull"));
 }
 
+/// PUT a manifest body at `reference` with an explicit `Content-Type`.
+async fn put_manifest(
+    app: &axum::Router,
+    name: &str,
+    reference: &str,
+    ctype: &str,
+    body: &str,
+) -> Resp {
+    send(
+        app,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/v2/{name}/manifests/{reference}"))
+            .header(header::CONTENT_TYPE, ctype)
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+/// A minimal single-platform OCI image manifest whose config+layer sizes sum to a known value.
+fn image_manifest(cfg_size: u32, layer_size: u32) -> String {
+    format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{c:064x}","size":{cfg_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{l:064x}","size":{layer_size}}}]}}"#,
+        c = cfg_size,
+        l = layer_size,
+        cfg_size = cfg_size,
+        layer_size = layer_size,
+    )
+}
+
+/// `docker buildx --push` of a multi-arch build: the per-arch image manifests go up BY DIGEST, then
+/// the image index goes up BY TAG. A `docker pull` on any arch fetches the index, picks its
+/// platform's child digest, and pulls that image manifest.
+#[tokio::test]
+async fn multi_arch_index_push_pull() {
+    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+    const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+    const DOCKER_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
+
+    let app = app(build_dev_state());
+    let name = "library/multi";
+
+    // Repo must exist before a manifest push (docker uploads blobs first; here push one so the repo
+    // row is created, mirroring the real flow).
+    push_blob(&app, name, b"a real layer blob", None).await;
+
+    // 1. Push the two per-arch image manifests BY DIGEST.
+    let amd64 = image_manifest(100, 2000); // image_size == 2100
+    let arm64 = image_manifest(150, 3000); // image_size == 3150
+    let amd64_digest = sha256_digest(amd64.as_bytes());
+    let arm64_digest = sha256_digest(arm64.as_bytes());
+    for (digest, body) in [(&amd64_digest, &amd64), (&arm64_digest, &arm64)] {
+        let r = put_manifest(&app, name, digest, OCI_MANIFEST, body).await;
+        assert_eq!(r.status, StatusCode::CREATED, "child put: {}", r.text());
+        assert_eq!(r.header("docker-content-digest"), *digest);
+    }
+
+    // 2. Push the image index BY TAG, referencing the children + their platforms.
+    let index = format!(
+        r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[{{"mediaType":"{OCI_MANIFEST}","digest":"{amd}","size":{amdlen},"platform":{{"os":"linux","architecture":"amd64"}}}},{{"mediaType":"{OCI_MANIFEST}","digest":"{arm}","size":{armlen},"platform":{{"os":"linux","architecture":"arm64"}}}}]}}"#,
+        amd = amd64_digest,
+        arm = arm64_digest,
+        amdlen = amd64.len(),
+        armlen = arm64.len(),
+    );
+    let index_digest = sha256_digest(index.as_bytes());
+    let put_idx = put_manifest(&app, name, "latest", OCI_INDEX, &index).await;
+    assert_eq!(put_idx.status, StatusCode::CREATED, "index put: {}", put_idx.text());
+    assert_eq!(put_idx.header("docker-content-digest"), index_digest);
+
+    // 3. GET the index by tag -> exact bytes, stored index media type, digest header.
+    let get_idx = send(&app, req("GET", &format!("/v2/{name}/manifests/latest"), None, Vec::new())).await;
+    assert_eq!(get_idx.status, StatusCode::OK);
+    assert_eq!(get_idx.body, index.as_bytes());
+    assert_eq!(get_idx.header("content-type"), OCI_INDEX);
+    assert_eq!(get_idx.header("docker-content-digest"), index_digest);
+
+    // 3b. HEAD the index by tag (docker pull's existence probe) preserves the index media type.
+    let head_idx = send(&app, req("HEAD", &format!("/v2/{name}/manifests/latest"), None, Vec::new())).await;
+    assert_eq!(head_idx.status, StatusCode::OK);
+    assert_eq!(head_idx.header("content-type"), OCI_INDEX);
+
+    // 4. Arch selection: parse the index, then pull the arm64 child BY DIGEST.
+    let parsed: serde_json::Value = serde_json::from_slice(&get_idx.body).unwrap();
+    let picked = parsed["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["platform"]["architecture"] == "arm64")
+        .and_then(|m| m["digest"].as_str())
+        .unwrap();
+    assert_eq!(picked, arm64_digest);
+    let child = send(&app, req("GET", &format!("/v2/{name}/manifests/{picked}"), None, Vec::new())).await;
+    assert_eq!(child.status, StatusCode::OK);
+    assert_eq!(child.body, arm64.as_bytes());
+    assert_eq!(child.header("content-type"), OCI_MANIFEST);
+
+    // 5. A docker manifest list media type is also accepted.
+    let list = format!(
+        r#"{{"schemaVersion":2,"mediaType":"{DOCKER_LIST}","manifests":[{{"mediaType":"application/vnd.docker.distribution.manifest.v2+json","digest":"{amd}","size":{amdlen},"platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+        amd = amd64_digest,
+        amdlen = amd64.len(),
+    );
+    let put_list = put_manifest(&app, name, "listtag", DOCKER_LIST, &list).await;
+    assert_eq!(put_list.status, StatusCode::CREATED, "list put: {}", put_list.text());
+
+    // 6. The web console surfaces the multi-arch tag: badge, platforms, aggregate size (2100+3150).
+    let detail = send(&app, req("GET", &format!("/r/{name}"), None, Vec::new())).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    let html = detail.text();
+    assert!(html.contains("multi-arch"), "detail missing multi-arch badge");
+    assert!(html.contains("linux/amd64"), "detail missing amd64 platform");
+    assert!(html.contains("linux/arm64"), "detail missing arm64 platform");
+    assert!(html.contains("5.1 KB"), "detail missing aggregate multi-arch size: {html}");
+}
+
+/// A non-manifest `Content-Type` on a manifest `PUT` is rejected as MANIFEST_INVALID.
+#[tokio::test]
+async fn manifest_put_rejects_non_manifest_content_type() {
+    let app = app(build_dev_state());
+    push_blob(&app, "app", b"seed", None).await;
+    let r = put_manifest(&app, "app", "latest", "text/plain", "{}").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.text().contains("MANIFEST_INVALID"), "{}", r.text());
+}
+
 #[tokio::test]
 async fn pull_unknown_manifest_is_404() {
     let app = app(build_dev_state());

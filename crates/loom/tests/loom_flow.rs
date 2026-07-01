@@ -223,6 +223,90 @@ async fn web_create_repo_issues_and_xss_escaping() {
     assert!(after.body.contains("Closed"));
 }
 
+/// Run `git --git-dir=<dir> <args>` feeding `stdin`, asserting success; returns trimmed stdout.
+fn git_capture(git_dir: &str, args: &[&str], stdin: &str) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "safe.directory")
+        .env("GIT_CONFIG_VALUE_0", "*")
+        .env("GIT_AUTHOR_NAME", "Seed")
+        .env("GIT_AUTHOR_EMAIL", "seed@w33d.xyz")
+        .env("GIT_COMMITTER_NAME", "Seed")
+        .env("GIT_COMMITTER_EMAIL", "seed@w33d.xyz")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Seed a single flat commit (root-level files only) onto `branch` of a bare repo via plumbing.
+fn seed_repo(git_dir: &str, branch: &str, files: &[(&str, &str)]) {
+    let mut tree = String::new();
+    for (name, content) in files {
+        let oid = git_capture(git_dir, &["hash-object", "-w", "--stdin"], content);
+        tree.push_str(&format!("100644 blob {oid}\t{name}\n"));
+    }
+    let tree_oid = git_capture(git_dir, &["mktree"], &tree);
+    let commit = git_capture(git_dir, &["commit-tree", &tree_oid, "-m", "seed"], "");
+    git_capture(git_dir, &["update-ref", &format!("refs/heads/{branch}"), &commit], "");
+}
+
+#[tokio::test]
+async fn readme_renders_markdown_and_blob_is_line_numbered() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "docs", "").await;
+
+    let git_dir = git.repo_path("alice", "docs").to_string_lossy().to_string();
+    seed_repo(
+        &git_dir,
+        "main",
+        &[
+            (
+                "README.md",
+                "# Hello\n\nSome **bold** text.\n\n<script>alert(1)</script>\n",
+            ),
+            ("main.rs", "fn main() {\n    println!(\"hi\");\n}\n"),
+        ],
+    );
+
+    // Repo page renders the README as sanitised HTML (heading + emphasis are live markup).
+    let view = send(&app, get("/r/alice/docs", Some("alice"))).await;
+    assert_eq!(view.status, StatusCode::OK);
+    assert!(view.body.contains("<h1>Hello</h1>"), "README heading rendered");
+    assert!(view.body.contains("<strong>bold</strong>"));
+    // The raw <script> in the README must be neutralised, not served as live markup.
+    assert!(!view.body.contains("<script>alert(1)</script>"));
+    assert!(view.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+
+    // A non-markdown blob renders as a line-numbered, escaped monospace table.
+    let blob = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
+    assert_eq!(blob.status, StatusCode::OK);
+    assert!(blob.body.contains("blob-line__num"), "line-number gutter present");
+    assert!(blob.body.contains("println!"));
+
+    // A markdown blob view renders as sanitised HTML too.
+    let md = send(&app, get("/r/alice/docs/blob/README.md", Some("alice"))).await;
+    assert_eq!(md.status, StatusCode::OK);
+    assert!(md.body.contains("<h1>Hello</h1>"));
+    assert!(!md.body.contains("<script>alert(1)</script>"));
+}
+
 #[tokio::test]
 async fn private_repo_hidden_from_other_users() {
     let app = app(temp_state());

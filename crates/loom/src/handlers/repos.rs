@@ -4,8 +4,11 @@
 //! `X-Auth-Subject` / `X-Auth-Email`, which we trust (Loom is internal-only). The OWNER of a repo
 //! is ALWAYS the subject header — never a client field. Private repos are hidden from non-owners
 //! (a private repo a viewer cannot see returns 404, so existence does not leak). Every
-//! producer-supplied string — repo name, description, file path, file content, commit subject — is
-//! HTML-escaped on render; file content is shown inside an escaped `<pre>` and never as raw HTML.
+//! producer-supplied string — repo name, description, file path, commit subject — is HTML-escaped
+//! on render; a non-markdown text blob is shown in a line-numbered, escaped monospace view.
+//! Markdown (a `.md` blob + the repo README, plus issue bodies) is rendered through the estate's
+//! sanitising [`crate::markdown`] pipeline: raw HTML is downgraded to text and unsafe link schemes
+//! are defused, so no producer-supplied markup ever executes.
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -346,6 +349,13 @@ async fn render_code_page(
 
     let files = render_file_browser(repo, subpath, &entries);
 
+    // A rendered README under the file browser at the repo root (GitHub-style), sanitised.
+    let readme = if subpath.is_empty() {
+        render_readme(state, repo, &commit, &entries).await
+    } else {
+        String::new()
+    };
+
     // History + branches only at the repo root, to keep subdirectory pages focused.
     let extras = if subpath.is_empty() {
         let branches = state.git.branches(&repo.owner_sub, &repo.name).await;
@@ -401,7 +411,40 @@ async fn render_code_page(
         String::new()
     };
 
-    Ok(format!("{header}{files}{extras}"))
+    Ok(format!("{header}{files}{readme}{extras}"))
+}
+
+/// Render a repo-root README as sanitised markdown HTML (GitHub-style), or nothing when there is
+/// no README blob (or it is binary / too large to render). The README name is HTML-escaped; the
+/// body is rendered through [`crate::markdown::render`], which strips raw HTML and unsafe links.
+async fn render_readme(
+    state: &AppState,
+    repo: &Repo,
+    commit: &str,
+    entries: &[TreeEntry],
+) -> String {
+    let Some(entry) = entries.iter().find(|e| !e.is_dir() && is_readme(&e.name)) else {
+        return String::new();
+    };
+    let Some(bytes) = state
+        .git
+        .read_blob(&repo.owner_sub, &repo.name, commit, &entry.name)
+        .await
+    else {
+        return String::new();
+    };
+    if bytes.contains(&0) || bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    format!(
+        r##"<section class="card">
+  <div class="card__head"><h2>{name}</h2></div>
+  <div class="card__body markdown-body">{html}</div>
+</section>"##,
+        name = esc(&entry.name),
+        html = crate::markdown::render(&text),
+    )
 }
 
 /// Repo header: owner/name lockup, visibility badge, clone box, tab strip.
@@ -549,10 +592,19 @@ fn render_blob(repo: &Repo, base_url: &str, open_issues: i64, path: &str, bytes:
         )
     } else {
         let text = String::from_utf8_lossy(bytes);
-        format!(
-            "<div class=\"card__body card__body--code\"><pre class=\"code-pre\"><code>{}</code></pre></div>",
-            esc(&text)
-        )
+        if is_markdown_path(path) {
+            // A markdown file renders as sanitised HTML (raw HTML/unsafe links defused).
+            format!(
+                "<div class=\"card__body markdown-body\">{}</div>",
+                crate::markdown::render(&text)
+            )
+        } else {
+            // Any other text blob gets a monospace, line-numbered view.
+            format!(
+                "<div class=\"card__body card__body--code\">{}</div>",
+                render_text_blob(&text)
+            )
+        }
     };
     format!(
         r##"{header}
@@ -635,6 +687,38 @@ fn validate_branch_name(b: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// True when `path`'s final component has a markdown extension (`.md` / `.markdown`).
+fn is_markdown_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    name.ends_with(".md") || name.ends_with(".markdown")
+}
+
+/// True when `name` is a README file (`README`, `README.md`, `README.markdown`, …), case-insensitive.
+fn is_readme(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "readme" || lower.starts_with("readme.")
+}
+
+/// Render a text blob as a line-numbered, monospace table. Each line's content is HTML-escaped;
+/// the number gutter is generated, so it never contains producer input. A single trailing newline
+/// is dropped so the last line is not a spurious empty row.
+fn render_text_blob(text: &str) -> String {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut rows = String::new();
+    for (i, raw_line) in body.split('\n').enumerate() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        rows.push_str(&format!(
+            "<tr class=\"blob-line\">\
+               <td class=\"blob-line__num\">{n}</td>\
+               <td class=\"blob-line__code\">{code}</td>\
+             </tr>",
+            n = i + 1,
+            code = esc(line),
+        ));
+    }
+    format!("<table class=\"blob-code\"><tbody>{rows}</tbody></table>")
+}
+
 /// Human-readable byte size (B/KiB/MiB).
 fn human_size(bytes: i64) -> String {
     const KIB: i64 = 1024;
@@ -672,5 +756,34 @@ mod tests {
     fn size_formatting() {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KiB");
+    }
+
+    #[test]
+    fn markdown_path_detection() {
+        assert!(is_markdown_path("README.md"));
+        assert!(is_markdown_path("docs/GUIDE.Markdown"));
+        assert!(!is_markdown_path("src/main.rs"));
+        assert!(!is_markdown_path("Makefile"));
+    }
+
+    #[test]
+    fn readme_detection() {
+        assert!(is_readme("README.md"));
+        assert!(is_readme("readme"));
+        assert!(is_readme("Readme.markdown"));
+        assert!(!is_readme("READMEISH.txt"));
+        assert!(!is_readme("notes.md"));
+    }
+
+    #[test]
+    fn text_blob_is_line_numbered_and_escaped() {
+        let html = render_text_blob("let x = 1;\n<b>two</b>\n");
+        // Two lines, numbered 1 and 2 (the trailing newline does not add a third row).
+        assert!(html.contains(">1<"));
+        assert!(html.contains(">2<"));
+        assert!(!html.contains(">3<"));
+        // HTML metacharacters in the content are escaped, never live markup.
+        assert!(!html.contains("<b>two</b>"));
+        assert!(html.contains("&lt;b&gt;two&lt;/b&gt;"));
     }
 }

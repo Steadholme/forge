@@ -52,6 +52,10 @@ base64 = "0.22"
 # macros, so the build needs NO database. rustls TLS (no openssl). The same standard SQL later
 # runs unchanged on FusionDB over pgwire.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+# Sanitised CommonMark rendering for README.md + issue bodies. Same version/features as the
+# estate's content crates (agora/echo/inkwell): raw HTML is downgraded to text and unsafe link
+# schemes are defused over the event stream before serialisation — pure Rust, no C deps.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 [dev-dependencies]
 # ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).

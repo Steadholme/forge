@@ -17,7 +17,10 @@ use crate::error::WebError;
 use crate::handlers::{
     esc, fmt_ts, human_size, short_digest, userbox, APP_CSS, LAYERS_SVG, SHIELD_SVG,
 };
-use crate::model::{image_size, RepoSummary, TagDetail};
+use crate::model::{
+    image_size, index_child_digests, index_platforms, is_manifest_list, ManifestRec, RepoSummary,
+    TagDetail,
+};
 use crate::AppState;
 
 const INDEX_HTML: &str = include_str!("../../templates/index.html");
@@ -115,9 +118,7 @@ async fn repo_summaries(state: &AppState) -> Result<Vec<RepoSummary>, WebError> 
         let tags = state.store.tags_for(&repo.name).await?;
         let mut total_size = 0i64;
         for t in &tags {
-            if let Some(m) = manifests.iter().find(|m| m.digest == t.manifest_digest) {
-                total_size += image_size(&m.raw);
-            }
+            total_size += resolved_size(&manifests, &t.manifest_digest);
         }
         let last_pushed = manifests
             .iter()
@@ -147,17 +148,44 @@ async fn tag_details(state: &AppState, repo: &str) -> Result<Vec<TagDetail>, Web
         .into_iter()
         .map(|t| {
             let m = manifests.iter().find(|m| m.digest == t.manifest_digest);
+            let platforms = m
+                .filter(|m| is_manifest_list(&m.media_type))
+                .map(|m| index_platforms(&m.raw))
+                .unwrap_or_default();
             TagDetail {
                 tag: t.tag,
                 manifest_digest: t.manifest_digest.clone(),
                 media_type: m.map(|m| m.media_type.clone()).unwrap_or_default(),
-                size: m.map(|m| image_size(&m.raw)).unwrap_or(0),
+                size: resolved_size(&manifests, &t.manifest_digest),
+                platforms,
                 updated_at: t.updated_at,
             }
         })
         .collect();
     out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.tag.cmp(&b.tag)));
     Ok(out)
+}
+
+/// The content size a tag's manifest represents. For a single-platform image it is `image_size`;
+/// for a multi-arch index / manifest list it is the sum of its per-platform child image sizes
+/// (resolved from the manifests already loaded for the repo), falling back to the index document's
+/// own size when no children are present yet.
+fn resolved_size(manifests: &[ManifestRec], digest: &str) -> i64 {
+    let Some(m) = manifests.iter().find(|m| m.digest == digest) else {
+        return 0;
+    };
+    if is_manifest_list(&m.media_type) {
+        let mut total = 0i64;
+        for child in index_child_digests(&m.raw) {
+            if let Some(cm) = manifests.iter().find(|x| x.digest == child) {
+                total += image_size(&cm.raw);
+            }
+        }
+        if total > 0 {
+            return total;
+        }
+    }
+    image_size(&m.raw)
 }
 
 /// Strip the scheme from `PUBLIC_BASE_URL` to get the registry host used in `docker` commands.
@@ -240,6 +268,24 @@ fn render_repo(who: &Identity, name: &str, tags: &[TagDetail], host: &str, csrf:
         .replace("{{TAG_ROWS}}", &render_tag_rows(name, tags, csrf))
 }
 
+/// A "multi-arch" badge listing the platforms of an index / manifest-list tag; empty for a
+/// single-platform image. All platform labels come from the manifest and are HTML-escaped.
+fn arch_badge(platforms: &[String]) -> String {
+    if platforms.is_empty() {
+        return String::new();
+    }
+    let list = platforms.iter().map(|p| esc(p)).collect::<Vec<_>>().join(", ");
+    let label = match platforms.len() {
+        1 => "multi-arch · 1 platform".to_string(),
+        n => format!("multi-arch · {n} platforms"),
+    };
+    format!(
+        " <span class=\"badge\" title=\"{list}\">{label}</span>",
+        list = list,
+        label = esc(&label),
+    )
+}
+
 fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
     if tags.is_empty() {
         return "<tr class=\"empty-row\"><td colspan=\"5\">This repository has no tags.</td></tr>"
@@ -252,7 +298,7 @@ fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
                 "<tr>\
                    <td><span class=\"tag-pill\">{tag}</span></td>\
                    <td class=\"mono\" title=\"{digest_full}\">{digest_short}</td>\
-                   <td class=\"muted\">{mtype}</td>\
+                   <td class=\"muted\">{mtype}{arch}</td>\
                    <td class=\"num\">{size}</td>\
                    <td class=\"muted\">{date}</td>\
                    <td class=\"row-action\">\
@@ -268,6 +314,7 @@ fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
                 digest_full = esc(&t.manifest_digest),
                 digest_short = esc(&short_digest(&t.manifest_digest)),
                 mtype = esc(&t.media_type),
+                arch = arch_badge(&t.platforms),
                 size = esc(&human_size(t.size)),
                 date = esc(&fmt_ts(t.updated_at)),
                 tag_js = esc(&t.tag),
