@@ -89,41 +89,83 @@ pub fn redirect(location: &str) -> Response {
     (StatusCode::FOUND, [(header::LOCATION, location.to_string())]).into_response()
 }
 
-/// The right side of the app-bar: a page title, the service nav (repos / tokens), an "All apps"
-/// pill back to the apex portal, a user chip (avatar initial + signed-in email when known), and
-/// the cross-subdomain logout link. Shared by every page so the chrome stays identical.
-pub fn userbox(title: &str, email: Option<&str>) -> String {
-    // A user chip (avatar initial + email) is shown only when a gateway identity is known.
-    let chip = match email {
+/// Two-letter avatar initials from the signed-in email (falls back to a neutral glyph).
+fn initials(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or(email);
+    let mut parts = local
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty());
+    let a = parts.next().and_then(|s| s.chars().next());
+    let b = parts.next().and_then(|s| s.chars().next());
+    match (a, b) {
+        (Some(a), Some(b)) => format!("{}{}", a.to_uppercase(), b.to_uppercase()),
+        (Some(a), None) => a.to_uppercase().to_string(),
+        _ => "·".to_string(),
+    }
+}
+
+/// The Odyssey v2 avatar menu (CSS focus-within dropdown): an avatar + name button, and a popover
+/// listing Account, All apps, and the cross-subdomain sign-out link (a GET link, method preserved).
+fn user_menu(email: Option<&str>) -> String {
+    let (glyph, name_html, head_html) = match email {
         Some(e) if !e.is_empty() => {
-            let initial = e
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "H".to_string());
-            format!(
-                "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\">{}</span></span>",
-                esc(&initial),
-                esc(e),
+            let local = e.split('@').next().unwrap_or(e);
+            (
+                esc(&initials(e)),
+                format!("<span class=\"usermenu__name\">{}</span>", esc(e)),
+                format!("<b>{}</b><span>{}</span>", esc(local), esc(e)),
             )
         }
-        _ => String::new(),
+        _ => (
+            "·".to_string(),
+            String::new(),
+            "<b>Signed in</b><span>HOLDFAST estate</span>".to_string(),
+        ),
     };
     format!(
-        concat!(
-            "<span class=\"topbar__title\">{title}</span>",
-            "<a class=\"btn btn-ghost btn-sm\" href=\"/\">Repositories</a>",
-            "<a class=\"btn btn-ghost btn-sm\" href=\"/pats\">Tokens</a>",
-            "<a class=\"allapps\" href=\"https://w33d.xyz\" title=\"All apps\">",
-            "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">",
-            "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/>",
-            "<rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/></svg>All apps</a>",
-            "{chip}",
-            "<a class=\"btn btn-ghost btn-sm\" href=\"{LOGOUT_URL}\">Log out</a>",
-        ),
-        title = esc(title),
-        chip = chip,
+        r##"<div class="usermenu">
+  <button class="usermenu__btn" type="button" aria-haspopup="menu">
+    <span class="avatar" aria-hidden="true">{glyph}</span>{name}
+    <svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+  </button>
+  <div class="usermenu__pop" role="menu">
+    <div class="usermenu__head"><span class="avatar avatar--lg" aria-hidden="true">{glyph}</span><div>{head}</div></div>
+    <a class="menuitem" role="menuitem" href="https://account.w33d.xyz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Account</a>
+    <a class="menuitem" role="menuitem" href="https://w33d.xyz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
+    <a class="menuitem menuitem--danger" role="menuitem" href="{LOGOUT_URL}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Sign out</a>
+  </div>
+</div>"##,
+        glyph = glyph,
+        name = name_html,
+        head = head_html,
         LOGOUT_URL = LOGOUT_URL,
+    )
+}
+
+/// The Odyssey v2 app-bar: a brand lockup (Loom's git-branch tile + wordmark), the service nav
+/// (Repositories / Tokens, current marked `.is-active`), an "All apps" waffle to the apex portal,
+/// and the avatar menu. Shared by every page so the chrome stays identical across the estate.
+pub fn userbox(title: &str, email: Option<&str>) -> String {
+    let tokens_active = title == "Access tokens";
+    let repos_cls = if tokens_active { "appnav" } else { "appnav is-active" };
+    let tokens_cls = if tokens_active { "appnav is-active" } else { "appnav" };
+    format!(
+        r##"<a class="appbar__brand" href="/" aria-label="HOLDFAST Loom">
+  <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
+  <span class="appbar__name"><b>Loom</b><span>git.w33d.xyz</span></span>
+</a>
+<nav class="appbar__nav" aria-label="Loom sections">
+  <a class="{repos_cls}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>Repositories</a>
+  <a class="{tokens_cls}" href="/pats"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>Tokens</a>
+</nav>
+<div class="appbar__spacer"></div>
+<div class="appbar__right">
+  <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+  {user}
+</div>"##,
+        repos_cls = repos_cls,
+        tokens_cls = tokens_cls,
+        user = user_menu(email),
     )
 }
 

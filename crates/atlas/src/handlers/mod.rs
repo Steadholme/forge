@@ -32,45 +32,86 @@ pub fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// Render the shared app-bar: shield + HOLDFAST wordmark + page title on the left; an "All apps"
-/// link back to the apex portal, the signed-in user chip (avatar initial + email), and a Logout
-/// link to the gateway on the right. An empty / placeholder (`—`) email omits the user chip
-/// (public / no-session shell).
-pub fn topbar(page_title: &str, email: &str) -> String {
-    let chip = if email.is_empty() || email == "—" {
-        String::new()
+/// Two-letter avatar initials from the signed-in email (falls back to a neutral glyph).
+fn initials(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or(email);
+    let mut parts = local
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty());
+    let a = parts.next().and_then(|s| s.chars().next());
+    let b = parts.next().and_then(|s| s.chars().next());
+    match (a, b) {
+        (Some(a), Some(b)) => format!("{}{}", a.to_uppercase(), b.to_uppercase()),
+        (Some(a), None) => a.to_uppercase().to_string(),
+        _ => "·".to_string(),
+    }
+}
+
+/// The Odyssey v2 avatar menu (CSS focus-within dropdown): an avatar + name button, and a popover
+/// listing Account, All apps, and the cross-subdomain sign-out link (a GET link, method preserved).
+/// A placeholder (`—`) or empty email renders a minimal avatar glyph so the shell never breaks.
+fn user_menu(email: &str) -> String {
+    let known = !(email.is_empty() || email == "—");
+    let (glyph, name_html, head_html) = if known {
+        let local = email.split('@').next().unwrap_or(email);
+        (
+            esc(&initials(email)),
+            format!("<span class=\"usermenu__name\">{}</span>", esc(email)),
+            format!("<b>{}</b><span>{}</span>", esc(local), esc(email)),
+        )
     } else {
-        let initial = email
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "H".to_string());
-        format!(
-            r#"<span class="userchip"><span class="userchip__avatar" aria-hidden="true">{initial}</span><span class="user-email">{email}</span></span>"#,
-            initial = esc(&initial),
-            email = esc(email),
+        (
+            "·".to_string(),
+            String::new(),
+            "<b>Signed in</b><span>HOLDFAST estate</span>".to_string(),
         )
     };
     format!(
-        r#"<header class="topbar">
-  <div class="topbar__inner">
-    <a class="brand" href="/" aria-label="HOLDFAST Atlas">
-      <span class="brand__glyph" aria-hidden="true">{shield}</span>
-      <span class="brand__word">HOLDFAST</span>
-      <span class="brand__product">Atlas</span>
-    </a>
-    <div class="topbar__right">
-      <span class="topbar__title">{title}</span>
-      <a class="allapps" href="https://w33d.xyz" title="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
-      {chip}
-      <a class="btn btn-ghost btn-sm" href="{logout}">Log out</a>
-    </div>
+        r##"<div class="usermenu">
+  <button class="usermenu__btn" type="button" aria-haspopup="menu">
+    <span class="avatar" aria-hidden="true">{glyph}</span>{name}
+    <svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+  </button>
+  <div class="usermenu__pop" role="menu">
+    <div class="usermenu__head"><span class="avatar avatar--lg" aria-hidden="true">{glyph}</span><div>{head}</div></div>
+    <a class="menuitem" role="menuitem" href="https://account.w33d.xyz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Account</a>
+    <a class="menuitem" role="menuitem" href="https://w33d.xyz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
+    <a class="menuitem menuitem--danger" role="menuitem" href="{logout}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Sign out</a>
   </div>
-</header>"#,
-        shield = SHIELD_SVG,
-        title = esc(page_title),
-        chip = chip,
+</div>"##,
+        glyph = glyph,
+        name = name_html,
+        head = head_html,
         logout = LOGOUT_URL,
+    )
+}
+
+/// Render the shared Odyssey v2 app-bar: a brand lockup (Atlas's network tile + wordmark), the
+/// estate nav (Catalog / Topology, current marked `.is-active`), an "All apps" waffle to the apex
+/// portal, and the avatar menu. `page_title` selects the active nav item.
+pub fn topbar(page_title: &str, email: &str) -> String {
+    let topology_active = page_title == "Topology";
+    let catalog_cls = if topology_active { "appnav" } else { "appnav is-active" };
+    let topology_cls = if topology_active { "appnav is-active" } else { "appnav" };
+    format!(
+        r##"<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="HOLDFAST Atlas">
+    <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span>
+    <span class="appbar__name"><b>Atlas</b><span>atlas.w33d.xyz</span></span>
+  </a>
+  <nav class="appbar__nav" aria-label="Atlas sections">
+    <a class="{catalog_cls}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Catalog</a>
+    <a class="{topology_cls}" href="/graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>Topology</a>
+  </nav>
+  <div class="appbar__spacer"></div>
+  <div class="appbar__right">
+    <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+    {user}
+  </div>
+</header>"##,
+        catalog_cls = catalog_cls,
+        topology_cls = topology_cls,
+        user = user_menu(email),
     )
 }
 
