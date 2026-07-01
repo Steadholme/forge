@@ -9,6 +9,7 @@
 //! shield + the signed-in email + the gateway logout). All producer-supplied text (repo names,
 //! tags, media types, digests) is HTML-escaped on render.
 
+pub mod admin;
 pub mod health;
 pub mod registry;
 pub mod web;

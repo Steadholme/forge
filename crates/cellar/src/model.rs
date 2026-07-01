@@ -82,6 +82,27 @@ pub fn index_platforms(raw: &str) -> Vec<String> {
     out
 }
 
+/// The blob digests an IMAGE manifest references: its `config.digest` plus every `layers[].digest`.
+/// These are the content-addressed blob bytes on the volume the manifest keeps alive. Empty for a
+/// manifest list / image index (which references child manifests, not blobs) or a malformed
+/// document. Used by garbage collection to compute the live blob set.
+pub fn manifest_blob_digests(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(d) = v.get("config").and_then(|c| c.get("digest")).and_then(|s| s.as_str()) {
+            out.push(d.to_string());
+        }
+        if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
+            for l in layers {
+                if let Some(d) = l.get("digest").and_then(|s| s.as_str()) {
+                    out.push(d.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The child image-manifest digests referenced by a manifest list / image index `raw` JSON.
 /// Empty for a non-index document.
 pub fn index_child_digests(raw: &str) -> Vec<String> {

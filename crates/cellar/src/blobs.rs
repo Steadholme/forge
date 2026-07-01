@@ -64,6 +64,11 @@ pub trait BlobStore: Send + Sync {
 
     /// Fetch a finalized blob's bytes, or `None` when absent.
     async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, BlobError>;
+
+    /// Delete a finalized blob's bytes. Returns `true` when a blob was removed, `false` when it was
+    /// already absent (idempotent). Used only by the garbage-collection sweep to reclaim disk from
+    /// blobs no live manifest references.
+    async fn delete(&self, digest: &str) -> Result<bool, BlobError>;
 }
 
 /// Verify `bytes` hash to `expected_digest` (sha256 only). Returns the computed digest on success
@@ -174,6 +179,10 @@ impl BlobStore for MemoryBlobStore {
 
     async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, BlobError> {
         Ok(self.inner.lock().expect("blob lock poisoned").blobs.get(digest).cloned())
+    }
+
+    async fn delete(&self, digest: &str) -> Result<bool, BlobError> {
+        Ok(self.inner.lock().expect("blob lock poisoned").blobs.remove(digest).is_some())
     }
 }
 
@@ -335,6 +344,17 @@ impl BlobStore for FsBlobStore {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(BlobError::Io(format!("read blob: {e}"))),
+        }
+    }
+
+    async fn delete(&self, digest: &str) -> Result<bool, BlobError> {
+        let Some(p) = self.blob_path(digest) else {
+            return Ok(false);
+        };
+        match tokio::fs::remove_file(&p).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(BlobError::Io(format!("delete blob: {e}"))),
         }
     }
 }

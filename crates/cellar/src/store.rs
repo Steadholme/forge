@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::model::{ManifestRec, Repository, TagRec};
+use crate::model::{BlobRec, ManifestRec, Repository, TagRec};
 
 /// Storage failure surfaced to the handler layer (mapped to an internal error).
 #[derive(Debug, Error)]
@@ -42,6 +42,13 @@ pub trait Store: Send + Sync {
     /// A blob's recorded size, or `None` when unknown to the registry.
     async fn blob_size(&self, digest: &str) -> Result<Option<i64>, StoreError>;
 
+    /// All recorded blobs (backs the admin storage accounting + garbage collection sweep).
+    async fn list_blobs(&self) -> Result<Vec<BlobRec>, StoreError>;
+
+    /// Delete a blob's metadata row. Returns `true` when a row was removed. The caller also drops
+    /// the bytes from the [`crate::blobs::BlobStore`]; used only by garbage collection.
+    async fn delete_blob(&self, digest: &str) -> Result<bool, StoreError>;
+
     /// Upsert a manifest (idempotent over `(repo,digest)`; re-push refreshes media_type/raw/size).
     async fn put_manifest(&self, m: &ManifestRec) -> Result<(), StoreError>;
 
@@ -50,6 +57,10 @@ pub trait Store: Send + Sync {
 
     /// All manifests in a repo (for web size aggregation).
     async fn manifests_for(&self, repo: &str) -> Result<Vec<ManifestRec>, StoreError>;
+
+    /// Delete a manifest row by repo + digest. Returns `true` when a row was removed. Used only by
+    /// garbage collection (removing an untagged/orphaned manifest).
+    async fn delete_manifest(&self, repo: &str, digest: &str) -> Result<bool, StoreError>;
 
     /// Upsert a tag pointer (last-writer-wins on `(repo,tag)`).
     async fn put_tag(&self, repo: &str, tag: &str, manifest_digest: &str, now: i64) -> Result<(), StoreError>;
@@ -128,6 +139,26 @@ impl Store for InMemoryStore {
         Ok(g.blobs.iter().find(|(d, _, _)| d == digest).map(|(_, s, _)| *s))
     }
 
+    async fn list_blobs(&self) -> Result<Vec<BlobRec>, StoreError> {
+        let g = self.inner.lock().expect("store lock poisoned");
+        Ok(g
+            .blobs
+            .iter()
+            .map(|(digest, size, created_at)| BlobRec {
+                digest: digest.clone(),
+                size: *size,
+                created_at: *created_at,
+            })
+            .collect())
+    }
+
+    async fn delete_blob(&self, digest: &str) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        let before = g.blobs.len();
+        g.blobs.retain(|(d, _, _)| d != digest);
+        Ok(g.blobs.len() != before)
+    }
+
     async fn put_manifest(&self, m: &ManifestRec) -> Result<(), StoreError> {
         let mut g = self.inner.lock().expect("store lock poisoned");
         if let Some(existing) = g.manifests.iter_mut().find(|x| x.id == m.id) {
@@ -152,6 +183,13 @@ impl Store for InMemoryStore {
     async fn manifests_for(&self, repo: &str) -> Result<Vec<ManifestRec>, StoreError> {
         let g = self.inner.lock().expect("store lock poisoned");
         Ok(g.manifests.iter().filter(|m| m.repo == repo).cloned().collect())
+    }
+
+    async fn delete_manifest(&self, repo: &str, digest: &str) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        let before = g.manifests.len();
+        g.manifests.retain(|m| !(m.repo == repo && m.digest == digest));
+        Ok(g.manifests.len() != before)
     }
 
     async fn put_tag(&self, repo: &str, tag: &str, manifest_digest: &str, now: i64) -> Result<(), StoreError> {
@@ -346,6 +384,31 @@ impl Store for PgStore {
         }
     }
 
+    async fn list_blobs(&self) -> Result<Vec<BlobRec>, StoreError> {
+        let rows = sqlx::query("SELECT digest, size, created_at FROM blobs ORDER BY digest ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
+        rows.iter()
+            .map(|r| {
+                Ok(BlobRec {
+                    digest: r.try_get("digest").map_err(be)?,
+                    size: r.try_get("size").map_err(be)?,
+                    created_at: r.try_get("created_at").map_err(be)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_blob(&self, digest: &str) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM blobs WHERE digest = $1")
+            .bind(digest)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn put_manifest(&self, m: &ManifestRec) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO manifests (id, repo, digest, media_type, raw, size, created_at) \
@@ -385,6 +448,16 @@ impl Store for PgStore {
             .await
             .map_err(be)?;
         rows.iter().map(Self::manifest_from_row).collect::<Result<_, _>>().map_err(be)
+    }
+
+    async fn delete_manifest(&self, repo: &str, digest: &str) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM manifests WHERE repo = $1 AND digest = $2")
+            .bind(repo)
+            .bind(digest)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn put_tag(&self, repo: &str, tag: &str, manifest_digest: &str, now: i64) -> Result<(), StoreError> {

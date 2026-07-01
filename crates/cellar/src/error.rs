@@ -133,6 +133,8 @@ impl From<crate::blobs::BlobError> for RegError {
 pub enum WebError {
     #[error("bad_request: {0}")]
     BadRequest(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("not_found: {0}")]
     NotFound(String),
     #[error("server_error: {0}")]
@@ -143,6 +145,7 @@ impl WebError {
     fn parts(&self) -> (StatusCode, &'static str, String) {
         match self {
             WebError::BadRequest(d) => (StatusCode::BAD_REQUEST, "Request rejected", d.clone()),
+            WebError::Forbidden(d) => (StatusCode::FORBIDDEN, "Forbidden", d.clone()),
             WebError::NotFound(d) => (StatusCode::NOT_FOUND, "Not found", d.clone()),
             WebError::Internal(d) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

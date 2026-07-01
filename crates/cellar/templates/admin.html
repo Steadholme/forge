@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Admin · Cellar · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/" aria-label="HOLDFAST Registry">
+        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
+        <span class="brand__word">HOLDFAST</span>
+      </a>
+      <div class="topbar__right">{{USERBOX}}</div>
+    </div>
+  </header>
+
+  <main class="console">
+    <div class="console__head console__head--row">
+      <div>
+        <h1>Registry administration</h1>
+        <p class="sub">Storage accounting for every repository, and garbage collection to reclaim
+          disk from untagged and orphaned images.</p>
+      </div>
+      <a class="btn btn-ghost btn-sm" href="/">All repositories</a>
+    </div>
+
+    {{NOTICE}}
+
+    <div class="cmd-strip">
+      <span class="cmd-label">On disk</span>
+      <code>{{TOTAL_SIZE}}</code>
+      <span class="cmd-label">Blobs</span>
+      <code>{{BLOB_COUNT}}</code>
+      <span class="cmd-label">Repositories</span>
+      <code>{{REPO_COUNT}}</code>
+    </div>
+
+    <div class="card card--message">
+      <div class="card__head">
+        <h2>Garbage collection</h2>
+      </div>
+      <div class="card__body">
+        <p class="sub">{{RECLAIM_LINE}}</p>
+        <form method="post" action="/admin/gc"
+              onsubmit="return confirm('Run garbage collection? This permanently deletes every manifest and blob no tag references.');">
+          <input type="hidden" name="csrf_token" value="{{CSRF}}">
+          <button class="btn btn-danger" type="submit">Run garbage collection</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="section-head">
+      <h2>Storage by repository</h2>
+      <span class="count-badge">{{REPO_COUNT}}</span>
+    </div>
+
+    <div class="table-wrap">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th>Images</th>
+            <th>Tags</th>
+            <th>Storage</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ROWS}}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>

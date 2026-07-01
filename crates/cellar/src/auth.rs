@@ -15,6 +15,7 @@
 use axum::http::{header, HeaderMap};
 
 use crate::config::Config;
+use crate::error::WebError;
 use crate::random_alnum;
 
 // ---------------------------------------------------------------------------
@@ -145,6 +146,51 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Admin authorization (the /admin subtree)
+// ---------------------------------------------------------------------------
+
+/// Group names that authorize the `/admin` panel (storage accounting + garbage collection).
+/// Membership in ANY of these lets a user reach the panel. Same shape as echo's `MODERATOR_GROUPS`.
+pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// The signed-in user's groups, parsed from the comma-separated `X-Auth-Groups` header (injected
+/// AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
+pub fn author_groups(headers: &HeaderMap) -> Vec<String> {
+    header_value(headers, HEADER_GROUPS)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the signed-in user belongs to `group` (exact match against `X-Auth-Groups`).
+pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
+    author_groups(headers).iter().any(|g| g == group)
+}
+
+/// Whether the signed-in user is in ANY [`ADMIN_GROUPS`] entry.
+pub fn is_admin(headers: &HeaderMap) -> bool {
+    let groups = author_groups(headers);
+    ADMIN_GROUPS.iter().any(|a| groups.iter().any(|g| g == a))
+}
+
+/// Require admin group membership for an `/admin` route. `Forbidden` (403) when the signed-in user
+/// carries no admin group — ordinary SSO users get 403; only admins see the panel.
+pub fn require_admin(headers: &HeaderMap) -> Result<(), WebError> {
+    if is_admin(headers) {
+        Ok(())
+    } else {
+        Err(WebError::Forbidden(
+            "This panel is restricted to registry administrators.".to_string(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +377,34 @@ mod tests {
             sign_identity("test-key", "usr_bob", "", 2),
             "930f82fb1224e69c9c5bc46e545c3b108b1eeb6c9078c7a33fc24f30c595f658"
         );
+    }
+
+    #[test]
+    fn admin_gating_by_group() {
+        // No X-Auth-Groups -> not an admin, require_admin 403s.
+        let none = HeaderMap::new();
+        assert!(author_groups(&none).is_empty());
+        assert!(!is_admin(&none));
+        assert!(require_admin(&none).is_err());
+
+        // A non-admin group alone does not authorize.
+        let mut other = HeaderMap::new();
+        other.insert(HEADER_GROUPS, HeaderValue::from_static("readers,writers"));
+        assert!(has_group(&other, "readers"));
+        assert!(!is_admin(&other));
+        assert!(require_admin(&other).is_err());
+
+        // Either admin group (with whitespace) authorizes.
+        let mut admins = HeaderMap::new();
+        admins.insert(HEADER_GROUPS, HeaderValue::from_static("dev, admins ,x"));
+        assert!(has_group(&admins, "admins"));
+        assert!(is_admin(&admins));
+        assert!(require_admin(&admins).is_ok());
+
+        let mut infra = HeaderMap::new();
+        infra.insert(HEADER_GROUPS, HeaderValue::from_static("infra-admins"));
+        assert!(is_admin(&infra));
+        assert!(require_admin(&infra).is_ok());
     }
 
     #[test]
