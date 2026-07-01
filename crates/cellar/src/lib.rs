@@ -58,6 +58,7 @@ pub fn app(state: AppState) -> Router {
         // --- SSO web console ---
         .route("/", get(handlers::web::index))
         .route("/r/{*name}", get(handlers::web::repo_detail))
+        .route("/m/{*name}", get(handlers::web::manifest_detail))
         .route("/delete-tag", post(handlers::web::delete_tag))
         // --- /admin subtree (admin-gated: storage accounting + garbage collection) ---
         .route("/admin", get(handlers::admin::index))

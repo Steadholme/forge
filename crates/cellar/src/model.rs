@@ -119,6 +119,99 @@ pub fn index_child_digests(raw: &str) -> Vec<String> {
     out
 }
 
+/// One content descriptor from an image manifest: the `config` object or a `layers[]` entry. The
+/// `mediaType`/`digest`/`size` are carried IN the manifest JSON, so rendering the detail page needs
+/// no blob lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Descriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: i64,
+}
+
+/// The `config` descriptor of an IMAGE manifest, or `None` for an index / malformed document.
+pub fn manifest_config(raw: &str) -> Option<Descriptor> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    descriptor_from(v.get("config")?)
+}
+
+/// The `layers[]` descriptors of an IMAGE manifest, in order. Empty for an index / malformed doc.
+pub fn manifest_layers(raw: &str) -> Vec<Descriptor> {
+    let mut out = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(arr) = v.get("layers").and_then(|l| l.as_array()) {
+            for l in arr {
+                if let Some(d) = descriptor_from(l) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse a `{mediaType,digest,size}` descriptor object. Requires a `digest`; the `mediaType`/`size`
+/// default to empty/0 when absent.
+fn descriptor_from(v: &serde_json::Value) -> Option<Descriptor> {
+    let digest = v.get("digest").and_then(|s| s.as_str())?;
+    Some(Descriptor {
+        media_type: v.get("mediaType").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+        digest: digest.to_string(),
+        size: v.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
+    })
+}
+
+/// One child entry of a manifest list / image index: the referenced image-manifest `digest` plus
+/// its declared `mediaType`, `size` and `os/arch[/variant]` platform (empty when absent/unknown).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub digest: String,
+    pub media_type: String,
+    pub size: i64,
+    /// `os/arch[/variant]`, or empty when the entry carries no (or an unknown) platform.
+    pub platform: String,
+}
+
+/// The child entries of a manifest list / image index `raw` JSON, in order. Empty for a
+/// non-index / malformed document. Unlike [`index_platforms`], attestation / unknown-platform
+/// entries are KEPT (with an empty `platform`) so the detail page reflects the document verbatim.
+pub fn index_entries(raw: &str) -> Vec<IndexEntry> {
+    let mut out = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(arr) = v.get("manifests").and_then(|m| m.as_array()) {
+            for m in arr {
+                let Some(digest) = m.get("digest").and_then(|s| s.as_str()) else {
+                    continue;
+                };
+                let p = m.get("platform");
+                let os = p.and_then(|p| p.get("os")).and_then(|s| s.as_str()).unwrap_or("");
+                let arch = p
+                    .and_then(|p| p.get("architecture"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let variant = p
+                    .and_then(|p| p.get("variant"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let platform = if os == "unknown" || arch == "unknown" || (os.is_empty() && arch.is_empty()) {
+                    String::new()
+                } else if variant.is_empty() {
+                    format!("{os}/{arch}")
+                } else {
+                    format!("{os}/{arch}/{variant}")
+                };
+                out.push(IndexEntry {
+                    digest: digest.to_string(),
+                    media_type: m.get("mediaType").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    size: m.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
+                    platform,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// One pushed repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repository {
@@ -271,5 +364,51 @@ mod tests {
         let img = r#"{"schemaVersion":2,"config":{"size":1},"layers":[]}"#;
         assert!(index_platforms(img).is_empty());
         assert!(index_child_digests(img).is_empty());
+    }
+
+    #[test]
+    fn parses_config_and_layers() {
+        let raw = r#"{"schemaVersion":2,
+            "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":1000},
+            "layers":[
+              {"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l1","size":2000},
+              {"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l2","size":500}
+            ]}"#;
+        let config = manifest_config(raw).unwrap();
+        assert_eq!(config.digest, "sha256:cfg");
+        assert_eq!(config.size, 1000);
+        assert_eq!(config.media_type, "application/vnd.oci.image.config.v1+json");
+        let layers = manifest_layers(raw);
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].digest, "sha256:l1");
+        assert_eq!(layers[0].size, 2000);
+        assert_eq!(layers[1].size, 500);
+
+        // An index has no config / layers.
+        let idx = r#"{"schemaVersion":2,"manifests":[{"digest":"sha256:x"}]}"#;
+        assert!(manifest_config(idx).is_none());
+        assert!(manifest_layers(idx).is_empty());
+    }
+
+    #[test]
+    fn parses_index_entries_with_platform_and_size() {
+        let raw = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
+            "manifests":[
+              {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaa","size":11,"platform":{"os":"linux","architecture":"amd64"}},
+              {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbb","size":22,"platform":{"os":"linux","architecture":"arm64","variant":"v8"}},
+              {"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:ccc","size":33,"platform":{"os":"unknown","architecture":"unknown"}}
+            ]}"#;
+        let entries = index_entries(raw);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].platform, "linux/amd64");
+        assert_eq!(entries[0].size, 11);
+        assert_eq!(entries[1].platform, "linux/arm64/v8");
+        // Unknown-platform child is kept but with an empty platform label.
+        assert_eq!(entries[2].digest, "sha256:ccc");
+        assert_eq!(entries[2].platform, "");
+
+        // An image manifest yields no index entries.
+        let img = r#"{"schemaVersion":2,"config":{"size":1},"layers":[]}"#;
+        assert!(index_entries(img).is_empty());
     }
 }

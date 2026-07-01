@@ -6,7 +6,7 @@
 //! delete a tag (the one state-changing web action, double-submit CSRF protected). All
 //! producer-supplied text (repo names, tags, media types, digests) is HTML-escaped on render.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
@@ -18,13 +18,15 @@ use crate::handlers::{
     esc, fmt_ts, human_size, short_digest, userbox, APP_CSS, LAYERS_SVG, SHIELD_SVG,
 };
 use crate::model::{
-    image_size, index_child_digests, index_platforms, is_manifest_list, ManifestRec, RepoSummary,
-    TagDetail,
+    image_size, index_child_digests, index_entries, index_platforms, is_manifest_list,
+    manifest_config, manifest_layers, Descriptor, IndexEntry, ManifestRec, RepoSummary, TagDetail,
 };
+use crate::names::reference_is_digest;
 use crate::AppState;
 
 const INDEX_HTML: &str = include_str!("../../templates/index.html");
 const REPO_HTML: &str = include_str!("../../templates/repo.html");
+const MANIFEST_HTML: &str = include_str!("../../templates/manifest.html");
 
 // ---------------------------------------------------------------------------
 // GET / — repository index
@@ -66,6 +68,59 @@ pub async fn repo_detail(
         Html(html),
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET /m/{*name}?ref={reference} — tag / manifest detail
+// ---------------------------------------------------------------------------
+
+/// `GET /m/{name}?ref={reference}` — the tag/manifest detail page: the manifest's media type,
+/// its config + layers (with sizes) for an image manifest, or its per-platform child manifests for
+/// a manifest list / image index, the full pull command, the manifest digest, and the tags that
+/// point at it. `ref` is a tag OR a `sha256:` digest. Read-only; any signed-in operator may view it
+/// (the registry is a shared estate resource — no per-user ownership). Every remote string
+/// (name, reference, digest, media types, platforms) is HTML-escaped on render.
+pub async fn manifest_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Response, WebError> {
+    let who = auth::identity(&headers);
+    if !state.store.repo_exists(&name).await? {
+        return Err(WebError::NotFound(format!(
+            "No repository named \"{name}\" exists in this registry."
+        )));
+    }
+    let reference = query_ref(raw_query.as_deref()).unwrap_or_default();
+    let reference = reference.trim().to_string();
+    if reference.is_empty() {
+        return Err(WebError::BadRequest(
+            "No image reference given. Open an image from its repository page.".to_string(),
+        ));
+    }
+    // Resolve the reference to a manifest digest: a digest is used verbatim; a tag is looked up.
+    let digest = if reference_is_digest(&reference) {
+        reference.clone()
+    } else {
+        state
+            .store
+            .get_tag(&name, &reference)
+            .await?
+            .ok_or_else(|| {
+                WebError::NotFound(format!("No tag \"{reference}\" in repository \"{name}\"."))
+            })?
+    };
+    let manifest = state
+        .store
+        .get_manifest(&name, &digest)
+        .await?
+        .ok_or_else(|| WebError::NotFound(format!("No manifest {digest} in repository \"{name}\".")))?;
+
+    let view = manifest_view(&state, &name, &reference, &manifest).await?;
+    let host = registry_host(&state.config.public_base);
+    let html = render_manifest(&who, &view, &host);
+    Ok(Html(html).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +341,288 @@ fn arch_badge(platforms: &[String]) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Manifest detail view assembly + rendering
+// ---------------------------------------------------------------------------
+
+/// The computed tag/manifest detail view (not stored).
+struct ManifestView {
+    name: String,
+    /// What the operator asked for — a tag or a digest (drives the subtitle).
+    reference: String,
+    /// The resolved manifest digest.
+    digest: String,
+    media_type: String,
+    /// Aggregate content size (config + layers, or summed child image sizes for a list).
+    size: i64,
+    is_list: bool,
+    /// The tags in this repo that point at this manifest digest.
+    tags: Vec<String>,
+    /// Image manifest only: the `config` descriptor.
+    config: Option<Descriptor>,
+    /// Image manifest only: the ordered `layers`.
+    layers: Vec<Descriptor>,
+    /// Manifest list only: each child entry paired with its resolved image size (falling back to
+    /// the entry's own descriptor size when the child manifest is not stored yet).
+    children: Vec<(IndexEntry, i64)>,
+}
+
+/// Assemble the [`ManifestView`] from the stored manifest plus the repo's other manifests (needed to
+/// resolve child image sizes for a list) and tags (to list what points at this digest).
+async fn manifest_view(
+    state: &AppState,
+    name: &str,
+    reference: &str,
+    manifest: &ManifestRec,
+) -> Result<ManifestView, WebError> {
+    let manifests = state.store.manifests_for(name).await?;
+    let tags: Vec<String> = state
+        .store
+        .tags_for(name)
+        .await?
+        .into_iter()
+        .filter(|t| t.manifest_digest == manifest.digest)
+        .map(|t| t.tag)
+        .collect();
+
+    let is_list = is_manifest_list(&manifest.media_type);
+    let (config, layers, children) = if is_list {
+        let children = index_entries(&manifest.raw)
+            .into_iter()
+            .map(|e| {
+                let resolved = manifests
+                    .iter()
+                    .find(|m| m.digest == e.digest)
+                    .map(|m| image_size(&m.raw))
+                    .unwrap_or(e.size);
+                (e, resolved)
+            })
+            .collect();
+        (None, Vec::new(), children)
+    } else {
+        (
+            manifest_config(&manifest.raw),
+            manifest_layers(&manifest.raw),
+            Vec::new(),
+        )
+    };
+
+    Ok(ManifestView {
+        name: name.to_string(),
+        reference: reference.to_string(),
+        digest: manifest.digest.clone(),
+        media_type: manifest.media_type.clone(),
+        size: resolved_size(&manifests, &manifest.digest),
+        is_list,
+        tags,
+        config,
+        layers,
+        children,
+    })
+}
+
+fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
+    let subtitle = if reference_is_digest(&v.reference) {
+        "Image manifest addressed by its content digest.".to_string()
+    } else {
+        format!("The image tagged \"{}\" in this repository.", v.reference)
+    };
+    let kind = if v.is_list {
+        match v.children.len() {
+            1 => "manifest list · 1 platform".to_string(),
+            n => format!("manifest list · {n} platforms"),
+        }
+    } else {
+        "image manifest".to_string()
+    };
+    // The canonical, fully-qualified pull command is by digest.
+    let pull_cmd = format!("docker pull {host}/{name}@{digest}", name = v.name, digest = v.digest);
+    MANIFEST_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
+        .replace("{{SUBTITLE}}", &esc(&subtitle))
+        .replace("{{PULL_CMD}}", &esc(&pull_cmd))
+        .replace("{{KIND}}", &esc(&kind))
+        .replace("{{DIGEST}}", &esc(&v.digest))
+        .replace("{{MEDIA_TYPE}}", &esc(&v.media_type))
+        .replace("{{SIZE}}", &esc(&human_size(v.size)))
+        .replace("{{TAGS}}", &render_tag_chips(&v.name, &v.tags))
+        .replace("{{CONTENT}}", &render_manifest_content(v))
+        // Replaced LAST: {{NAME}} appears in the title, the heading, and the back-link href, and
+        // no injected value can contain the literal "{{NAME}}" (names carry no braces).
+        .replace("{{NAME}}", &esc(&v.name))
+}
+
+/// Tag chips linking back to the repository page (where the tag can be managed). "untagged" when a
+/// manifest has no tags pointing at it (e.g. an index child pushed by digest).
+fn render_tag_chips(repo: &str, tags: &[String]) -> String {
+    if tags.is_empty() {
+        return "<span class=\"muted\">untagged</span>".to_string();
+    }
+    tags.iter()
+        .map(|t| {
+            format!(
+                "<a class=\"tag-pill\" href=\"/r/{repo}\">{tag}</a>",
+                repo = esc(repo),
+                tag = esc(t),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn render_manifest_content(v: &ManifestView) -> String {
+    if v.is_list {
+        render_children(v)
+    } else {
+        render_layers(v)
+    }
+}
+
+/// The config + layers tables of an image manifest.
+fn render_layers(v: &ManifestView) -> String {
+    let config_rows = match &v.config {
+        Some(c) => format!(
+            "<tr><td class=\"muted\">{mtype}</td><td class=\"mono\" title=\"{dfull}\">{dshort}</td><td class=\"num\">{size}</td></tr>",
+            mtype = esc(&c.media_type),
+            dfull = esc(&c.digest),
+            dshort = esc(&short_digest(&c.digest)),
+            size = esc(&human_size(c.size)),
+        ),
+        None => "<tr class=\"empty-row\"><td colspan=\"3\">No config recorded for this manifest.</td></tr>".to_string(),
+    };
+    let layer_rows = if v.layers.is_empty() {
+        "<tr class=\"empty-row\"><td colspan=\"4\">This image has no layers.</td></tr>".to_string()
+    } else {
+        v.layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                format!(
+                    "<tr><td class=\"num\">{n}</td><td class=\"muted\">{mtype}</td><td class=\"mono\" title=\"{dfull}\">{dshort}</td><td class=\"num\">{size}</td></tr>",
+                    n = i + 1,
+                    mtype = esc(&l.media_type),
+                    dfull = esc(&l.digest),
+                    dshort = esc(&short_digest(&l.digest)),
+                    size = esc(&human_size(l.size)),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let layer_count = match v.layers.len() {
+        1 => "1 layer".to_string(),
+        n => format!("{n} layers"),
+    };
+    format!(
+        "<div class=\"section-head\"><h2>Config</h2></div>\
+         <div class=\"table-wrap\"><table class=\"data\">\
+           <thead><tr><th>Media type</th><th>Digest</th><th>Size</th></tr></thead>\
+           <tbody>{config_rows}</tbody>\
+         </table></div>\
+         <div class=\"section-head\"><h2>Layers</h2><span class=\"count-badge\">{layer_count}</span></div>\
+         <div class=\"table-wrap\"><table class=\"data\">\
+           <thead><tr><th>#</th><th>Media type</th><th>Digest</th><th>Size</th></tr></thead>\
+           <tbody>{layer_rows}</tbody>\
+         </table></div>",
+        config_rows = config_rows,
+        layer_count = esc(&layer_count),
+        layer_rows = layer_rows,
+    )
+}
+
+/// The per-platform child manifests of a manifest list / image index. Each child digest links to
+/// its own manifest detail page (linking a list to the image manifests it fans out to).
+fn render_children(v: &ManifestView) -> String {
+    let rows = if v.children.is_empty() {
+        "<tr class=\"empty-row\"><td colspan=\"4\">This manifest list has no entries.</td></tr>".to_string()
+    } else {
+        v.children
+            .iter()
+            .map(|(e, size)| {
+                let platform = if e.platform.is_empty() {
+                    "<span class=\"muted\">—</span>".to_string()
+                } else {
+                    format!("<span class=\"tag-pill\">{}</span>", esc(&e.platform))
+                };
+                format!(
+                    "<tr><td>{platform}</td>\
+                       <td class=\"mono\"><a href=\"/m/{name}?ref={dref}\" title=\"{dfull}\">{dshort}</a></td>\
+                       <td class=\"muted\">{mtype}</td>\
+                       <td class=\"num\">{size}</td></tr>",
+                    platform = platform,
+                    name = esc(&v.name),
+                    dref = esc(&url_query_value(&e.digest)),
+                    dfull = esc(&e.digest),
+                    dshort = esc(&short_digest(&e.digest)),
+                    mtype = esc(&e.media_type),
+                    size = esc(&human_size(*size)),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let count = match v.children.len() {
+        1 => "1 manifest".to_string(),
+        n => format!("{n} manifests"),
+    };
+    format!(
+        "<div class=\"section-head\"><h2>Platforms</h2><span class=\"count-badge\">{count}</span></div>\
+         <div class=\"table-wrap\"><table class=\"data\">\
+           <thead><tr><th>Platform</th><th>Digest</th><th>Media type</th><th>Size</th></tr></thead>\
+           <tbody>{rows}</tbody>\
+         </table></div>",
+        count = esc(&count),
+        rows = rows,
+    )
+}
+
+/// Percent-encode a reference for use as a `?ref=` query value. Only a digest's `:` needs escaping;
+/// tags are already URL-safe. Mirrors the encoding the registry tests use for the query string.
+fn url_query_value(s: &str) -> String {
+    s.replace(':', "%3A")
+}
+
+/// Extract the `ref` query parameter (percent-decoding a `%3A`-escaped digest colon), if present.
+fn query_ref(raw: Option<&str>) -> Option<String> {
+    for pair in raw?.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == "ref" {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+/// Minimal percent-decode of a query value (`%XX` -> byte). Leaves malformed escapes untouched.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hexval(b[i + 1]), hexval(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hexval(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
     if tags.is_empty() {
         return "<tr class=\"empty-row\"><td colspan=\"5\">This repository has no tags.</td></tr>"
@@ -296,8 +633,8 @@ fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
         .map(|t| {
             format!(
                 "<tr>\
-                   <td><span class=\"tag-pill\">{tag}</span></td>\
-                   <td class=\"mono\" title=\"{digest_full}\">{digest_short}</td>\
+                   <td><a class=\"tag-pill\" href=\"/m/{repo_attr}?ref={tag_ref}\">{tag}</a></td>\
+                   <td class=\"mono\" title=\"{digest_full}\"><a href=\"/m/{repo_attr}?ref={digest_ref}\">{digest_short}</a></td>\
                    <td class=\"muted\">{mtype}{arch}</td>\
                    <td class=\"num\">{size}</td>\
                    <td class=\"muted\">{date}</td>\
@@ -311,7 +648,9 @@ fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
                    </td>\
                  </tr>",
                 tag = esc(&t.tag),
+                tag_ref = esc(&url_query_value(&t.tag)),
                 digest_full = esc(&t.manifest_digest),
+                digest_ref = esc(&url_query_value(&t.manifest_digest)),
                 digest_short = esc(&short_digest(&t.manifest_digest)),
                 mtype = esc(&t.media_type),
                 arch = arch_badge(&t.platforms),

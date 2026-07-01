@@ -69,6 +69,39 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Group-based authorization (X-Auth-Groups)
+// ---------------------------------------------------------------------------
+
+/// Group names that grant estate-admin authority. Membership in ANY of these lets a user moderate
+/// content they do not own (e.g. close another user's issue). Same shape as cellar's `ADMIN_GROUPS`.
+pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// The signed-in user's groups, parsed from the comma-separated `X-Auth-Groups` header (injected
+/// AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
+pub fn author_groups(headers: &HeaderMap) -> Vec<String> {
+    header_value(headers, HEADER_GROUPS)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the signed-in user belongs to `group` (exact match against `X-Auth-Groups`).
+pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
+    author_groups(headers).iter().any(|g| g == group)
+}
+
+/// Whether the signed-in user is in ANY [`ADMIN_GROUPS`] entry.
+pub fn is_admin(headers: &HeaderMap) -> bool {
+    let groups = author_groups(headers);
+    ADMIN_GROUPS.iter().any(|a| groups.iter().any(|g| g == a))
+}
+
+// ---------------------------------------------------------------------------
 // Gateway identity signature (X-Auth-Sig) verification
 // ---------------------------------------------------------------------------
 
@@ -260,6 +293,28 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(HEADER_SUBJECT, HeaderValue::from_static("u_admin"));
         assert!(gateway_identity_ok(&h));
+    }
+
+    #[test]
+    fn admin_group_membership() {
+        // No X-Auth-Groups -> not an admin.
+        assert!(!is_admin(&HeaderMap::new()));
+
+        // A non-admin group -> not an admin.
+        let mut other = HeaderMap::new();
+        other.insert(HEADER_GROUPS, HeaderValue::from_static("readers,writers"));
+        assert!(!is_admin(&other));
+        assert!(has_group(&other, "readers"));
+
+        // An admin group (whitespace-tolerant) -> admin.
+        let mut admins = HeaderMap::new();
+        admins.insert(HEADER_GROUPS, HeaderValue::from_static("dev, admins ,x"));
+        assert!(is_admin(&admins));
+        assert!(has_group(&admins, "admins"));
+
+        let mut infra = HeaderMap::new();
+        infra.insert(HEADER_GROUPS, HeaderValue::from_static("infra-admins"));
+        assert!(is_admin(&infra));
     }
 
     #[test]

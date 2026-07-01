@@ -41,6 +41,9 @@ pub struct Issue {
     pub state: String,
     /// Creation time, epoch seconds.
     pub created_at: i64,
+    /// Last-activity time, epoch seconds (state change or a new comment). Equals `created_at` at
+    /// open time.
+    pub updated_at: i64,
 }
 
 impl Issue {
@@ -48,6 +51,21 @@ impl Issue {
     pub fn is_open(&self) -> bool {
         self.state == "open"
     }
+}
+
+/// A comment on an issue. Field order/types mirror the `issue_comments` table exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueComment {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning issue id (foreign key into `issues.id`).
+    pub issue_id: String,
+    /// Author subject from `X-Auth-Subject`.
+    pub author_sub: String,
+    /// Comment body (markdown rendered as sanitised HTML).
+    pub body: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
 }
 
 /// A pull request: a request to merge the `head` branch into the `base` branch of one repository.

@@ -74,6 +74,14 @@ pub fn app(state: AppState) -> Router {
             get(handlers::issues::list).post(handlers::issues::create),
         )
         .route(
+            "/r/{owner}/{name}/issues/{number}",
+            get(handlers::issues::detail),
+        )
+        .route(
+            "/r/{owner}/{name}/issues/{number}/comment",
+            post(handlers::issues::comment),
+        )
+        .route(
             "/r/{owner}/{name}/issues/{number}/toggle",
             post(handlers::issues::toggle),
         )

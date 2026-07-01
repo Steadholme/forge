@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::REPO_LIST_LIMIT;
-use crate::model::{Issue, Pat, Pull, Repo};
+use crate::model::{Issue, IssueComment, Pat, Pull, Repo};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -62,15 +62,49 @@ pub trait Store: Send + Sync {
     /// All issues on a repo, newest number first.
     async fn list_issues(&self, repo_id: &str) -> Result<Vec<Issue>, StoreError>;
 
+    /// A page of issues on a repo, newest number first, optionally filtered by state. `state_filter`
+    /// is `""` (all), `"open"`, or `"closed"`. `limit`/`offset` drive simple pagination.
+    async fn list_issues_page(
+        &self,
+        repo_id: &str,
+        state_filter: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Issue>, StoreError>;
+
+    /// Count of issues on a repo matching `state_filter` (`""`/`"open"`/`"closed"`) — the pager total.
+    async fn count_issues(&self, repo_id: &str, state_filter: &str) -> Result<i64, StoreError>;
+
     /// One issue by its per-repo number.
     async fn get_issue(&self, repo_id: &str, number: i64)
         -> Result<Option<Issue>, StoreError>;
 
-    /// Set an issue's state (`open`/`closed`) by id. Returns whether a row changed.
-    async fn set_issue_state(&self, id: &str, state: &str) -> Result<bool, StoreError>;
+    /// Set an issue's state (`open`/`closed`) by id, stamping `updated_at`. Returns whether a row
+    /// changed.
+    async fn set_issue_state(
+        &self,
+        id: &str,
+        state: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError>;
 
     /// Count of OPEN issues on a repo (for the repo header badge).
     async fn open_issue_count(&self, repo_id: &str) -> Result<i64, StoreError>;
+
+    // --- issue comments ------------------------------------------------------
+    /// Append a comment to an issue and stamp the parent issue's `updated_at` to `created_at`
+    /// (last-activity). Returns the stored comment.
+    async fn create_comment(
+        &self,
+        id: &str,
+        issue_id: &str,
+        author_sub: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<IssueComment, StoreError>;
+
+    /// All comments on an issue, oldest first (chronological thread order).
+    async fn list_comments(&self, issue_id: &str) -> Result<Vec<IssueComment>, StoreError>;
 
     // --- pulls ---------------------------------------------------------------
     /// Create a pull request, atomically allocating the next per-repo `number`. Returns the stored
@@ -128,6 +162,7 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     repos: Mutex<Vec<Repo>>,
     issues: Mutex<Vec<Issue>>,
+    issue_comments: Mutex<Vec<IssueComment>>,
     pulls: Mutex<Vec<Pull>>,
     pats: Mutex<Vec<Pat>>,
 }
@@ -205,6 +240,7 @@ impl Store for InMemoryStore {
             author_sub: author_sub.to_string(),
             state: "open".to_string(),
             created_at,
+            updated_at: created_at,
         };
         issues.push(issue.clone());
         Ok(issue)
@@ -221,6 +257,35 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
+    async fn list_issues_page(
+        &self,
+        repo_id: &str,
+        state_filter: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Issue>, StoreError> {
+        let issues = self.issues.lock().expect("issues lock poisoned");
+        let mut out: Vec<Issue> = issues
+            .iter()
+            .filter(|i| i.repo_id == repo_id && (state_filter.is_empty() || i.state == state_filter))
+            .cloned()
+            .collect();
+        out.sort_by_key(|i| std::cmp::Reverse(i.number));
+        Ok(out
+            .into_iter()
+            .skip(offset.max(0) as usize)
+            .take(limit.max(0) as usize)
+            .collect())
+    }
+
+    async fn count_issues(&self, repo_id: &str, state_filter: &str) -> Result<i64, StoreError> {
+        let issues = self.issues.lock().expect("issues lock poisoned");
+        Ok(issues
+            .iter()
+            .filter(|i| i.repo_id == repo_id && (state_filter.is_empty() || i.state == state_filter))
+            .count() as i64)
+    }
+
     async fn get_issue(
         &self,
         repo_id: &str,
@@ -233,12 +298,18 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
-    async fn set_issue_state(&self, id: &str, state: &str) -> Result<bool, StoreError> {
+    async fn set_issue_state(
+        &self,
+        id: &str,
+        state: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError> {
         let mut issues = self.issues.lock().expect("issues lock poisoned");
         for i in issues.iter_mut() {
             if i.id == id {
                 let changed = i.state != state;
                 i.state = state.to_string();
+                i.updated_at = updated_at;
                 return Ok(changed);
             }
         }
@@ -251,6 +322,49 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|i| i.repo_id == repo_id && i.is_open())
             .count() as i64)
+    }
+
+    async fn create_comment(
+        &self,
+        id: &str,
+        issue_id: &str,
+        author_sub: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<IssueComment, StoreError> {
+        let comment = IssueComment {
+            id: id.to_string(),
+            issue_id: issue_id.to_string(),
+            author_sub: author_sub.to_string(),
+            body: body.to_string(),
+            created_at,
+        };
+        self.issue_comments
+            .lock()
+            .expect("issue_comments lock poisoned")
+            .push(comment.clone());
+        // Last-activity bump on the parent issue.
+        if let Some(i) = self
+            .issues
+            .lock()
+            .expect("issues lock poisoned")
+            .iter_mut()
+            .find(|i| i.id == issue_id)
+        {
+            i.updated_at = created_at;
+        }
+        Ok(comment)
+    }
+
+    async fn list_comments(&self, issue_id: &str) -> Result<Vec<IssueComment>, StoreError> {
+        let comments = self.issue_comments.lock().expect("issue_comments lock poisoned");
+        let mut out: Vec<IssueComment> = comments
+            .iter()
+            .filter(|c| c.issue_id == issue_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        Ok(out)
     }
 
     async fn create_pull(
@@ -385,7 +499,8 @@ use sqlx::Row;
 const REPO_COLS: &str =
     "id, owner_sub, name, description, is_private, default_branch, created_at";
 const ISSUE_COLS: &str =
-    "id, repo_id, number, title, body, author_sub, state, created_at";
+    "id, repo_id, number, title, body, author_sub, state, created_at, updated_at";
+const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
 const PULL_COLS: &str =
     "id, repo_id, number, title, body, base_branch, head_branch, author_sub, state, created_at, merged_at";
 const PAT_COLS: &str = "id, owner_sub, name, token_hash, created_at";
@@ -438,6 +553,35 @@ impl PgStore {
                  state TEXT NOT NULL DEFAULT 'open', \
                  created_at BIGINT NOT NULL\
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Last-activity column, added idempotently for tables created before it existed.
+        sqlx::query(
+            "ALTER TABLE issues ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backfill legacy rows so updated_at is never behind created_at.
+        sqlx::query("UPDATE issues SET updated_at = created_at WHERE updated_at < created_at")
+            .execute(&self.pool)
+            .await?;
+        // Threaded comments on an issue (foreign key issue_id -> issues.id, application-enforced).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS issue_comments (\
+                 id TEXT PRIMARY KEY, \
+                 issue_id TEXT NOT NULL, \
+                 author_sub TEXT NOT NULL, \
+                 body TEXT NOT NULL DEFAULT '', \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Thread lookup for the issue detail page.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_issue_comments_issue \
+             ON issue_comments (issue_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -521,6 +665,17 @@ impl PgStore {
             body: row.try_get("body")?,
             author_sub: row.try_get("author_sub")?,
             state: row.try_get("state")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    fn comment_from_row(row: &sqlx::postgres::PgRow) -> Result<IssueComment, sqlx::Error> {
+        Ok(IssueComment {
+            id: row.try_get("id")?,
+            issue_id: row.try_get("issue_id")?,
+            author_sub: row.try_get("author_sub")?,
+            body: row.try_get("body")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -640,8 +795,8 @@ impl Store for PgStore {
 
             let result = sqlx::query(
                 "INSERT INTO issues \
-                     (id, repo_id, number, title, body, author_sub, state, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, 'open', $7) \
+                     (id, repo_id, number, title, body, author_sub, state, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $7) \
                  ON CONFLICT (repo_id, number) DO NOTHING",
             )
             .bind(id)
@@ -665,6 +820,7 @@ impl Store for PgStore {
                     author_sub: author_sub.to_string(),
                     state: "open".to_string(),
                     created_at,
+                    updated_at: created_at,
                 });
             }
         }
@@ -687,6 +843,45 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn list_issues_page(
+        &self,
+        repo_id: &str,
+        state_filter: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Issue>, StoreError> {
+        // `state_filter = ''` selects every state; otherwise it is bound (never interpolated).
+        let rows = sqlx::query(&format!(
+            "SELECT {ISSUE_COLS} FROM issues \
+             WHERE repo_id = $1 AND ($2 = '' OR state = $2) \
+             ORDER BY number DESC LIMIT $3 OFFSET $4"
+        ))
+        .bind(repo_id)
+        .bind(state_filter)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::issue_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn count_issues(&self, repo_id: &str, state_filter: &str) -> Result<i64, StoreError> {
+        let row = sqlx::query(
+            "SELECT count(*) AS n FROM issues \
+             WHERE repo_id = $1 AND ($2 = '' OR state = $2)",
+        )
+        .bind(repo_id)
+        .bind(state_filter)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.try_get("n").map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn get_issue(
         &self,
         repo_id: &str,
@@ -706,9 +901,15 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn set_issue_state(&self, id: &str, state: &str) -> Result<bool, StoreError> {
-        let result = sqlx::query("UPDATE issues SET state = $1 WHERE id = $2")
+    async fn set_issue_state(
+        &self,
+        id: &str,
+        state: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE issues SET state = $1, updated_at = $2 WHERE id = $3")
             .bind(state)
+            .bind(updated_at)
             .bind(id)
             .execute(&self.pool)
             .await
@@ -725,6 +926,57 @@ impl Store for PgStore {
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
         row.try_get("n").map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn create_comment(
+        &self,
+        id: &str,
+        issue_id: &str,
+        author_sub: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<IssueComment, StoreError> {
+        sqlx::query(
+            "INSERT INTO issue_comments (id, issue_id, author_sub, body, created_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(issue_id)
+        .bind(author_sub)
+        .bind(body)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        // Last-activity bump on the parent issue (only forward).
+        sqlx::query("UPDATE issues SET updated_at = $1 WHERE id = $2 AND updated_at < $1")
+            .bind(created_at)
+            .bind(issue_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(IssueComment {
+            id: id.to_string(),
+            issue_id: issue_id.to_string(),
+            author_sub: author_sub.to_string(),
+            body: body.to_string(),
+            created_at,
+        })
+    }
+
+    async fn list_comments(&self, issue_id: &str) -> Result<Vec<IssueComment>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {COMMENT_COLS} FROM issue_comments \
+             WHERE issue_id = $1 ORDER BY created_at ASC, id ASC"
+        ))
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::comment_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn create_pull(
@@ -969,8 +1221,68 @@ mod tests {
         assert_eq!(other.number, 1); // independent per repo
 
         assert_eq!(s.open_issue_count("r").await.unwrap(), 2);
-        assert!(s.set_issue_state("i1", "closed").await.unwrap());
+        assert!(s.set_issue_state("i1", "closed", 42).await.unwrap());
         assert_eq!(s.open_issue_count("r").await.unwrap(), 1);
+        // Closing stamps updated_at.
+        assert_eq!(s.get_issue("r", 1).await.unwrap().unwrap().updated_at, 42);
+    }
+
+    #[tokio::test]
+    async fn issue_filter_pagination_and_comments() {
+        let s = InMemoryStore::new();
+        for n in 0..5 {
+            s.create_issue(&format!("i{n}"), "r", "t", "", "u", n).await.unwrap();
+        }
+        // Close #2 and #4.
+        s.set_issue_state("i1", "closed", 100).await.unwrap(); // issue number 2
+        s.set_issue_state("i3", "closed", 100).await.unwrap(); // issue number 4
+
+        assert_eq!(s.count_issues("r", "").await.unwrap(), 5);
+        assert_eq!(s.count_issues("r", "open").await.unwrap(), 3);
+        assert_eq!(s.count_issues("r", "closed").await.unwrap(), 2);
+
+        // Page 1 (limit 2) of ALL issues, newest number first.
+        let page1: Vec<i64> = s
+            .list_issues_page("r", "", 2, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.number)
+            .collect();
+        assert_eq!(page1, vec![5, 4]);
+        let page2: Vec<i64> = s
+            .list_issues_page("r", "", 2, 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.number)
+            .collect();
+        assert_eq!(page2, vec![3, 2]);
+
+        // Filter to closed only.
+        let closed: Vec<i64> = s
+            .list_issues_page("r", "closed", 10, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.number)
+            .collect();
+        assert_eq!(closed, vec![4, 2]);
+
+        // Comments: chronological + last-activity bump on the parent issue.
+        s.create_comment("c1", "i0", "u", "first", 200).await.unwrap();
+        s.create_comment("c2", "i0", "v", "second", 210).await.unwrap();
+        let thread: Vec<String> = s
+            .list_comments("i0")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.body)
+            .collect();
+        assert_eq!(thread, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(s.get_issue("r", 1).await.unwrap().unwrap().updated_at, 210);
+        // A comment on a foreign issue does not appear in this thread.
+        assert!(s.list_comments("nope").await.unwrap().is_empty());
     }
 
     #[tokio::test]

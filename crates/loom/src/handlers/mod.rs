@@ -2,7 +2,7 @@
 //!
 //! - [`health`] — unauthenticated liveness probe (`/healthz`).
 //! - [`repos`] — the SSO web surface: repo list/create, browse (tree/blob), commit history.
-//! - [`issues`] — the per-repo issue tracker (list/create/toggle).
+//! - [`issues`] — the per-repo issue tracker (list/filter, detail + comments, create/comment/toggle).
 //! - [`pats`] — personal-access-token management (mint once / revoke).
 //! - [`smart_http`] — the git smart-HTTP protocol (`/git/...`) with PAT Basic auth.
 //!

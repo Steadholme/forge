@@ -125,6 +125,49 @@ fn post_form(
     b.body(Body::from(body)).unwrap()
 }
 
+/// Like [`post_form`], but also injects an `X-Auth-Groups` header (for admin-gate tests).
+fn post_form_groups(
+    path: &str,
+    fields: &[(&str, &str)],
+    cookie: &str,
+    subject: &str,
+    groups: &str,
+) -> Request<Body> {
+    let body = fields
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, enc(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, format!("__Host-csrf={cookie}"))
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", format!("{subject}@w33d.xyz"))
+        .header("x-auth-groups", groups)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Open an issue through the web flow as `subject`; returns the new issue's detail location.
+async fn open_issue(app: &axum::Router, subject: &str, repo: &str, title: &str, body: &str) -> String {
+    let page = send(app, get(&format!("/r/{repo}/issues"), Some(subject))).await;
+    let csrf = page.csrf_cookie().expect("csrf on issues page");
+    let created = send(
+        app,
+        post_form(
+            &format!("/r/{repo}/issues"),
+            &[("csrf_token", &csrf), ("title", title), ("body", body)],
+            &csrf,
+            Some(subject),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND, "issue create should 302 to detail");
+    created.location()
+}
+
 /// Create a repo through the web flow; returns nothing (assertions inline).
 async fn create_repo(app: &axum::Router, subject: &str, name: &str, visibility: &str) {
     let page = send(app, get("/", Some(subject))).await;
@@ -221,6 +264,140 @@ async fn web_create_repo_issues_and_xss_escaping() {
     assert_eq!(toggled.status, StatusCode::FOUND);
     let after = send(&app, get("/r/alice/proj/issues", Some("alice"))).await;
     assert!(after.body.contains("Closed"));
+}
+
+#[tokio::test]
+async fn issue_detail_comments_filter_and_admin_gate() {
+    let app = app(temp_state());
+    create_repo(&app, "alice", "proj", "").await;
+
+    // bob (not the repo owner) opens an issue with a markdown body.
+    let loc = open_issue(&app, "bob", "alice/proj", "First bug", "**bold** body").await;
+    assert_eq!(loc, "/r/alice/proj/issues/1");
+
+    // Detail page: markdown body rendered, and the author (bob) sees the Close button.
+    let detail = send(&app, get(&loc, Some("bob"))).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.body.contains("#1"));
+    assert!(detail.body.contains("<strong>bold</strong>"), "issue body markdown rendered");
+    assert!(detail.body.contains("Add a comment"));
+    assert!(detail.body.contains("Close issue"), "author sees the close action");
+
+    // carol (neither owner nor author, not admin) sees NO close button on the detail page.
+    let carol_view = send(&app, get(&loc, Some("carol"))).await;
+    assert!(!carol_view.body.contains("Close issue"), "non-moderator has no close action");
+    assert!(carol_view.body.contains("Add a comment"), "any signed-in user can comment");
+    let carol_csrf = carol_view.csrf_cookie().expect("csrf on detail");
+
+    // carol adds a comment with a markdown + XSS payload; markup is rendered, script is escaped.
+    let commented = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/comment",
+            &[
+                ("csrf_token", &carol_csrf),
+                ("body", "_italic_ <script>alert(1)</script>"),
+            ],
+            &carol_csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(commented.status, StatusCode::FOUND);
+    assert_eq!(commented.location(), "/r/alice/proj/issues/1");
+
+    let with_comment = send(&app, get(&loc, Some("bob"))).await;
+    assert!(with_comment.body.contains("<em>italic</em>"), "comment markdown rendered");
+    assert!(!with_comment.body.contains("<script>alert(1)</script>"), "script escaped");
+    assert!(with_comment.body.contains("&lt;script&gt;"));
+    assert!(with_comment.body.contains("carol"), "comment author shown");
+
+    // CSRF is required on comment.
+    let no_csrf = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/comment",
+            &[("csrf_token", "wrong"), ("body", "nope")],
+            "the-cookie",
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::BAD_REQUEST);
+
+    // Empty comment is rejected inline (400), not stored.
+    let empty = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/comment",
+            &[("csrf_token", &carol_csrf), ("body", "   ")],
+            &carol_csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert!(empty.body.contains("Comment cannot be empty."));
+
+    // Second issue, then exercise the open/closed filter.
+    open_issue(&app, "bob", "alice/proj", "Second bug", "").await;
+    // Close issue #1 (bob is the author).
+    let close1 = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/toggle",
+            &[("csrf_token", &carol_csrf)],
+            &carol_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(close1.status, StatusCode::FOUND);
+
+    let open_only = send(&app, get("/r/alice/proj/issues?state=open", Some("bob"))).await;
+    assert!(open_only.body.contains("Second bug"), "open filter shows the open issue");
+    assert!(!open_only.body.contains("First bug"), "open filter hides the closed issue");
+    let closed_only = send(&app, get("/r/alice/proj/issues?state=closed", Some("bob"))).await;
+    assert!(closed_only.body.contains("First bug"), "closed filter shows the closed issue");
+    assert!(!closed_only.body.contains("Second bug"), "closed filter hides the open issue");
+
+    // Admin gate on toggle: carol (non-owner, non-author) is refused without an admin group...
+    let forbidden = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/2/toggle",
+            &[("csrf_token", &carol_csrf)],
+            &carol_csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    // ...but succeeds as an estate admin (X-Auth-Groups: admins).
+    let admin_close = send(
+        &app,
+        post_form_groups(
+            "/r/alice/proj/issues/2/toggle",
+            &[("csrf_token", &carol_csrf)],
+            &carol_csrf,
+            "carol",
+            "admins",
+        ),
+    )
+    .await;
+    assert_eq!(admin_close.status, StatusCode::FOUND, "admin may close a foreign issue");
+    let both_closed = send(&app, get("/r/alice/proj/issues?state=closed", Some("bob"))).await;
+    assert!(both_closed.body.contains("First bug"));
+    assert!(both_closed.body.contains("Second bug"), "admin close landed");
+}
+
+#[tokio::test]
+async fn issue_detail_missing_is_404() {
+    let app = app(temp_state());
+    create_repo(&app, "alice", "proj", "").await;
+    let missing = send(&app, get("/r/alice/proj/issues/999", Some("alice"))).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
 }
 
 /// Run `git --git-dir=<dir> <args>` feeding `stdin`, asserting success; returns trimmed stdout.

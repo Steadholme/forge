@@ -52,7 +52,7 @@ async fn pg_store_full_integration() {
 
     // Raw pool to reset the tables for a clean run.
     let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    for t in ["issues", "pulls", "pats", "repos"] {
+    for t in ["issue_comments", "issues", "pulls", "pats", "repos"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
     }
 
@@ -97,8 +97,10 @@ async fn pg_store_full_integration() {
     assert_eq!(fetched.author_sub, "alice");
     assert!(fetched.is_open());
 
-    assert!(store.set_issue_state("is1", "closed").await.unwrap());
+    assert!(store.set_issue_state("is1", "closed", now + 9).await.unwrap());
     assert_eq!(store.open_issue_count(&repo_id).await.unwrap(), 1);
+    // Closing stamps updated_at.
+    assert_eq!(store.get_issue(&repo_id, 1).await.unwrap().unwrap().updated_at, now + 9);
 
     let listed: Vec<i64> = store
         .list_issues(&repo_id)
@@ -108,6 +110,40 @@ async fn pg_store_full_integration() {
         .map(|i| i.number)
         .collect();
     assert_eq!(listed, vec![2, 1]); // newest number first
+
+    // Filter + pagination via the portable SQL path.
+    assert_eq!(store.count_issues(&repo_id, "").await.unwrap(), 2);
+    assert_eq!(store.count_issues(&repo_id, "open").await.unwrap(), 1);
+    assert_eq!(store.count_issues(&repo_id, "closed").await.unwrap(), 1);
+    let open_only: Vec<i64> = store
+        .list_issues_page(&repo_id, "open", 10, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.number)
+        .collect();
+    assert_eq!(open_only, vec![2]); // is1 (#1) is closed
+    let first_page: Vec<i64> = store
+        .list_issues_page(&repo_id, "", 1, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.number)
+        .collect();
+    assert_eq!(first_page, vec![2]); // newest first, limit 1
+
+    // Comments: chronological thread + last-activity bump on the parent issue.
+    store.create_comment("ic1", "is2", "alice", "first note", now + 20).await.unwrap();
+    store.create_comment("ic2", "is2", "bob", "second note", now + 21).await.unwrap();
+    let thread: Vec<String> = store
+        .list_comments("is2")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.body)
+        .collect();
+    assert_eq!(thread, vec!["first note".to_string(), "second note".to_string()]);
+    assert_eq!(store.get_issue(&repo_id, 2).await.unwrap().unwrap().updated_at, now + 21);
 
     // --- pulls: sequential numbering + state + merge guard -----------------
     let pr1 = store
@@ -165,7 +201,7 @@ async fn pg_store_full_integration() {
     let n: i64 = row.try_get("n").unwrap();
     assert_eq!(n, 4);
 
-    for t in ["issues", "pulls", "pats", "repos"] {
+    for t in ["issue_comments", "issues", "pulls", "pats", "repos"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
     }
     eprintln!("pg_store integration test passed.");
