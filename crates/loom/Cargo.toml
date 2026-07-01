@@ -42,6 +42,9 @@ rand = "0.8"
 # token). RustCrypto — pure Rust, no OpenSSL (matches cairn's posture). `hex` renders the digest.
 sha2 = "0.10"
 hex = "0.4"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
 # Decode the HTTP Basic `Authorization` header on the /git/ smart-HTTP routes (username:PAT).
 # base64 0.22 matches keystone/corvid/sanctum.
 base64 = "0.22"

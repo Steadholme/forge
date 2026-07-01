@@ -36,6 +36,10 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # CSPRNG bytes for the double-submit CSRF token + hex encoding (same as inkwell).
 getrandom = "0.2"
 hex = "0.4"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
+sha2 = "0.10"
 # Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
 # macros, so the build needs NO database. rustls TLS (no openssl). Standard SQL only, so the same
 # statements later run unchanged on FusionDB over pgwire. Atlas owns the `services` annotations

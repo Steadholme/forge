@@ -26,7 +26,7 @@ pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="htt
 pub const LAYERS_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M24 6 6 15l18 9 18-9-18-9Z" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="2" stroke-linejoin="round"/><path d="M6 24l18 9 18-9" stroke="#A5B4FC" stroke-width="2" stroke-linejoin="round" fill="none"/><path d="M6 33l18 9 18-9" stroke="#C7D2FE" stroke-width="2" stroke-linejoin="round" fill="none"/></svg>"##;
 
 /// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
-pub const LOGOUT_URL: &str = "https://id.w33d.xyz/_gw/auth/logout";
+pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
 /// Branded error page shell.
 const ERROR_HTML: &str = include_str!("../../templates/error.html");

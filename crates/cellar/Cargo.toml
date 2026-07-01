@@ -42,6 +42,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 # Content addressing: the SHA-256 of a blob/manifest IS its digest (`sha256:<hex>`). Pure-Rust
 # (ring-free) — no openssl, matching the estate's crypto stack.
 sha2 = "0.10"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
 
 [dev-dependencies]
 # ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).
