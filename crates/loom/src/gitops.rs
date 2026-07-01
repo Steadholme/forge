@@ -50,6 +50,17 @@ pub struct CommitInfo {
     pub subject: String,
 }
 
+/// Outcome of a server-side [`GitOps::merge`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// `head` was already contained in `base`; the ref was not moved.
+    AlreadyUpToDate,
+    /// `base` was fast-forwarded to `head` (no merge commit created).
+    FastForward,
+    /// A two-parent merge commit (its OID) was created and `base` advanced to it.
+    MergeCommit(String),
+}
+
 /// Parsed CGI response from `git http-backend`.
 pub struct CgiOut {
     pub status: u16,
@@ -247,6 +258,223 @@ impl GitOps {
     }
 
     // -----------------------------------------------------------------------
+    // Pull-request plumbing: branch compare (commits ahead + diff) and merge.
+    // -----------------------------------------------------------------------
+
+    /// Resolve a local branch name to its commit OID, or `None` when the branch is absent. The ref
+    /// is addressed as `refs/heads/{branch}`, which never starts with `-` (no option injection).
+    pub async fn branch_oid(&self, owner: &str, name: &str, branch: &str) -> Option<String> {
+        let repo = self.repo_path(owner, name);
+        self.rev(&repo.to_string_lossy(), &format!("refs/heads/{branch}"))
+            .await
+    }
+
+    /// Commits on `head` that are NOT on `base` (`git log base..head`), newest first, capped at
+    /// `limit` — i.e. the commits a PR from `head` into `base` would add. Both branch names are
+    /// resolved through `refs/heads/…`, so neither is ever option-like.
+    pub async fn commits_between(
+        &self,
+        owner: &str,
+        name: &str,
+        base: &str,
+        head: &str,
+        limit: usize,
+    ) -> Vec<CommitInfo> {
+        let repo = self.repo_path(owner, name);
+        let fmt = "--pretty=format:%H%x1f%an%x1f%ae%x1f%at%x1f%s%x00";
+        let max = format!("--max-count={limit}");
+        let range = format!("refs/heads/{base}..refs/heads/{head}");
+        let out = match self
+            .run_git_in_capture(&repo.to_string_lossy(), &["log", &max, fmt, &range])
+            .await
+        {
+            Ok(out) if out.status => out,
+            _ => return Vec::new(),
+        };
+        parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Unified diff of `base..head` (`git diff base..head`) as a UTF-8 string. `None` when the git
+    /// invocation fails (e.g. a branch was deleted). An empty string means the ranges are equal.
+    pub async fn diff(&self, owner: &str, name: &str, base: &str, head: &str) -> Option<String> {
+        let repo = self.repo_path(owner, name);
+        let range = format!("refs/heads/{base}..refs/heads/{head}");
+        let out = self
+            .run_git_in_capture(&repo.to_string_lossy(), &["diff", &range])
+            .await
+            .ok()?;
+        if out.status {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Server-side merge of `head` into `base` on the bare repo, using ONLY git plumbing (no
+    /// working tree). Fast-forwards when possible, otherwise writes a real merge commit via
+    /// `git merge-tree --write-tree` + `git commit-tree`. The `base` ref is advanced with a
+    /// compare-and-swap (old value pinned), so a concurrent push cannot be clobbered. Conflicts
+    /// abort the merge with an error; nothing is written.
+    pub async fn merge(
+        &self,
+        owner: &str,
+        name: &str,
+        base: &str,
+        head: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<MergeOutcome, String> {
+        let repo = self.repo_path(owner, name);
+        let dir = repo.to_string_lossy().to_string();
+        let base_ref = format!("refs/heads/{base}");
+        let head_ref = format!("refs/heads/{head}");
+
+        let base_oid = self
+            .rev(&dir, &base_ref)
+            .await
+            .ok_or_else(|| format!("base branch '{base}' no longer exists"))?;
+        let head_oid = self
+            .rev(&dir, &head_ref)
+            .await
+            .ok_or_else(|| format!("head branch '{head}' no longer exists"))?;
+
+        // Head already contained in base (or identical) — nothing to merge.
+        if base_oid == head_oid || self.is_ancestor(&dir, &head_oid, &base_oid).await {
+            return Ok(MergeOutcome::AlreadyUpToDate);
+        }
+
+        // Base is an ancestor of head — a clean fast-forward.
+        if self.is_ancestor(&dir, &base_oid, &head_oid).await {
+            self.update_ref(&dir, &base_ref, &head_oid, &base_oid).await?;
+            return Ok(MergeOutcome::FastForward);
+        }
+
+        // Divergent histories — compute a merged tree and record a two-parent merge commit.
+        let tree = self.merge_tree(&dir, &base_oid, &head_oid).await?;
+        let commit = self
+            .commit_tree(
+                &dir,
+                &tree,
+                &[&base_oid, &head_oid],
+                message,
+                author_name,
+                author_email,
+            )
+            .await?;
+        self.update_ref(&dir, &base_ref, &commit, &base_oid).await?;
+        Ok(MergeOutcome::MergeCommit(commit))
+    }
+
+    /// `git rev-parse --verify --quiet <refspec>` → the resolved OID, or `None` if it does not
+    /// resolve.
+    async fn rev(&self, dir: &str, refspec: &str) -> Option<String> {
+        let out = self
+            .run_git_in_capture(dir, &["rev-parse", "--verify", "--quiet", refspec])
+            .await
+            .ok()?;
+        if !out.status {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// True when `ancestor` is an ancestor of (or equal to) `descendant`
+    /// (`git merge-base --is-ancestor`). Both inputs are resolved 40-hex OIDs.
+    async fn is_ancestor(&self, dir: &str, ancestor: &str, descendant: &str) -> bool {
+        matches!(
+            self.run_git_in_capture(dir, &["merge-base", "--is-ancestor", ancestor, descendant])
+                .await,
+            Ok(out) if out.status
+        )
+    }
+
+    /// `git merge-tree --write-tree <base> <head>` → the merged tree OID. Errors (with git's
+    /// conflict summary) when the three-way merge does not apply cleanly.
+    async fn merge_tree(&self, dir: &str, base: &str, head: &str) -> Result<String, String> {
+        let out = self
+            .run_git_in_capture(dir, &["merge-tree", "--write-tree", base, head])
+            .await
+            .map_err(|e| format!("merge-tree failed: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !out.status {
+            return Err("the branches have conflicting changes that must be resolved manually"
+                .to_string());
+        }
+        // On success the first line is the merged tree OID.
+        stdout
+            .lines()
+            .next()
+            .map(|l| l.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "merge-tree produced no tree".to_string())
+    }
+
+    /// `git commit-tree <tree> -p <parent>… -m <message>` with the merging user's identity as both
+    /// author and committer → the new commit OID.
+    async fn commit_tree(
+        &self,
+        dir: &str,
+        tree: &str,
+        parents: &[&str],
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<String, String> {
+        let mut args: Vec<&str> = vec!["commit-tree", tree];
+        for p in parents {
+            args.push("-p");
+            args.push(p);
+        }
+        args.push("-m");
+        args.push(message);
+        let env = [
+            ("GIT_AUTHOR_NAME", author_name),
+            ("GIT_AUTHOR_EMAIL", author_email),
+            ("GIT_COMMITTER_NAME", author_name),
+            ("GIT_COMMITTER_EMAIL", author_email),
+        ];
+        let out = self
+            .run_git_capture_env(dir, &args, &env)
+            .await
+            .map_err(|e| format!("commit-tree failed: {e}"))?;
+        if !out.status {
+            return Err("could not create the merge commit".to_string());
+        }
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if oid.is_empty() {
+            Err("commit-tree produced no commit".to_string())
+        } else {
+            Ok(oid)
+        }
+    }
+
+    /// `git update-ref <ref> <new> <old>` — a compare-and-swap advance of a branch ref (fails if
+    /// the ref moved off `old` since we read it).
+    async fn update_ref(
+        &self,
+        dir: &str,
+        refname: &str,
+        new_oid: &str,
+        old_oid: &str,
+    ) -> Result<(), String> {
+        let out = self
+            .run_git_in_capture(dir, &["update-ref", refname, new_oid, old_oid])
+            .await
+            .map_err(|e| format!("update-ref failed: {e}"))?;
+        if out.status {
+            Ok(())
+        } else {
+            Err("the base branch moved during the merge; retry".to_string())
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Smart-HTTP CGI (`git http-backend`)
     // -----------------------------------------------------------------------
 
@@ -339,6 +567,32 @@ impl GitOps {
             .stdin(Stdio::null())
             .output()
             .await?;
+        Ok(CapturedOut {
+            status: out.status.success(),
+            stdout: out.stdout,
+        })
+    }
+
+    /// Like [`run_git_in_capture`], but also injects the given environment pairs (used to set the
+    /// committer identity for `commit-tree`). `safe.directory=*` is preserved via GIT_CONFIG.
+    async fn run_git_capture_env(
+        &self,
+        repo_dir: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> std::io::Result<CapturedOut> {
+        let mut full: Vec<&str> = vec!["--git-dir", repo_dir];
+        full.extend_from_slice(args);
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.args(&full)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "safe.directory")
+            .env("GIT_CONFIG_VALUE_0", "*")
+            .stdin(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().await?;
         Ok(CapturedOut {
             status: out.status.success(),
             stdout: out.stdout,

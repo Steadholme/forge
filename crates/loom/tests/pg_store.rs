@@ -52,7 +52,7 @@ async fn pg_store_full_integration() {
 
     // Raw pool to reset the tables for a clean run.
     let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    for t in ["issues", "pats", "repos"] {
+    for t in ["issues", "pulls", "pats", "repos"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
     }
 
@@ -109,6 +109,37 @@ async fn pg_store_full_integration() {
         .collect();
     assert_eq!(listed, vec![2, 1]); // newest number first
 
+    // --- pulls: sequential numbering + state + merge guard -----------------
+    let pr1 = store
+        .create_pull("pl1", &repo_id, "add x", "body", "main", "feat", "alice", now)
+        .await
+        .unwrap();
+    let pr2 = store
+        .create_pull("pl2", &repo_id, "add y", "", "main", "fix", "bob", now + 1)
+        .await
+        .unwrap();
+    assert_eq!(pr1.number, 1);
+    assert_eq!(pr2.number, 2);
+    assert_eq!(store.open_pull_count(&repo_id).await.unwrap(), 2);
+
+    let listed_pulls: Vec<i64> = store
+        .list_pulls(&repo_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.number)
+        .collect();
+    assert_eq!(listed_pulls, vec![2, 1]); // newest number first
+
+    assert!(store.set_pull_state("pl2", "closed").await.unwrap());
+    assert!(store.merge_pull("pl1", now + 5).await.unwrap());
+    let merged = store.get_pull(&repo_id, 1).await.unwrap().unwrap();
+    assert!(merged.is_merged());
+    assert_eq!(merged.merged_at, now + 5);
+    // The merge guard refuses a second merge (already non-open).
+    assert!(!store.merge_pull("pl1", now + 6).await.unwrap());
+    assert_eq!(store.open_pull_count(&repo_id).await.unwrap(), 0);
+
     // --- pats: hash lookup + ownership-scoped revoke -----------------------
     store
         .create_pat(&Pat {
@@ -134,7 +165,7 @@ async fn pg_store_full_integration() {
     let n: i64 = row.try_get("n").unwrap();
     assert_eq!(n, 4);
 
-    for t in ["issues", "pats", "repos"] {
+    for t in ["issues", "pulls", "pats", "repos"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
     }
     eprintln!("pg_store integration test passed.");

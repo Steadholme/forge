@@ -50,6 +50,45 @@ impl Issue {
     }
 }
 
+/// A pull request: a request to merge the `head` branch into the `base` branch of one repository.
+/// Field order/types mirror the `pulls` table exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pull {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id.
+    pub repo_id: String,
+    /// Per-repo sequential PR number (1-based; display key), independent of issue numbers.
+    pub number: i64,
+    /// PR title.
+    pub title: String,
+    /// PR description (markdown rendered as sanitised HTML).
+    pub body: String,
+    /// Base branch — the branch the changes merge INTO (e.g. `main`).
+    pub base: String,
+    /// Head branch — the branch that CARRIES the changes.
+    pub head: String,
+    /// Author subject from `X-Auth-Subject`.
+    pub author_sub: String,
+    /// `open`, `merged`, or `closed`.
+    pub state: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+    /// Merge time, epoch seconds; `0` while the PR has never been merged.
+    pub merged_at: i64,
+}
+
+impl Pull {
+    /// True when the PR is still open (neither merged nor closed).
+    pub fn is_open(&self) -> bool {
+        self.state == "open"
+    }
+    /// True when the PR has been merged.
+    pub fn is_merged(&self) -> bool {
+        self.state == "merged"
+    }
+}
+
 /// A personal access token. Only the SHA-256 hash is stored; the secret is shown once at mint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pat {

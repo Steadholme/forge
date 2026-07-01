@@ -368,6 +368,140 @@ async fn pat_mint_shows_secret_once() {
 }
 
 // ===========================================================================
+// Pull requests: compare (commits ahead + diff), create, gated merge
+// ===========================================================================
+
+/// Seed `main` (one commit) and `feature` (a second commit on top of it, so a merge of feature
+/// into main fast-forwards). Returns the head OID of `feature`.
+fn seed_two_branches(git_dir: &str) -> String {
+    // main: file.txt = "one\n"
+    let blob_a = git_capture(git_dir, &["hash-object", "-w", "--stdin"], "one\n");
+    let tree_a = git_capture(git_dir, &["mktree"], &format!("100644 blob {blob_a}\tfile.txt\n"));
+    let commit_a = git_capture(git_dir, &["commit-tree", &tree_a, "-m", "A"], "");
+    git_capture(git_dir, &["update-ref", "refs/heads/main", &commit_a], "");
+
+    // feature: file.txt = "one\ntwo\n", parented on A (fast-forward relationship).
+    let blob_b = git_capture(git_dir, &["hash-object", "-w", "--stdin"], "one\ntwo\n");
+    let tree_b = git_capture(git_dir, &["mktree"], &format!("100644 blob {blob_b}\tfile.txt\n"));
+    let commit_b =
+        git_capture(git_dir, &["commit-tree", &tree_b, "-p", &commit_a, "-m", "B"], "");
+    git_capture(git_dir, &["update-ref", "refs/heads/feature", &commit_b], "");
+    commit_b
+}
+
+#[tokio::test]
+async fn pull_request_compare_create_and_merge() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+
+    // --- compare: commits ahead + escaped diff -----------------------------
+    let cmp = send(
+        &app,
+        get("/r/alice/proj/compare?base=main&head=feature", Some("alice")),
+    )
+    .await;
+    assert_eq!(cmp.status, StatusCode::OK);
+    assert!(cmp.body.contains("Create pull request"));
+    assert!(cmp.body.contains("diff-row--add"), "diff shows an added line");
+    assert!(cmp.body.contains("two"), "added content present");
+    let csrf = cmp.csrf_cookie().expect("csrf on compare");
+
+    // --- create the PR -----------------------------------------------------
+    let created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls",
+            &[
+                ("csrf_token", &csrf),
+                ("base", "main"),
+                ("head", "feature"),
+                ("title", "Add second line"),
+                ("body", "please review"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+    assert_eq!(created.location(), "/r/alice/proj/pulls/1");
+
+    // List shows the open PR.
+    let list = send(&app, get("/r/alice/proj/pulls", Some("alice"))).await;
+    assert!(list.body.contains("#1"));
+    assert!(list.body.contains("Open"));
+
+    // Detail shows the merge button for the owner.
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.body.contains("Merge pull request"));
+    let csrf = detail.csrf_cookie().expect("csrf on detail");
+
+    // --- gating: a non-owner, non-author cannot merge (403) ----------------
+    let forbidden = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", "x")],
+            "x",
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    // --- CSRF is required on merge -----------------------------------------
+    let no_csrf = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", "wrong")],
+            "the-cookie",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::BAD_REQUEST);
+
+    // --- merge (owner) -> fast-forward -------------------------------------
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(merged.status, StatusCode::FOUND);
+
+    // main now points at feature's commit (the fast-forward landed on disk).
+    let main_oid = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_eq!(main_oid, feature_oid, "base fast-forwarded to head");
+
+    // Detail now reports the PR as merged, and re-merging is refused.
+    let after = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(after.body.contains("Merged"));
+    let csrf2 = after.csrf_cookie().unwrap();
+    let remerge = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf2)],
+            &csrf2,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(remerge.status, StatusCode::BAD_REQUEST, "merged PR is terminal");
+}
+
+// ===========================================================================
 // git smart-HTTP: advertisement + PAT auth policy
 // ===========================================================================
 

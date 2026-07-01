@@ -16,6 +16,7 @@
 pub mod health;
 pub mod issues;
 pub mod pats;
+pub mod pulls;
 pub mod repos;
 pub mod smart_http;
 

@@ -158,7 +158,14 @@ async fn render_issues(
     error: Option<&str>,
 ) -> String {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
-    let header = render_repo_header(repo, &state.config.public_base_url, open_issues, "issues");
+    let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    let header = render_repo_header(
+        repo,
+        &state.config.public_base_url,
+        open_issues,
+        open_pulls,
+        "issues",
+    );
 
     let error_block = match error {
         Some(msg) => format!(

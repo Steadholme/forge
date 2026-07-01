@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::REPO_LIST_LIMIT;
-use crate::model::{Issue, Pat, Repo};
+use crate::model::{Issue, Pat, Pull, Repo};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -72,6 +72,38 @@ pub trait Store: Send + Sync {
     /// Count of OPEN issues on a repo (for the repo header badge).
     async fn open_issue_count(&self, repo_id: &str) -> Result<i64, StoreError>;
 
+    // --- pulls ---------------------------------------------------------------
+    /// Create a pull request, atomically allocating the next per-repo `number`. Returns the stored
+    /// PR (with its assigned number and `open` state).
+    #[allow(clippy::too_many_arguments)]
+    async fn create_pull(
+        &self,
+        id: &str,
+        repo_id: &str,
+        title: &str,
+        body: &str,
+        base: &str,
+        head: &str,
+        author_sub: &str,
+        created_at: i64,
+    ) -> Result<Pull, StoreError>;
+
+    /// All pull requests on a repo, newest number first.
+    async fn list_pulls(&self, repo_id: &str) -> Result<Vec<Pull>, StoreError>;
+
+    /// One pull request by its per-repo number.
+    async fn get_pull(&self, repo_id: &str, number: i64) -> Result<Option<Pull>, StoreError>;
+
+    /// Set a PR's state (`open`/`closed`) by id. Returns whether a row changed.
+    async fn set_pull_state(&self, id: &str, state: &str) -> Result<bool, StoreError>;
+
+    /// Mark a PR merged: sets `state='merged'` and records `merged_at`. Returns whether a row
+    /// changed (false when the PR is already non-open, guarding a double-merge).
+    async fn merge_pull(&self, id: &str, merged_at: i64) -> Result<bool, StoreError>;
+
+    /// Count of OPEN pull requests on a repo (for the repo header badge).
+    async fn open_pull_count(&self, repo_id: &str) -> Result<i64, StoreError>;
+
     // --- pats ----------------------------------------------------------------
     /// Insert a personal access token (only the hash is stored).
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError>;
@@ -96,6 +128,7 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     repos: Mutex<Vec<Repo>>,
     issues: Mutex<Vec<Issue>>,
+    pulls: Mutex<Vec<Pull>>,
     pats: Mutex<Vec<Pat>>,
 }
 
@@ -220,6 +253,94 @@ impl Store for InMemoryStore {
             .count() as i64)
     }
 
+    async fn create_pull(
+        &self,
+        id: &str,
+        repo_id: &str,
+        title: &str,
+        body: &str,
+        base: &str,
+        head: &str,
+        author_sub: &str,
+        created_at: i64,
+    ) -> Result<Pull, StoreError> {
+        let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
+        let number = pulls
+            .iter()
+            .filter(|p| p.repo_id == repo_id)
+            .map(|p| p.number)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let pull = Pull {
+            id: id.to_string(),
+            repo_id: repo_id.to_string(),
+            number,
+            title: title.to_string(),
+            body: body.to_string(),
+            base: base.to_string(),
+            head: head.to_string(),
+            author_sub: author_sub.to_string(),
+            state: "open".to_string(),
+            created_at,
+            merged_at: 0,
+        };
+        pulls.push(pull.clone());
+        Ok(pull)
+    }
+
+    async fn list_pulls(&self, repo_id: &str) -> Result<Vec<Pull>, StoreError> {
+        let pulls = self.pulls.lock().expect("pulls lock poisoned");
+        let mut out: Vec<Pull> = pulls
+            .iter()
+            .filter(|p| p.repo_id == repo_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.number));
+        Ok(out)
+    }
+
+    async fn get_pull(&self, repo_id: &str, number: i64) -> Result<Option<Pull>, StoreError> {
+        let pulls = self.pulls.lock().expect("pulls lock poisoned");
+        Ok(pulls
+            .iter()
+            .find(|p| p.repo_id == repo_id && p.number == number)
+            .cloned())
+    }
+
+    async fn set_pull_state(&self, id: &str, state: &str) -> Result<bool, StoreError> {
+        let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
+        for p in pulls.iter_mut() {
+            if p.id == id {
+                let changed = p.state != state;
+                p.state = state.to_string();
+                return Ok(changed);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn merge_pull(&self, id: &str, merged_at: i64) -> Result<bool, StoreError> {
+        let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
+        for p in pulls.iter_mut() {
+            // Only an OPEN PR can transition to merged (guards a concurrent double-merge).
+            if p.id == id && p.is_open() {
+                p.state = "merged".to_string();
+                p.merged_at = merged_at;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn open_pull_count(&self, repo_id: &str) -> Result<i64, StoreError> {
+        let pulls = self.pulls.lock().expect("pulls lock poisoned");
+        Ok(pulls
+            .iter()
+            .filter(|p| p.repo_id == repo_id && p.is_open())
+            .count() as i64)
+    }
+
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError> {
         let mut pats = self.pats.lock().expect("pats lock poisoned");
         pats.push(pat.clone());
@@ -265,6 +386,8 @@ const REPO_COLS: &str =
     "id, owner_sub, name, description, is_private, default_branch, created_at";
 const ISSUE_COLS: &str =
     "id, repo_id, number, title, body, author_sub, state, created_at";
+const PULL_COLS: &str =
+    "id, repo_id, number, title, body, base_branch, head_branch, author_sub, state, created_at, merged_at";
 const PAT_COLS: &str = "id, owner_sub, name, token_hash, created_at";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
@@ -336,6 +459,33 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Pull requests. `base`/`head` are branch names; stored as `base_branch`/`head_branch`
+        // to avoid any brush with reserved words. `merged_at` is BIGINT (0 = never merged) rather
+        // than a nullable column, so the row mapping stays a plain non-Option BIGINT read.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pulls (\
+                 id TEXT PRIMARY KEY, \
+                 repo_id TEXT NOT NULL, \
+                 number BIGINT NOT NULL, \
+                 title TEXT NOT NULL, \
+                 body TEXT NOT NULL DEFAULT '', \
+                 base_branch TEXT NOT NULL, \
+                 head_branch TEXT NOT NULL, \
+                 author_sub TEXT NOT NULL, \
+                 state TEXT NOT NULL DEFAULT 'open', \
+                 created_at BIGINT NOT NULL, \
+                 merged_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Per-repo PR numbering uniqueness (backs the race-safe ON CONFLICT retry).
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pulls_repo_number \
+             ON pulls (repo_id, number)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Token verification lookup on the hot /git/ path.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_pats_token_hash ON pats (token_hash)",
@@ -372,6 +522,22 @@ impl PgStore {
             author_sub: row.try_get("author_sub")?,
             state: row.try_get("state")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn pull_from_row(row: &sqlx::postgres::PgRow) -> Result<Pull, sqlx::Error> {
+        Ok(Pull {
+            id: row.try_get("id")?,
+            repo_id: row.try_get("repo_id")?,
+            number: row.try_get("number")?,
+            title: row.try_get("title")?,
+            body: row.try_get("body")?,
+            base: row.try_get("base_branch")?,
+            head: row.try_get("head_branch")?,
+            author_sub: row.try_get("author_sub")?,
+            state: row.try_get("state")?,
+            created_at: row.try_get("created_at")?,
+            merged_at: row.try_get("merged_at")?,
         })
     }
 
@@ -561,6 +727,137 @@ impl Store for PgStore {
         row.try_get("n").map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn create_pull(
+        &self,
+        id: &str,
+        repo_id: &str,
+        title: &str,
+        body: &str,
+        base: &str,
+        head: &str,
+        author_sub: &str,
+        created_at: i64,
+    ) -> Result<Pull, StoreError> {
+        // Allocate the next per-repo number and insert; on the rare concurrent collision the
+        // unique index rejects the row (0 affected) and we retry with a fresh max.
+        for _ in 0..8 {
+            let row = sqlx::query(
+                "SELECT COALESCE(MAX(number), 0) + 1 AS next FROM pulls WHERE repo_id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let number: i64 = row
+                .try_get("next")
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+            let result = sqlx::query(
+                "INSERT INTO pulls \
+                     (id, repo_id, number, title, body, base_branch, head_branch, author_sub, \
+                      state, created_at, merged_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9, 0) \
+                 ON CONFLICT (repo_id, number) DO NOTHING",
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(number)
+            .bind(title)
+            .bind(body)
+            .bind(base)
+            .bind(head)
+            .bind(author_sub)
+            .bind(created_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+            if result.rows_affected() == 1 {
+                return Ok(Pull {
+                    id: id.to_string(),
+                    repo_id: repo_id.to_string(),
+                    number,
+                    title: title.to_string(),
+                    body: body.to_string(),
+                    base: base.to_string(),
+                    head: head.to_string(),
+                    author_sub: author_sub.to_string(),
+                    state: "open".to_string(),
+                    created_at,
+                    merged_at: 0,
+                });
+            }
+        }
+        Err(StoreError::Backend(
+            "could not allocate a pull-request number".to_string(),
+        ))
+    }
+
+    async fn list_pulls(&self, repo_id: &str) -> Result<Vec<Pull>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {PULL_COLS} FROM pulls WHERE repo_id = $1 ORDER BY number DESC"
+        ))
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::pull_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_pull(&self, repo_id: &str, number: i64) -> Result<Option<Pull>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {PULL_COLS} FROM pulls WHERE repo_id = $1 AND number = $2"
+        ))
+        .bind(repo_id)
+        .bind(number)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::pull_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_pull_state(&self, id: &str, state: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE pulls SET state = $1 WHERE id = $2")
+            .bind(state)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn merge_pull(&self, id: &str, merged_at: i64) -> Result<bool, StoreError> {
+        // Guard the transition in SQL: only an OPEN row flips to merged, so two racing merges
+        // cannot both succeed (the second sees 0 rows affected).
+        let result = sqlx::query(
+            "UPDATE pulls SET state = 'merged', merged_at = $1 \
+             WHERE id = $2 AND state = 'open'",
+        )
+        .bind(merged_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn open_pull_count(&self, repo_id: &str) -> Result<i64, StoreError> {
+        let row = sqlx::query(
+            "SELECT count(*) AS n FROM pulls WHERE repo_id = $1 AND state = 'open'",
+        )
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.try_get("n").map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO pats (id, owner_sub, name, token_hash, created_at) \
@@ -674,6 +971,48 @@ mod tests {
         assert_eq!(s.open_issue_count("r").await.unwrap(), 2);
         assert!(s.set_issue_state("i1", "closed").await.unwrap());
         assert_eq!(s.open_issue_count("r").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_numbers_state_and_merge_guard() {
+        let s = InMemoryStore::new();
+        let p1 = s
+            .create_pull("pl1", "r", "first", "b", "main", "feat", "u", 10)
+            .await
+            .unwrap();
+        let p2 = s
+            .create_pull("pl2", "r", "second", "", "main", "fix", "v", 11)
+            .await
+            .unwrap();
+        let other = s
+            .create_pull("pl3", "other", "x", "", "main", "wip", "u", 12)
+            .await
+            .unwrap();
+        assert_eq!(p1.number, 1);
+        assert_eq!(p2.number, 2);
+        assert_eq!(other.number, 1); // independent per repo
+        assert!(p1.is_open());
+        assert_eq!(s.open_pull_count("r").await.unwrap(), 2);
+
+        // newest number first
+        let listed: Vec<i64> = s
+            .list_pulls("r")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(listed, vec![2, 1]);
+
+        // Close p2, merge p1.
+        assert!(s.set_pull_state("pl2", "closed").await.unwrap());
+        assert!(s.merge_pull("pl1", 99).await.unwrap());
+        let merged = s.get_pull("r", 1).await.unwrap().unwrap();
+        assert!(merged.is_merged());
+        assert_eq!(merged.merged_at, 99);
+        // A second merge is refused (already non-open) — the double-merge guard.
+        assert!(!s.merge_pull("pl1", 100).await.unwrap());
+        assert_eq!(s.open_pull_count("r").await.unwrap(), 0);
     }
 
     #[tokio::test]

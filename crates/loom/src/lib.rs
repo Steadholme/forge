@@ -77,6 +77,26 @@ pub fn app(state: AppState) -> Router {
             "/r/{owner}/{name}/issues/{number}/toggle",
             post(handlers::issues::toggle),
         )
+        .route(
+            "/r/{owner}/{name}/compare",
+            get(handlers::pulls::compare),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls",
+            get(handlers::pulls::list).post(handlers::pulls::create),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}",
+            get(handlers::pulls::detail),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/merge",
+            post(handlers::pulls::merge),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/toggle",
+            post(handlers::pulls::toggle),
+        )
         .route("/pats", get(handlers::pats::index).post(handlers::pats::create))
         .route("/pats/{id}/revoke", post(handlers::pats::revoke))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):

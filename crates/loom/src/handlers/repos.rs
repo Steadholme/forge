@@ -172,7 +172,15 @@ pub async fn blob(
         .ok_or_else(|| AppError::NotFound("No such file in the default branch.".to_string()))?;
 
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
-    let body = render_blob(&repo, &state.config.public_base_url, open_issues, &path, &bytes);
+    let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    let body = render_blob(
+        &repo,
+        &state.config.public_base_url,
+        open_issues,
+        open_pulls,
+        &path,
+        &bytes,
+    );
     Ok(html_ok(page(
         &format!("{}/{}", owner, name),
         Some(&who.email),
@@ -330,7 +338,9 @@ async fn render_code_page(
     subpath: &str,
 ) -> Result<String, AppError> {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
-    let header = render_repo_header(repo, &state.config.public_base_url, open_issues, "code");
+    let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    let header =
+        render_repo_header(repo, &state.config.public_base_url, open_issues, open_pulls, "code");
 
     let head = state.git.head_commit(&repo.owner_sub, &repo.name).await;
     let Some(commit) = head else {
@@ -452,6 +462,7 @@ pub(crate) fn render_repo_header(
     repo: &Repo,
     base_url: &str,
     open_issues: i64,
+    open_pulls: i64,
     active: &str,
 ) -> String {
     let badge = if repo.is_private {
@@ -471,6 +482,7 @@ pub(crate) fn render_repo_header(
         repo.name
     );
     let code_active = if active == "code" { " tab--active" } else { "" };
+    let pulls_active = if active == "pulls" { " tab--active" } else { "" };
     let issues_active = if active == "issues" { " tab--active" } else { "" };
     format!(
         r##"<div class="console__head">
@@ -486,6 +498,7 @@ pub(crate) fn render_repo_header(
 </div>
 <nav class="tabs">
   <a class="tab{code_active}" href="/r/{owner}/{name}">Code</a>
+  <a class="tab{pulls_active}" href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span></a>
   <a class="tab{issues_active}" href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span></a>
 </nav>"##,
         owner = esc(&repo.owner_sub),
@@ -494,8 +507,10 @@ pub(crate) fn render_repo_header(
         desc = desc,
         clone = esc(&clone_url),
         code_active = code_active,
+        pulls_active = pulls_active,
         issues_active = issues_active,
         open_issues = open_issues,
+        open_pulls = open_pulls,
     )
 }
 
@@ -581,8 +596,15 @@ fn render_file_browser(repo: &Repo, subpath: &str, entries: &[TreeEntry]) -> Str
 }
 
 /// File-view card: repo header + breadcrumb + escaped file content (or a binary/too-large notice).
-fn render_blob(repo: &Repo, base_url: &str, open_issues: i64, path: &str, bytes: &[u8]) -> String {
-    let header = render_repo_header(repo, base_url, open_issues, "code");
+fn render_blob(
+    repo: &Repo,
+    base_url: &str,
+    open_issues: i64,
+    open_pulls: i64,
+    path: &str,
+    bytes: &[u8],
+) -> String {
+    let header = render_repo_header(repo, base_url, open_issues, open_pulls, "code");
     let content = if bytes.contains(&0) {
         "<div class=\"card__body\"><p class=\"muted\">Binary file not shown.</p></div>".to_string()
     } else if bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
@@ -671,7 +693,7 @@ fn normalize_branch(b: &str) -> String {
 }
 
 /// Validate a git branch name (conservative subset; enough for a default branch).
-fn validate_branch_name(b: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_branch_name(b: &str) -> Result<(), &'static str> {
     if b.is_empty() || b.len() > 64 {
         return Err("Branch name must be 1–64 characters.");
     }
