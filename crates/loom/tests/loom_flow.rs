@@ -390,6 +390,25 @@ async fn issue_detail_comments_filter_and_admin_gate() {
     let both_closed = send(&app, get("/r/alice/proj/issues?state=closed", Some("bob"))).await;
     assert!(both_closed.body.contains("First bug"));
     assert!(both_closed.body.contains("Second bug"), "admin close landed");
+
+    // Delegated admin: a product-scoped operator (X-Auth-Groups: git-admins) may ALSO moderate a
+    // foreign issue — here reopening issue 2 — WITHOUT being in a global admin group.
+    let delegated_toggle = send(
+        &app,
+        post_form_groups(
+            "/r/alice/proj/issues/2/toggle",
+            &[("csrf_token", &carol_csrf)],
+            &carol_csrf,
+            "carol",
+            "git-admins",
+        ),
+    )
+    .await;
+    assert_eq!(
+        delegated_toggle.status,
+        StatusCode::FOUND,
+        "git-admins operator may moderate a foreign issue"
+    );
 }
 
 #[tokio::test]

@@ -104,6 +104,16 @@ async fn admin_gate_forbids_non_admins_and_allows_admins() {
     // 4. `infra-admins` is also allowed.
     let infra = get_admin(&app, Some("infra-admins")).await;
     assert_eq!(infra.status, StatusCode::OK);
+
+    // 5. Delegated admin: the product-scoped operator group (default "registry-admins") reaches the
+    //    panel too, without belonging to either global admin group.
+    let registry = get_admin(&app, Some("registry-admins")).await;
+    assert_eq!(registry.status, StatusCode::OK, "{}", registry.text());
+    assert!(registry.text().contains("Registry administration"));
+
+    // 6. A random unrelated group is still forbidden.
+    let random = get_admin(&app, Some("random-group")).await;
+    assert_eq!(random.status, StatusCode::FORBIDDEN, "{}", random.text());
 }
 
 #[tokio::test]

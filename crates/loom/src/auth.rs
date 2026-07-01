@@ -72,9 +72,35 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 // Group-based authorization (X-Auth-Groups)
 // ---------------------------------------------------------------------------
 
-/// Group names that grant estate-admin authority. Membership in ANY of these lets a user moderate
-/// content they do not own (e.g. close another user's issue). Same shape as cellar's `ADMIN_GROUPS`.
+/// The two GLOBAL admin groups that ALWAYS grant estate-admin authority, in EVERY crate. Kept as
+/// the immutable default seed for [`admin_groups`] — never removed, so anything an `admins` /
+/// `infra-admins` member can do today keeps working unchanged.
 pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// Default PRODUCT-scoped operator group for Loom (git hosting). Overridable via `LOOM_ADMIN_GROUP`.
+pub const PRODUCT_ADMIN_GROUP: &str = "git-admins";
+
+/// DELEGATED ADMIN — the effective admin set is the two globals PLUS one product-scoped operator
+/// group, so Loom administration (the issue-moderation gate, etc.) can be handed to a scoped
+/// operator via Census WITHOUT granting global `admins`. The product group is read ONCE from
+/// `LOOM_ADMIN_GROUP` (default [`PRODUCT_ADMIN_GROUP`] = `"git-admins"`); the two globals are always
+/// present, so this is purely ADDITIVE — behaviour is identical until someone is put in the new
+/// group. See [`is_admin`].
+pub fn admin_groups() -> &'static [String] {
+    static GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+    GROUPS.get_or_init(|| {
+        let product = std::env::var("LOOM_ADMIN_GROUP")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| PRODUCT_ADMIN_GROUP.to_string());
+        let mut groups: Vec<String> = ADMIN_GROUPS.iter().map(|s| s.to_string()).collect();
+        if !groups.iter().any(|g| g == &product) {
+            groups.push(product);
+        }
+        groups
+    })
+}
 
 /// The signed-in user's groups, parsed from the comma-separated `X-Auth-Groups` header (injected
 /// AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
@@ -95,10 +121,10 @@ pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
     author_groups(headers).iter().any(|g| g == group)
 }
 
-/// Whether the signed-in user is in ANY [`ADMIN_GROUPS`] entry.
+/// Whether the signed-in user is in ANY [`admin_groups`] entry (the two globals + the product group).
 pub fn is_admin(headers: &HeaderMap) -> bool {
     let groups = author_groups(headers);
-    ADMIN_GROUPS.iter().any(|a| groups.iter().any(|g| g == a))
+    admin_groups().iter().any(|a| groups.iter().any(|g| g == a))
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +341,18 @@ mod tests {
         let mut infra = HeaderMap::new();
         infra.insert(HEADER_GROUPS, HeaderValue::from_static("infra-admins"));
         assert!(is_admin(&infra));
+
+        // Delegated admin: the product-scoped operator group (default "git-admins") is ALSO
+        // accepted, WITHOUT belonging to either global admin group.
+        let mut product = HeaderMap::new();
+        product.insert(HEADER_GROUPS, HeaderValue::from_static("git-admins"));
+        assert!(is_admin(&product));
+        // The resolved set is exactly the two globals plus the product group.
+        assert_eq!(admin_groups(), ["admins", "infra-admins", "git-admins"]);
+        // A random unrelated group is still refused (403 at the gate).
+        let mut random = HeaderMap::new();
+        random.insert(HEADER_GROUPS, HeaderValue::from_static("random-group"));
+        assert!(!is_admin(&random));
     }
 
     #[test]
