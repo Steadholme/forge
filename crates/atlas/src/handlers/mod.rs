@@ -4,8 +4,8 @@
 //! detail + annotation editor, the topology graph, and the JSON inventory.
 //!
 //! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
-//! matching the HOLDFAST enterprise brand (the same dark command-center look as Keystone/inkwell):
-//! shield lockup, indigo accent, status pills, cards.
+//! matching the estate's Odyssey design language (light neutral canvas, white hairline-bordered
+//! cards, indigo accent): shield lockup, status pills, flat soft-color chips.
 
 pub mod catalog;
 pub mod health;
@@ -57,6 +57,7 @@ pub fn topbar(page_title: &str, email: &str) -> String {
     <a class="brand" href="/" aria-label="HOLDFAST Atlas">
       <span class="brand__glyph" aria-hidden="true">{shield}</span>
       <span class="brand__word">HOLDFAST</span>
+      <span class="brand__product">Atlas</span>
     </a>
     <div class="topbar__right">
       <span class="topbar__title">{title}</span>
@@ -151,6 +152,10 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
     <a class="btn btn-primary" href="/">Back to the catalog</a>
   </div>
 </main>
+<footer class="site-foot">
+  <span>HOLDFAST · Atlas</span>
+  <span>Estate ops atlas · part of the HOLDFAST estate</span>
+</footer>
 </body></html>"#,
         css = APP_CSS,
         topbar = topbar("Atlas", "—"),
