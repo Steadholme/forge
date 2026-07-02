@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use loom::model::{CommitStatus, Pat, Repo};
+use loom::model::{CommitStatus, Pat, Release, Repo};
 use loom::now_secs;
 use loom::store::{PgStore, Store};
 use sqlx::postgres::PgPoolOptions;
@@ -52,6 +52,22 @@ fn commit_status(repo_id: &str, context: &str, state: &str, updated_at: i64) -> 
     }
 }
 
+fn release(id: &str, repo_id: &str, tag: &str, created_at: i64, draft: bool) -> Release {
+    Release {
+        id: id.to_string(),
+        repo_id: repo_id.to_string(),
+        tag_name: tag.to_string(),
+        target_commit: format!("{tag}-commit"),
+        title: format!("Release {tag}"),
+        body_md: format!("notes for {tag}"),
+        is_prerelease: false,
+        is_draft: draft,
+        created_by: "alice".to_string(),
+        created_at,
+        published_at: if draft { 0 } else { created_at },
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_store_full_integration() {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
@@ -82,6 +98,7 @@ async fn pg_store_full_integration() {
         "pr_review_comments",
         "pr_reviews",
         "commit_statuses",
+        "releases",
         "issues",
         "pulls",
         "labels",
@@ -164,6 +181,53 @@ async fn pg_store_full_integration() {
 
     // --- issues: sequential numbering per repo + state ---------------------
     let repo_id = got.id.clone();
+    let r1 = release("rl1", &repo_id, "v1.0.0", now + 5, false);
+    let r2 = release("rl2", &repo_id, "v2.0.0", now + 6, true);
+    assert_eq!(store.create_release(&r1).await.unwrap(), Some(r1.clone()));
+    assert!(
+        store
+            .create_release(&release("rl_dup", &repo_id, "v1.0.0", now + 7, false))
+            .await
+            .unwrap()
+            .is_none(),
+        "one release per repo tag"
+    );
+    assert_eq!(store.create_release(&r2).await.unwrap(), Some(r2.clone()));
+    assert_eq!(store.release_count(&repo_id, false).await.unwrap(), 1);
+    assert_eq!(store.release_count(&repo_id, true).await.unwrap(), 2);
+    let release_tags: Vec<String> = store
+        .list_releases_by_repo(&repo_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.tag_name)
+        .collect();
+    assert_eq!(release_tags, vec!["v2.0.0", "v1.0.0"]);
+    assert_eq!(
+        store
+            .get_release_by_tag(&repo_id, "v1.0.0")
+            .await
+            .unwrap()
+            .unwrap(),
+        r1
+    );
+    let mut edited_release = r2.clone();
+    edited_release.is_draft = false;
+    edited_release.published_at = now + 8;
+    edited_release.title = "Release v2".to_string();
+    assert!(store.update_release(&edited_release).await.unwrap());
+    assert_eq!(
+        store
+            .get_release(&repo_id, "rl2")
+            .await
+            .unwrap()
+            .unwrap()
+            .title,
+        "Release v2"
+    );
+    assert!(store.delete_release(&repo_id, "rl1").await.unwrap());
+    assert!(store.get_release(&repo_id, "rl1").await.unwrap().is_none());
+
     assert!(store
         .aggregate_state_for_commit(&repo_id, "abc123")
         .await

@@ -426,6 +426,23 @@ impl GitOps {
         }
     }
 
+    /// Create a lightweight tag pointing at `target_commit`. The empty old-value argument makes this
+    /// a create-only update, so an existing tag is never overwritten.
+    pub async fn create_lightweight_tag(
+        &self,
+        owner: &str,
+        name: &str,
+        tag: &str,
+        target_commit: &str,
+    ) -> std::io::Result<()> {
+        let path = self.repo_path(owner, name).to_string_lossy().to_string();
+        self.run_git_in(
+            &path,
+            &["update-ref", &format!("refs/tags/{tag}"), target_commit, ""],
+        )
+        .await
+    }
+
     /// Point the bare repo's HEAD at `refs/heads/{branch}` (the default-branch setting). The
     /// branch name is caller-validated, so the argument is never option-like.
     pub async fn set_head(&self, owner: &str, name: &str, branch: &str) -> std::io::Result<()> {

@@ -88,6 +88,27 @@ pub fn app(state: AppState) -> Router {
             get(handlers::commits::detail),
         )
         .route("/r/{owner}/{name}/branches", get(handlers::branches::list))
+        .route("/r/{owner}/{name}/releases", get(handlers::releases::list))
+        .route(
+            "/r/{owner}/{name}/releases.json",
+            get(handlers::releases::list_json),
+        )
+        .route(
+            "/r/{owner}/{name}/releases/new",
+            get(handlers::releases::new_release).post(handlers::releases::create),
+        )
+        .route(
+            "/r/{owner}/{name}/releases/tag/{*tag}",
+            get(handlers::releases::detail_by_tag),
+        )
+        .route(
+            "/r/{owner}/{name}/releases/{id}/delete",
+            post(handlers::releases::delete),
+        )
+        .route(
+            "/r/{owner}/{name}/releases/{id}",
+            get(handlers::releases::detail),
+        )
         .route(
             "/r/{owner}/{name}/settings",
             get(handlers::settings::show).post(handlers::settings::update),

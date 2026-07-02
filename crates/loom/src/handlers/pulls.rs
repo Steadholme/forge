@@ -42,11 +42,17 @@ const NOTIFY_BODY_CHARS: usize = 240;
 async fn pr_header(state: &AppState, repo: &Repo, active: &str) -> String {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    let release_count = state
+        .store
+        .release_count(&repo.id, false)
+        .await
+        .unwrap_or(0);
     render_repo_header(
         repo,
         &state.config.public_base_url,
         open_issues,
         open_pulls,
+        release_count,
         active,
     )
 }

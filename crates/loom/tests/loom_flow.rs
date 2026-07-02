@@ -1512,6 +1512,150 @@ async fn branches_page_lists_branches_and_tags() {
 }
 
 #[tokio::test]
+async fn releases_flow_handles_notes_drafts_json_and_delete() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    seed_repo(&git_dir, "main", &[("README.md", "# Project\n")]);
+    let target = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    git_capture(&git_dir, &["tag", "v1.0.0", &target], "");
+
+    let form = send(&app, get("/r/alice/proj/releases/new", Some("alice"))).await;
+    assert_eq!(form.status, StatusCode::OK);
+    let csrf = form.csrf_cookie().expect("csrf on release form");
+    let created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/releases/new",
+            &[
+                ("csrf_token", &csrf),
+                ("existing_tag", "v1.0.0"),
+                ("title", "Ship <it>"),
+                (
+                    "body_md",
+                    "# Notes\n\nFixes #1\n\n<script>alert(1)</script>",
+                ),
+                ("is_prerelease", "on"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+    assert_eq!(created.location(), "/r/alice/proj/releases/tag/v1.0.0");
+
+    let detail = send(
+        &app,
+        get("/r/alice/proj/releases/tag/v1.0.0", Some("alice")),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.body.contains("Ship &lt;it&gt;"));
+    assert!(detail.body.contains("<h1>Notes</h1>"));
+    assert!(detail.body.contains("/r/alice/proj/issues/1"));
+    assert!(!detail.body.contains("<script>alert(1)</script>"));
+    assert!(detail.body.contains("&lt;script&gt;"));
+    assert!(detail.body.contains("Pre-release"));
+
+    let home = send(&app, get("/r/alice/proj", Some("alice"))).await;
+    assert_eq!(home.status, StatusCode::OK);
+    assert!(home.body.contains("Latest release"));
+    assert!(home.body.contains("Ship &lt;it&gt;"));
+
+    let json = send(&app, get("/r/alice/proj/releases.json", Some("bob"))).await;
+    assert_eq!(json.status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&json.body).unwrap();
+    assert_eq!(parsed["releases"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["releases"][0]["tag_name"], "v1.0.0");
+
+    let form = send(&app, get("/r/alice/proj/releases/new", Some("alice"))).await;
+    let csrf = form.csrf_cookie().expect("csrf on release form");
+    let draft_created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/releases/new",
+            &[
+                ("csrf_token", &csrf),
+                ("new_tag", "v2.0.0"),
+                ("title", "Draft plan"),
+                ("body_md", "not public yet"),
+                ("is_draft", "on"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(draft_created.status, StatusCode::FOUND);
+    assert_eq!(
+        draft_created.location(),
+        "/r/alice/proj/releases/tag/v2.0.0"
+    );
+    assert_eq!(
+        git_capture(&git_dir, &["rev-parse", "refs/tags/v2.0.0^{commit}"], ""),
+        target
+    );
+
+    let bob_list = send(&app, get("/r/alice/proj/releases", Some("bob"))).await;
+    assert_eq!(bob_list.status, StatusCode::OK);
+    assert!(bob_list.body.contains("v1.0.0"));
+    assert!(!bob_list.body.contains("Draft plan"));
+    let bob_draft = send(&app, get("/r/alice/proj/releases/tag/v2.0.0", Some("bob"))).await;
+    assert_eq!(bob_draft.status, StatusCode::NOT_FOUND);
+
+    let alice_list = send(&app, get("/r/alice/proj/releases", Some("alice"))).await;
+    assert_eq!(alice_list.status, StatusCode::OK);
+    assert!(alice_list.body.contains("Draft plan"));
+    assert!(alice_list.body.contains("Draft"));
+
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    let draft = store
+        .get_release_by_tag(&repo.id, "v2.0.0")
+        .await
+        .unwrap()
+        .unwrap();
+    let bad_delete = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/releases/{}/delete", draft.id),
+            &[("csrf_token", "wrong")],
+            "wrong-cookie",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(bad_delete.status, StatusCode::BAD_REQUEST);
+
+    let detail = send(
+        &app,
+        get("/r/alice/proj/releases/tag/v2.0.0", Some("alice")),
+    )
+    .await;
+    let csrf = detail.csrf_cookie().expect("csrf on release detail");
+    let deleted = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/releases/{}/delete", draft.id),
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::FOUND);
+    assert_eq!(deleted.location(), "/r/alice/proj/releases");
+    assert!(store
+        .get_release_by_tag(&repo.id, "v2.0.0")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn settings_guarded_and_default_branch_validated() {
     let state = temp_state();
     let git = state.git.clone();

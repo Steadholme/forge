@@ -6,6 +6,7 @@
 //! - [`branches`] — the branches + tags listing.
 //! - [`issues`] — the per-repo issue tracker (list/filter, detail + comments, create/comment/toggle).
 //! - [`pulls`] — pull requests (compare, create, detail, gated merge).
+//! - [`releases`] — repo releases attached to git tags, with Markdown notes.
 //! - [`settings`] — repo settings (description + default branch; owner/admin only).
 //! - [`pats`] — personal-access-token management (mint once / revoke).
 //! - [`smart_http`] — the git smart-HTTP protocol (`/git/...`) with PAT Basic auth.
@@ -23,6 +24,7 @@ pub mod health;
 pub mod issues;
 pub mod pats;
 pub mod pulls;
+pub mod releases;
 pub mod repos;
 pub mod settings;
 pub mod smart_http;

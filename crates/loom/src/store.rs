@@ -1,4 +1,4 @@
-//! Metadata storage: repositories, issues, personal access tokens.
+//! Metadata storage: repositories, releases, issues, personal access tokens.
 //!
 //! `Store` is a small async trait with an in-memory and a PostgreSQL implementation, mirroring
 //! the keystone/cairn/pastefire seam: handlers depend only on the trait, so a FusionDB-backed
@@ -21,7 +21,7 @@ use thiserror::Error;
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
     CommitStatus, Issue, IssueComment, Label, Milestone, Pat, Pull, PullReview, PullReviewComment,
-    Repo,
+    Release, Repo,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -87,6 +87,32 @@ pub trait Store: Send + Sync {
 
     /// Fetch a repo by opaque id (used for fork attribution links).
     async fn get_repo_by_id(&self, id: &str) -> Result<Option<Repo>, StoreError>;
+
+    // --- releases ------------------------------------------------------------
+    /// Create a release. Returns `Ok(None)` when the repo already has a release for the tag.
+    async fn create_release(&self, release: &Release) -> Result<Option<Release>, StoreError>;
+
+    /// Replace release metadata by id. Returns whether a row changed.
+    async fn update_release(&self, release: &Release) -> Result<bool, StoreError>;
+
+    /// Delete a release by repo + id. Returns whether a row was removed.
+    async fn delete_release(&self, repo_id: &str, id: &str) -> Result<bool, StoreError>;
+
+    /// Fetch one release by repo + id.
+    async fn get_release(&self, repo_id: &str, id: &str) -> Result<Option<Release>, StoreError>;
+
+    /// Fetch one release by repo + tag name.
+    async fn get_release_by_tag(
+        &self,
+        repo_id: &str,
+        tag_name: &str,
+    ) -> Result<Option<Release>, StoreError>;
+
+    /// All releases on a repo, newest created first.
+    async fn list_releases_by_repo(&self, repo_id: &str) -> Result<Vec<Release>, StoreError>;
+
+    /// Count releases on a repo. Drafts are optionally included for writer-visible badges.
+    async fn release_count(&self, repo_id: &str, include_drafts: bool) -> Result<i64, StoreError>;
 
     // --- issues --------------------------------------------------------------
     /// Create an issue, atomically allocating the next per-repo `number`. Returns the stored
@@ -340,6 +366,7 @@ pub trait Store: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryStore {
     repos: Mutex<Vec<Repo>>,
+    releases: Mutex<Vec<Release>>,
     issues: Mutex<Vec<Issue>>,
     issue_comments: Mutex<Vec<IssueComment>>,
     issue_labels: Mutex<Vec<(String, String)>>,
@@ -428,6 +455,79 @@ impl Store for InMemoryStore {
     async fn get_repo_by_id(&self, id: &str) -> Result<Option<Repo>, StoreError> {
         let repos = self.repos.lock().expect("repos lock poisoned");
         Ok(repos.iter().find(|r| r.id == id).cloned())
+    }
+
+    async fn create_release(&self, release: &Release) -> Result<Option<Release>, StoreError> {
+        let mut releases = self.releases.lock().expect("releases lock poisoned");
+        if releases
+            .iter()
+            .any(|r| r.repo_id == release.repo_id && r.tag_name == release.tag_name)
+        {
+            return Ok(None);
+        }
+        releases.push(release.clone());
+        Ok(Some(release.clone()))
+    }
+
+    async fn update_release(&self, release: &Release) -> Result<bool, StoreError> {
+        let mut releases = self.releases.lock().expect("releases lock poisoned");
+        for r in releases.iter_mut() {
+            if r.repo_id == release.repo_id && r.id == release.id {
+                *r = release.clone();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn delete_release(&self, repo_id: &str, id: &str) -> Result<bool, StoreError> {
+        let mut releases = self.releases.lock().expect("releases lock poisoned");
+        let before = releases.len();
+        releases.retain(|r| !(r.repo_id == repo_id && r.id == id));
+        Ok(releases.len() != before)
+    }
+
+    async fn get_release(&self, repo_id: &str, id: &str) -> Result<Option<Release>, StoreError> {
+        let releases = self.releases.lock().expect("releases lock poisoned");
+        Ok(releases
+            .iter()
+            .find(|r| r.repo_id == repo_id && r.id == id)
+            .cloned())
+    }
+
+    async fn get_release_by_tag(
+        &self,
+        repo_id: &str,
+        tag_name: &str,
+    ) -> Result<Option<Release>, StoreError> {
+        let releases = self.releases.lock().expect("releases lock poisoned");
+        Ok(releases
+            .iter()
+            .find(|r| r.repo_id == repo_id && r.tag_name == tag_name)
+            .cloned())
+    }
+
+    async fn list_releases_by_repo(&self, repo_id: &str) -> Result<Vec<Release>, StoreError> {
+        let releases = self.releases.lock().expect("releases lock poisoned");
+        let mut out: Vec<Release> = releases
+            .iter()
+            .filter(|r| r.repo_id == repo_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    async fn release_count(&self, repo_id: &str, include_drafts: bool) -> Result<i64, StoreError> {
+        let releases = self.releases.lock().expect("releases lock poisoned");
+        Ok(releases
+            .iter()
+            .filter(|r| r.repo_id == repo_id && (include_drafts || !r.is_draft))
+            .count() as i64)
     }
 
     async fn create_issue(
@@ -1169,6 +1269,8 @@ use sqlx::Row;
 
 const REPO_COLS: &str =
     "id, owner_sub, name, description, is_private, default_branch, require_approval, protect_default_branch, forked_from_id, created_at";
+const RELEASE_COLS: &str =
+    "id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, created_by, created_at, published_at";
 const ISSUE_COLS: &str =
     "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
 const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
@@ -1246,6 +1348,35 @@ impl PgStore {
         .await?;
         sqlx::query(
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS forked_from_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS releases (\
+                 id TEXT PRIMARY KEY, \
+                 repo_id TEXT NOT NULL, \
+                 tag_name TEXT NOT NULL, \
+                 target_commit TEXT NOT NULL, \
+                 title TEXT NOT NULL, \
+                 body_md TEXT NOT NULL DEFAULT '', \
+                 is_prerelease BOOLEAN NOT NULL DEFAULT FALSE, \
+                 is_draft BOOLEAN NOT NULL DEFAULT FALSE, \
+                 created_by TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 published_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_releases_repo_tag \
+             ON releases (repo_id, tag_name)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_releases_repo_created \
+             ON releases (repo_id, created_at)",
         )
         .execute(&self.pool)
         .await?;
@@ -1538,6 +1669,22 @@ impl PgStore {
         })
     }
 
+    fn release_from_row(row: &sqlx::postgres::PgRow) -> Result<Release, sqlx::Error> {
+        Ok(Release {
+            id: row.try_get("id")?,
+            repo_id: row.try_get("repo_id")?,
+            tag_name: row.try_get("tag_name")?,
+            target_commit: row.try_get("target_commit")?,
+            title: row.try_get("title")?,
+            body_md: row.try_get("body_md")?,
+            is_prerelease: row.try_get("is_prerelease")?,
+            is_draft: row.try_get("is_draft")?,
+            created_by: row.try_get("created_by")?,
+            created_at: row.try_get("created_at")?,
+            published_at: row.try_get("published_at")?,
+        })
+    }
+
     fn comment_from_row(row: &sqlx::postgres::PgRow) -> Result<IssueComment, sqlx::Error> {
         Ok(IssueComment {
             id: row.try_get("id")?,
@@ -1738,6 +1885,129 @@ impl Store for PgStore {
         row.as_ref()
             .map(Self::repo_from_row)
             .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn create_release(&self, release: &Release) -> Result<Option<Release>, StoreError> {
+        let result = sqlx::query(
+            "INSERT INTO releases \
+                 (id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, \
+                  created_by, created_at, published_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (repo_id, tag_name) DO NOTHING",
+        )
+        .bind(&release.id)
+        .bind(&release.repo_id)
+        .bind(&release.tag_name)
+        .bind(&release.target_commit)
+        .bind(&release.title)
+        .bind(&release.body_md)
+        .bind(release.is_prerelease)
+        .bind(release.is_draft)
+        .bind(&release.created_by)
+        .bind(release.created_at)
+        .bind(release.published_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        if result.rows_affected() == 1 {
+            Ok(Some(release.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn update_release(&self, release: &Release) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE releases SET tag_name = $1, target_commit = $2, title = $3, body_md = $4, \
+             is_prerelease = $5, is_draft = $6, published_at = $7 \
+             WHERE repo_id = $8 AND id = $9",
+        )
+        .bind(&release.tag_name)
+        .bind(&release.target_commit)
+        .bind(&release.title)
+        .bind(&release.body_md)
+        .bind(release.is_prerelease)
+        .bind(release.is_draft)
+        .bind(release.published_at)
+        .bind(&release.repo_id)
+        .bind(&release.id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_release(&self, repo_id: &str, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM releases WHERE repo_id = $1 AND id = $2")
+            .bind(repo_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn get_release(&self, repo_id: &str, id: &str) -> Result<Option<Release>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {RELEASE_COLS} FROM releases WHERE repo_id = $1 AND id = $2"
+        ))
+        .bind(repo_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::release_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_release_by_tag(
+        &self,
+        repo_id: &str,
+        tag_name: &str,
+    ) -> Result<Option<Release>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {RELEASE_COLS} FROM releases WHERE repo_id = $1 AND tag_name = $2"
+        ))
+        .bind(repo_id)
+        .bind(tag_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::release_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_releases_by_repo(&self, repo_id: &str) -> Result<Vec<Release>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {RELEASE_COLS} FROM releases \
+             WHERE repo_id = $1 ORDER BY created_at DESC, id DESC"
+        ))
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::release_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn release_count(&self, repo_id: &str, include_drafts: bool) -> Result<i64, StoreError> {
+        let row = sqlx::query(
+            "SELECT count(*) AS n FROM releases \
+             WHERE repo_id = $1 AND ($2 = TRUE OR is_draft = FALSE)",
+        )
+        .bind(repo_id)
+        .bind(include_drafts)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.try_get("n")
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
@@ -2727,6 +2997,22 @@ mod tests {
         }
     }
 
+    fn release(id: &str, repo_id: &str, tag: &str, created: i64, draft: bool) -> Release {
+        Release {
+            id: id.into(),
+            repo_id: repo_id.into(),
+            tag_name: tag.into(),
+            target_commit: format!("{tag}-commit"),
+            title: format!("Release {tag}"),
+            body_md: format!("notes for {tag}"),
+            is_prerelease: false,
+            is_draft: draft,
+            created_by: "u".into(),
+            created_at: created,
+            published_at: if draft { 0 } else { created },
+        }
+    }
+
     #[tokio::test]
     async fn repo_create_is_unique_per_owner_and_name() {
         let s = InMemoryStore::new();
@@ -2774,6 +3060,51 @@ mod tests {
             .update_repo_settings("nope", "x", "main", false, false)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn releases_are_unique_by_repo_tag_and_visible_counts_skip_drafts() {
+        let s = InMemoryStore::new();
+        let r1 = release("rl1", "r", "v1.0.0", 10, false);
+        let r2 = release("rl2", "r", "v2.0.0", 20, true);
+        let other = release("rl3", "other", "v1.0.0", 30, false);
+
+        assert_eq!(s.create_release(&r1).await.unwrap(), Some(r1.clone()));
+        assert!(s
+            .create_release(&release("rl_dup", "r", "v1.0.0", 11, false))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(s.create_release(&r2).await.unwrap(), Some(r2.clone()));
+        assert_eq!(s.create_release(&other).await.unwrap(), Some(other));
+
+        let listed = s.list_releases_by_repo("r").await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| r.tag_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v2.0.0", "v1.0.0"]
+        );
+        assert_eq!(s.release_count("r", false).await.unwrap(), 1);
+        assert_eq!(s.release_count("r", true).await.unwrap(), 2);
+        assert_eq!(
+            s.get_release_by_tag("r", "v1.0.0").await.unwrap().unwrap(),
+            r1
+        );
+
+        let mut edited = r2.clone();
+        edited.is_draft = false;
+        edited.published_at = 25;
+        edited.title = "Release v2".to_string();
+        assert!(s.update_release(&edited).await.unwrap());
+        assert_eq!(
+            s.get_release("r", "rl2").await.unwrap().unwrap().title,
+            "Release v2"
+        );
+        assert_eq!(s.release_count("r", false).await.unwrap(), 2);
+        assert!(s.delete_release("r", "rl1").await.unwrap());
+        assert!(s.get_release("r", "rl1").await.unwrap().is_none());
     }
 
     #[tokio::test]

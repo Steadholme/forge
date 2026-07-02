@@ -28,6 +28,33 @@ pub struct Repo {
     pub created_at: i64,
 }
 
+/// A release attached to one repository tag. Field order/types mirror the `releases` table exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Release {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id.
+    pub repo_id: String,
+    /// Git tag name this release describes.
+    pub tag_name: String,
+    /// Commit OID the tag pointed at when the release was created/updated.
+    pub target_commit: String,
+    /// Release title.
+    pub title: String,
+    /// Release notes in Markdown.
+    pub body_md: String,
+    /// Whether this is marked as a pre-release.
+    pub is_prerelease: bool,
+    /// Draft releases are visible only to writers.
+    pub is_draft: bool,
+    /// Creator subject from `X-Auth-Subject`.
+    pub created_by: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+    /// Publish time, epoch seconds; `0` while the release remains a draft.
+    pub published_at: i64,
+}
+
 /// An issue on a repository. Field order/types mirror the `issues` table exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Issue {

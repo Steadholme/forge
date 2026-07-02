@@ -21,7 +21,7 @@ use crate::config::COMMIT_LIMIT;
 use crate::error::AppError;
 use crate::gitops::TreeEntry;
 use crate::handlers::{esc, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
-use crate::model::{validate_owner_sub, validate_repo_name, Repo};
+use crate::model::{validate_owner_sub, validate_repo_name, Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
 /// Length of a repo/issue/pat id (62-symbol alphabet).
@@ -252,11 +252,17 @@ pub async fn blob(
 
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    let release_count = state
+        .store
+        .release_count(&repo.id, false)
+        .await
+        .unwrap_or(0);
     let body = render_blob(
         &repo,
         &state.config.public_base_url,
         open_issues,
         open_pulls,
+        release_count,
         &path,
         &bytes,
     );
@@ -289,14 +295,29 @@ pub async fn load_visible_repo(
 /// Render the repo header for the `active` tab, fetching the open issue/PR badge counts (the
 /// shared entry point for the commits/branches/settings pages).
 pub(crate) async fn header_with_counts(state: &AppState, repo: &Repo, active: &str) -> String {
+    header_with_counts_for(state, repo, active, false).await
+}
+
+pub(crate) async fn header_with_counts_for(
+    state: &AppState,
+    repo: &Repo,
+    active: &str,
+    include_drafts: bool,
+) -> String {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    let release_count = state
+        .store
+        .release_count(&repo.id, include_drafts)
+        .await
+        .unwrap_or(0);
     let parent = fork_parent(state, repo).await;
     render_repo_header_with_parent(
         repo,
         &state.config.public_base_url,
         open_issues,
         open_pulls,
+        release_count,
         active,
         parent.as_ref(),
     )
@@ -475,12 +496,18 @@ async fn render_code_page(
 ) -> Result<String, AppError> {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    let release_count = state
+        .store
+        .release_count(&repo.id, false)
+        .await
+        .unwrap_or(0);
     let parent = fork_parent(state, repo).await;
     let header = render_repo_header_with_parent(
         repo,
         &state.config.public_base_url,
         open_issues,
         open_pulls,
+        release_count,
         "code",
         parent.as_ref(),
     );
@@ -505,6 +532,11 @@ async fn render_code_page(
     // A rendered README under the file browser at the repo root (GitHub-style), sanitised.
     let readme = if subpath.is_empty() {
         render_readme(state, repo, &commit, &entries).await
+    } else {
+        String::new()
+    };
+    let latest_release = if subpath.is_empty() {
+        render_latest_release(state, repo).await
     } else {
         String::new()
     };
@@ -568,7 +600,7 @@ async fn render_code_page(
         String::new()
     };
 
-    Ok(format!("{header}{files}{readme}{extras}"))
+    Ok(format!("{header}{files}{readme}{latest_release}{extras}"))
 }
 
 /// Render a repo-root README as sanitised markdown HTML (GitHub-style), or nothing when there is
@@ -604,15 +636,93 @@ async fn render_readme(
     )
 }
 
+async fn render_latest_release(state: &AppState, repo: &Repo) -> String {
+    let releases = state
+        .store
+        .list_releases_by_repo(&repo.id)
+        .await
+        .unwrap_or_default();
+    let Some(release) = releases.into_iter().find(|r| !r.is_draft) else {
+        return String::new();
+    };
+    render_latest_release_card(repo, &release)
+}
+
+fn render_latest_release_card(repo: &Repo, release: &Release) -> String {
+    let prerelease = if release.is_prerelease {
+        "<span class=\"state-badge release-badge release-badge--prerelease\">Pre-release</span>"
+    } else {
+        ""
+    };
+    let summary = release_notes_summary(&release.body_md);
+    let notes = if summary.is_empty() {
+        "<p class=\"muted\">No release notes.</p>".to_string()
+    } else {
+        format!("<p class=\"release-card__summary\">{}</p>", esc(&summary))
+    };
+    format!(
+        r##"<section class="card release-card">
+  <div class="card__head">
+    <h2>Latest release</h2>
+    <a class="btn btn-ghost btn-sm" href="/r/{owner}/{name}/releases">All releases</a>
+  </div>
+  <div class="card__body">
+    <div class="release-card__head">
+      <div>
+        <a class="release-card__title" href="/r/{owner}/{name}/releases/tag/{tag}">{title}</a>
+        <div class="release-card__meta">
+          <span class="release-tag">{tag}</span>
+          <a href="/r/{owner}/{name}/commit/{target}"><code class="oid">{short}</code></a>
+          <span>{published}</span>
+        </div>
+      </div>
+      <div class="release-card__badges">{prerelease}</div>
+    </div>
+    {notes}
+    <div class="release-assets"><span class="release-asset muted">No assets.</span></div>
+  </div>
+</section>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        tag = esc(&release.tag_name),
+        title = esc(&release.title),
+        target = esc(&release.target_commit),
+        short = esc(&short_oid(&release.target_commit)),
+        published = esc(&fmt_ts(release.published_at)),
+        prerelease = prerelease,
+        notes = notes,
+    )
+}
+
+fn release_notes_summary(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
 /// Repo header: owner/name lockup, visibility badge, clone box, tab strip.
 pub(crate) fn render_repo_header(
     repo: &Repo,
     base_url: &str,
     open_issues: i64,
     open_pulls: i64,
+    release_count: i64,
     active: &str,
 ) -> String {
-    render_repo_header_with_parent(repo, base_url, open_issues, open_pulls, active, None)
+    render_repo_header_with_parent(
+        repo,
+        base_url,
+        open_issues,
+        open_pulls,
+        release_count,
+        active,
+        None,
+    )
 }
 
 pub(crate) fn render_repo_header_with_parent(
@@ -620,6 +730,7 @@ pub(crate) fn render_repo_header_with_parent(
     base_url: &str,
     open_issues: i64,
     open_pulls: i64,
+    release_count: i64,
     active: &str,
     forked_from: Option<&Repo>,
 ) -> String {
@@ -666,6 +777,7 @@ pub(crate) fn render_repo_header_with_parent(
   <a class="tab{code_active}" href="/r/{owner}/{name}">Code</a>
   <a class="tab{commits_active}" href="/r/{owner}/{name}/commits">Commits</a>
   <a class="tab{branches_active}" href="/r/{owner}/{name}/branches">Branches</a>
+  <a class="tab{releases_active}" href="/r/{owner}/{name}/releases">Releases <span class="tab__count">{release_count}</span></a>
   <a class="tab{issues_active}" href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span></a>
   <a class="tab{pulls_active}" href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span></a>
   <a class="tab{settings_active}" href="/r/{owner}/{name}/settings">Settings</a>
@@ -679,11 +791,13 @@ pub(crate) fn render_repo_header_with_parent(
         code_active = tab("code"),
         commits_active = tab("commits"),
         branches_active = tab("branches"),
+        releases_active = tab("releases"),
         pulls_active = tab("pulls"),
         issues_active = tab("issues"),
         settings_active = tab("settings"),
         open_issues = open_issues,
         open_pulls = open_pulls,
+        release_count = release_count,
     )
 }
 
@@ -774,10 +888,18 @@ fn render_blob(
     base_url: &str,
     open_issues: i64,
     open_pulls: i64,
+    release_count: i64,
     path: &str,
     bytes: &[u8],
 ) -> String {
-    let header = render_repo_header(repo, base_url, open_issues, open_pulls, "code");
+    let header = render_repo_header(
+        repo,
+        base_url,
+        open_issues,
+        open_pulls,
+        release_count,
+        "code",
+    );
     let content = if bytes.contains(&0) {
         "<div class=\"card__body\"><p class=\"muted\">Binary file not shown.</p></div>".to_string()
     } else if bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
