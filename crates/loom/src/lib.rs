@@ -20,6 +20,7 @@ pub mod config;
 pub mod error;
 pub mod gitops;
 pub mod handlers;
+pub mod highlight;
 pub mod markdown;
 pub mod model;
 mod notify;

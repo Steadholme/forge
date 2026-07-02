@@ -34,6 +34,20 @@ fn enc(s: &str) -> String {
     out
 }
 
+fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
 struct Resp {
     status: StatusCode,
     headers: HeaderMap,
@@ -822,7 +836,8 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
     assert!(blob.body.contains("id=\"L2\""));
     assert!(blob.body.contains("data-line=\"2\""));
     assert!(blob.body.contains("href=\"#L2\">2</a>"));
-    assert!(blob.body.contains("println!"));
+    assert!(blob.body.contains("<span class=\"tok-kw\">fn</span>"));
+    assert!(strip_tags(&blob.body).contains("println!"));
     assert!(blob.body.contains("btn-permalink"));
     assert!(blob
         .body
@@ -834,7 +849,7 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
     )
     .await;
     assert_eq!(pinned.status, StatusCode::OK);
-    assert!(pinned.body.contains("println!"));
+    assert!(strip_tags(&pinned.body).contains("println!"));
 
     // A markdown blob view renders as sanitised HTML too.
     let md = send(&app, get("/r/alice/docs/blob/README.md", Some("alice"))).await;
@@ -849,7 +864,7 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
     );
     let moved = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
     assert_eq!(moved.status, StatusCode::OK);
-    assert!(moved.body.contains("changed();"));
+    assert!(strip_tags(&moved.body).contains("changed();"));
 
     let still_pinned = send(
         &app,
@@ -857,8 +872,8 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
     )
     .await;
     assert_eq!(still_pinned.status, StatusCode::OK);
-    assert!(still_pinned.body.contains("println!"));
-    assert!(!still_pinned.body.contains("changed();"));
+    assert!(strip_tags(&still_pinned.body).contains("println!"));
+    assert!(!strip_tags(&still_pinned.body).contains("changed();"));
 }
 
 #[tokio::test]
@@ -972,8 +987,9 @@ async fn blame_view_renders_groups_and_graceful_notices() {
     assert!(blame.body.contains("class=\"blame-commit\""));
     assert!(blame.body.contains("rowspan=\"3\""));
     assert!(blame.body.contains(&format!("/r/alice/docs/commit/{head}")));
+    assert!(blame.body.contains("<span class=\"tok-kw\">fn</span>"));
     assert!(!blame.body.contains("println!(\"<hi>\");"));
-    assert!(blame.body.contains("println!(&quot;&lt;hi&gt;&quot;);"));
+    assert!(strip_tags(&blame.body).contains("println!(&quot;&lt;hi&gt;&quot;);"));
 
     let binary = send(&app, get("/r/alice/docs/blame/HEAD/bin.dat", Some("alice"))).await;
     assert_eq!(binary.status, StatusCode::OK);

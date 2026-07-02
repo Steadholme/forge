@@ -13,7 +13,7 @@
 //! Everything else (text, code, emphasis, link titles) is escaped by `push_html` itself. After
 //! serialisation, Loom adds safe GFM class hooks and links plain-text references outside tags/code.
 
-use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
+use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 /// Repository context for GFM references that need to point back into the current repo.
 #[derive(Clone, Copy)]
@@ -49,10 +49,52 @@ fn render_inner(md: &str, context: Option<RenderContext<'_>>) -> String {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
 
-    let events = Parser::new_ext(md, options).map(sanitize_event);
+    let events = highlight_code_blocks(Parser::new_ext(md, options).map(sanitize_event));
     let mut out = String::new();
-    html::push_html(&mut out, events);
+    html::push_html(&mut out, events.into_iter());
     add_gfm_classes_and_links(&out, context)
+}
+
+fn highlight_code_blocks<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>> {
+    let mut out = Vec::new();
+    let mut events = events.peekable();
+    while let Some(event) = events.next() {
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let mut code = String::new();
+                while let Some(inner) = events.next() {
+                    match inner {
+                        Event::End(TagEnd::CodeBlock) => break,
+                        Event::Text(s) | Event::Code(s) | Event::Html(s) | Event::InlineHtml(s) => {
+                            code.push_str(&s)
+                        }
+                        Event::SoftBreak | Event::HardBreak => code.push('\n'),
+                        _ => {}
+                    }
+                }
+                out.push(Event::Html(CowStr::Boxed(
+                    render_code_block(&code, &kind).into_boxed_str(),
+                )));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn render_code_block(code: &str, kind: &CodeBlockKind<'_>) -> String {
+    let lang = match kind {
+        CodeBlockKind::Fenced(info) => crate::highlight::normalize_lang(info),
+        CodeBlockKind::Indented => None,
+    };
+    let class = lang
+        .map(|lang| format!(" class=\"language-{lang}\""))
+        .unwrap_or_default();
+    let code = match lang {
+        Some(lang) => crate::highlight::highlight(code, lang),
+        None => escape_html(code),
+    };
+    format!("<pre><code{class}>{code}</code></pre>\n")
 }
 
 /// Neutralise raw HTML and unsafe link/image schemes for a single event.
@@ -384,6 +426,25 @@ mod tests {
         let html = render("```\nfn main() {}\n```");
         assert!(html.contains("<pre><code"));
         assert!(html.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn fenced_code_block_is_highlighted_and_escaped() {
+        let html = render("```rust\nfn main() { let x = \"</script><img src=x>\"; }\n```");
+        assert!(html.contains("<code class=\"language-rust\">"));
+        assert!(html.contains("<span class=\"tok-kw\">fn</span>"));
+        assert!(!html.contains("</script>"));
+        assert!(!html.contains("<img"));
+        assert!(html.contains("&lt;/script&gt;&lt;img src=x&gt;"));
+    }
+
+    #[test]
+    fn unknown_fenced_code_language_degrades_to_escaped_text() {
+        let html = render("```wat\n<b>x</b>\n```");
+        assert!(html.contains("<pre><code>"));
+        assert!(!html.contains("<span class=\"tok-"));
+        assert!(!html.contains("<b>x</b>"));
+        assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
     }
 
     #[test]

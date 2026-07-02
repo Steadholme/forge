@@ -5,7 +5,7 @@
 //! is ALWAYS the subject header — never a client field. Private repos are hidden from non-owners
 //! (a private repo a viewer cannot see returns 404, so existence does not leak). Every
 //! producer-supplied string — repo name, description, file path, commit subject — is HTML-escaped
-//! on render; a non-markdown text blob is shown in a line-numbered, escaped monospace view.
+//! on render; a non-markdown text blob is shown in a line-numbered, escaped/highlighted monospace view.
 //! Markdown (a `.md` blob + the repo README, plus issue bodies) is rendered through the estate's
 //! sanitising [`crate::markdown`] pipeline: raw HTML is downgraded to text and unsafe link schemes
 //! are defused, so no producer-supplied markup ever executes.
@@ -1406,7 +1406,7 @@ fn render_blob(
             // Any other text blob gets a monospace, line-numbered view.
             format!(
                 "<div class=\"card__body card__body--code\">{}</div>",
-                render_text_blob(&text)
+                render_text_blob(&text, path)
             )
         }
     };
@@ -1461,7 +1461,7 @@ fn render_blame(
     } else {
         format!(
             "<div class=\"card__body card__body--code\">{}</div>",
-            render_blame_table(repo, lines)
+            render_blame_table(repo, path, lines)
         )
     };
     let history_href = file_history_href(repo, ref_name, path);
@@ -1584,9 +1584,10 @@ fn render_file_history(
     )
 }
 
-fn render_blame_table(repo: &Repo, lines: &[BlameLine]) -> String {
+fn render_blame_table(repo: &Repo, path: &str, lines: &[BlameLine]) -> String {
     let now = now_secs();
     let mut rows = String::new();
+    let lang = highlight_lang_for_lines(path, lines);
     let mut i = 0usize;
     while i < lines.len() {
         let line = &lines[i];
@@ -1623,7 +1624,7 @@ fn render_blame_table(repo: &Repo, lines: &[BlameLine]) -> String {
                  </tr>",
                 commit_cell = commit_cell,
                 lineno = current.lineno,
-                code = esc(&current.content),
+                code = render_code_line(&current.content, lang),
             ));
         }
         i += run_len;
@@ -1711,11 +1712,13 @@ fn is_readme(name: &str) -> bool {
     lower == "readme" || lower.starts_with("readme.")
 }
 
-/// Render a text blob as a line-numbered, monospace table. Each line's content is HTML-escaped;
-/// the number gutter is generated, so it never contains producer input. A single trailing newline
-/// is dropped so the last line is not a spurious empty row.
-fn render_text_blob(text: &str) -> String {
+/// Render a text blob as a line-numbered, monospace table. Each line's content is escaped before
+/// optional syntax highlighting; the number gutter is generated, so it never contains producer
+/// input. A single trailing newline is dropped so the last line is not a spurious empty row.
+fn render_text_blob(text: &str, path: &str) -> String {
     let body = text.strip_suffix('\n').unwrap_or(text);
+    let lang = crate::highlight::language_for_path(path)
+        .filter(|_| crate::highlight::within_highlight_limits(body));
     let mut rows = String::new();
     for (i, raw_line) in body.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -1726,10 +1729,27 @@ fn render_text_blob(text: &str) -> String {
                <td class=\"blob-line__code\">{code}</td>\
              </tr>",
             n = n,
-            code = esc(line),
+            code = render_code_line(line, lang),
         ));
     }
     format!("<table class=\"blob-code\"><tbody>{rows}</tbody></table>")
+}
+
+fn render_code_line(line: &str, lang: Option<&str>) -> String {
+    match lang {
+        Some(lang) => crate::highlight::highlight(line, lang),
+        None => esc(line),
+    }
+}
+
+fn highlight_lang_for_lines(path: &str, lines: &[BlameLine]) -> Option<&'static str> {
+    let total_bytes = lines.iter().map(|line| line.content.len()).sum::<usize>();
+    if lines.len() > crate::highlight::MAX_HIGHLIGHT_LINES
+        || total_bytes > crate::highlight::MAX_HIGHLIGHT_BYTES
+    {
+        return None;
+    }
+    crate::highlight::language_for_path(path)
 }
 
 /// Human-readable byte size (B/KiB/MiB).
@@ -1794,7 +1814,7 @@ mod tests {
 
     #[test]
     fn text_blob_is_line_numbered_and_escaped() {
-        let html = render_text_blob("let x = 1;\n<b>two</b>\n");
+        let html = render_text_blob("let x = 1;\n<b>two</b>\n", "notes.txt");
         // Two lines, numbered 1 and 2 (the trailing newline does not add a third row).
         assert!(html.contains("id=\"L1\""));
         assert!(html.contains("data-line=\"2\""));
@@ -1803,6 +1823,15 @@ mod tests {
         // HTML metacharacters in the content are escaped, never live markup.
         assert!(!html.contains("<b>two</b>"));
         assert!(html.contains("&lt;b&gt;two&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn text_blob_highlights_known_language_without_unescaped_markup() {
+        let html = render_text_blob("fn main() { let x = \"<b>\"; }\n", "src/main.rs");
+        assert!(html.contains("<span class=\"tok-kw\">fn</span>"));
+        assert!(html.contains("<span class=\"tok-fn\">main</span>"));
+        assert!(!html.contains("<b>"));
+        assert!(html.contains("&lt;b&gt;"));
     }
 
     #[test]
@@ -1857,10 +1886,11 @@ mod tests {
                 content: "done".to_string(),
             },
         ];
-        let html = render_blame_table(&repo, &lines);
+        let html = render_blame_table(&repo, "src/main.rs", &lines);
         assert!(html.contains("class=\"blame-table\""));
         assert!(html.contains("rowspan=\"2\""));
         assert!(html.contains("/r/alice/demo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(html.contains("<span class=\"tok-kw\">let</span>"));
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
