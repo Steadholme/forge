@@ -1314,3 +1314,60 @@ mark.code-search-hit {
 /* Draft merge notice — an informational, disabled-merge hint, weakened to the
    softest ink so it reads as guidance rather than an error. */
 .pr-status--draft { color:var(--ink-3); }
+
+/* ==========================================================================
+   Merge strategy (Merge / Squash / Rebase)
+   Pure-CSS visuals for the merge-method chooser (SSR hooks in handlers/pulls.rs):
+     .merge-strategy        — the inline merge form (label + select + button)
+     .merge-strategy__label — the quiet "Merge method" prefix label
+     .merge-method-select   — native <select> for merge/squash/rebase
+     .merge-strategy__note  — "all methods enabled" helper line
+   The select carries no .select class, so the Odyssey caret + field sizing are
+   replicated here from the .select/.input base. Colour comes only from Odyssey
+   v2 tokens, so dark mode conforms automatically (no literals); reduced-motion
+   is neutralised by the global guard at the top of this file — no extra media
+   query needed here.
+   ========================================================================== */
+
+/* Row layout — keep the label, chooser and CTA on one tidy baseline and let
+   them wrap together (not mid-control) on a narrow action strip. */
+.merge-strategy { align-items:center; gap:8px; flex-wrap:wrap; }
+
+/* Prefix label — a quiet inline lead-in, one notch below the CTA so it reads as
+   guidance for the control, never a heading. */
+.merge-strategy__label {
+  margin:0; font-size:12.5px; font-weight:600; letter-spacing:-.01em;
+  color:var(--ink-2); white-space:nowrap;
+}
+
+/* Chooser — mirrors the .select/.input base (height, border, radius, focus ring)
+   and the same Odyssey caret glyph, but sized to its content instead of full
+   width. The chosen method is inked strong so the current selection is obvious. */
+.merge-method-select {
+  height:var(--tap); min-width:170px; padding:0 34px 0 12px;
+  font-family:inherit; font-size:13.5px; font-weight:600; color:var(--ink);
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-sm);
+  appearance:none; cursor:pointer; outline:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23727a8a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat; background-position:right 12px center;
+  transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.merge-method-select:hover { border-color:var(--ink-4); }
+.merge-method-select:focus { border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); }
+/* Disabled chooser (blocked/conflicting head) — recede to a flat, dimmed field. */
+.merge-method-select:disabled { opacity:.55; cursor:not-allowed; background:var(--surface-2); }
+
+/* Merge CTA keeps its .btn-primary green; when a rule blocks the merge (draft or
+   a conflicting head) the disabled button is de-emphasised to a soft accent
+   wash so it reads as "not now" rather than a live, pressable action. */
+.merge-strategy .btn-primary:disabled,
+.merge-strategy .btn-primary[disabled] {
+  background:var(--accent-soft-2); color:var(--accent-ink); box-shadow:none;
+}
+
+/* Helper line — the softest ink and its own full-width row beneath the chooser,
+   so it explains the options without competing with them. */
+.merge-strategy__note {
+  flex-basis:100%; margin:2px 0 0; padding:0;
+  font-size:12px; color:var(--ink-3);
+}
