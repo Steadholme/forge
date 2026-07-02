@@ -827,8 +827,10 @@ fn seed_two_branches(git_dir: &str) -> String {
 async fn pull_request_compare_create_and_merge() {
     let state = temp_state();
     let git = state.git.clone();
+    let store = state.store.clone();
     let app = app(state);
     create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
     let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
     let feature_oid = seed_two_branches(&git_dir);
 
@@ -861,6 +863,8 @@ async fn pull_request_compare_create_and_merge() {
                 ("head", "feature"),
                 ("title", "Add second line"),
                 ("body", "please review"),
+                ("assignee", "bob"),
+                ("reviewer", "carol"),
             ],
             &csrf,
             Some("alice"),
@@ -869,17 +873,48 @@ async fn pull_request_compare_create_and_merge() {
     .await;
     assert_eq!(created.status, StatusCode::FOUND);
     assert_eq!(created.location(), "/r/alice/proj/pulls/1");
+    let pull = store.get_pull(&repo.id, 1).await.unwrap().unwrap();
+    assert_eq!(pull.assignee_sub, "bob");
+    assert_eq!(pull.reviewer_sub, "carol");
 
     // List shows the open PR.
     let list = send(&app, get("/r/alice/proj/pulls", Some("alice"))).await;
     assert!(list.body.contains("#1"));
     assert!(list.body.contains("Open"));
+    assert!(list.body.contains("assigned to bob"));
+    assert!(list.body.contains("reviewer carol"));
 
     // Detail shows the merge button for the owner.
     let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
     assert_eq!(detail.status, StatusCode::OK);
     assert!(detail.body.contains("Merge pull request"));
+    assert!(detail.body.contains("assignee bob"));
+    assert!(detail.body.contains("reviewer carol"));
     let csrf = detail.csrf_cookie().expect("csrf on detail");
+
+    let meta = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/metadata",
+            &[
+                ("csrf_token", &csrf),
+                ("assignee", "dave"),
+                ("reviewer", "erin"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(meta.status, StatusCode::FOUND);
+    let pull = store.get_pull(&repo.id, 1).await.unwrap().unwrap();
+    assert_eq!(pull.assignee_sub, "dave");
+    assert_eq!(pull.reviewer_sub, "erin");
+
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(detail.body.contains("assignee dave"));
+    assert!(detail.body.contains("reviewer erin"));
+    let csrf = detail.csrf_cookie().expect("csrf after metadata update");
 
     // --- gating: a non-owner, non-author cannot merge (403) ----------------
     let forbidden = send(

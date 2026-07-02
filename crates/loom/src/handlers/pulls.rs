@@ -30,6 +30,9 @@ use crate::{now_secs, random_alnum, AppState};
 const PULL_ID_LEN: usize = 16;
 const REVIEW_ID_LEN: usize = 16;
 const REVIEW_COMMENT_ID_LEN: usize = 16;
+const KLAXON_SOURCE: &str = "loom";
+const NOTIFY_TITLE_CHARS: usize = 96;
+const NOTIFY_BODY_CHARS: usize = 240;
 
 // ===========================================================================
 // Shared helpers
@@ -55,6 +58,91 @@ fn can_gate(repo: &Repo, pull: &Pull, who: &Identity) -> bool {
 
 fn can_review(repo: &Repo, pull: &Pull, who: &Identity, headers: &HeaderMap) -> bool {
     can_gate(repo, pull, who) || auth::is_admin(headers)
+}
+
+fn truncate_notify(s: &str, max: usize) -> String {
+    let mut iter = s.trim().chars();
+    let mut out: String = iter.by_ref().take(max).collect();
+    if iter.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+fn pull_notify_url(state: &AppState, repo: &Repo, number: i64) -> String {
+    format!(
+        "{}/r/{}/{}/pulls/{number}",
+        state.config.public_base_url.trim_end_matches('/'),
+        repo.owner_sub,
+        repo.name,
+    )
+}
+
+fn notify_pull_author(
+    state: &AppState,
+    actor_sub: &str,
+    repo: &Repo,
+    pull: &Pull,
+    summary: &str,
+) {
+    if pull.author_sub == actor_sub {
+        return;
+    }
+    let Some(k) = &state.klaxon else {
+        return;
+    };
+    let title = format!("{actor_sub} 评论了你的 PR");
+    let body = if summary.trim().is_empty() {
+        truncate_notify(&pull.title, NOTIFY_BODY_CHARS)
+    } else {
+        truncate_notify(summary, NOTIFY_BODY_CHARS)
+    };
+    let url = pull_notify_url(state, repo, pull.number);
+    k.notify(KLAXON_SOURCE, &pull.author_sub, &title, &body, &url);
+}
+
+fn notify_pull_assigned(
+    state: &AppState,
+    actor_sub: &str,
+    recipient_sub: &str,
+    repo: &Repo,
+    pull: &Pull,
+) {
+    if recipient_sub.is_empty() || recipient_sub == actor_sub {
+        return;
+    }
+    let Some(k) = &state.klaxon else {
+        return;
+    };
+    let title = format!(
+        "{actor_sub} 请你 review PR:{}",
+        truncate_notify(&pull.title, NOTIFY_TITLE_CHARS)
+    );
+    let body = truncate_notify(&pull.title, NOTIFY_BODY_CHARS);
+    let url = pull_notify_url(state, repo, pull.number);
+    k.notify(KLAXON_SOURCE, recipient_sub, &title, &body, &url);
+}
+
+fn notify_pull_assignment_changes(
+    state: &AppState,
+    actor_sub: &str,
+    repo: &Repo,
+    pull: &Pull,
+    old_assignee: &str,
+    new_assignee: &str,
+    old_reviewer: &str,
+    new_reviewer: &str,
+) {
+    let mut recipients = BTreeSet::new();
+    for (old, new) in [(old_assignee, new_assignee), (old_reviewer, new_reviewer)] {
+        if old != new && recipients.insert(new) {
+            notify_pull_assigned(state, actor_sub, new, repo, pull);
+        }
+    }
+}
+
+fn clean_subject_field(raw: &str) -> String {
+    raw.trim().chars().take(128).collect()
 }
 
 // ===========================================================================
@@ -173,6 +261,10 @@ pub struct CreateForm {
     #[serde(default)]
     pub body: String,
     #[serde(default)]
+    pub assignee: String,
+    #[serde(default)]
+    pub reviewer: String,
+    #[serde(default)]
     pub milestone_id: String,
     #[serde(default, deserialize_with = "crate::handlers::form_vec")]
     pub labels: Vec<String>,
@@ -238,6 +330,8 @@ pub async fn create(
     }
     let (milestone_id, label_ids) =
         clean_pull_metadata(&state, &repo, &form.milestone_id, &form.labels).await?;
+    let assignee = clean_subject_field(&form.assignee);
+    let reviewer = clean_subject_field(&form.reviewer);
 
     let pull = state
         .store
@@ -254,8 +348,18 @@ pub async fn create(
         .await?;
     state
         .store
-        .set_pull_metadata(&pull.id, &milestone_id, &label_ids)
+        .set_pull_metadata(&pull.id, &assignee, &reviewer, &milestone_id, &label_ids)
         .await?;
+    notify_pull_assignment_changes(
+        &state,
+        &who.subject,
+        &repo,
+        &pull,
+        "",
+        &assignee,
+        "",
+        &reviewer,
+    );
 
     // Audit: no dedicated AuditSink in this crate — tracing is the audit surface (as with repo
     // create / issue open / PAT mint).
@@ -628,6 +732,7 @@ pub async fn review(
         ));
     }
     let verdict = normalize_verdict(&form.verdict)?;
+    let review_body = form.body.trim().chars().take(20_000).collect::<String>();
     state
         .store
         .create_pull_review(
@@ -635,7 +740,7 @@ pub async fn review(
             &pull.id,
             &who.subject,
             verdict,
-            &form.body.trim().chars().take(20_000).collect::<String>(),
+            &review_body,
             now_secs(),
         )
         .await?;
@@ -646,6 +751,12 @@ pub async fn review(
         verdict,
         "pull request reviewed"
     );
+    let summary = if review_body.is_empty() {
+        format!("Review verdict: {}", verdict.replace('_', " "))
+    } else {
+        review_body
+    };
+    notify_pull_author(&state, &who.subject, &repo, &pull, &summary);
     Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
 }
 
@@ -761,6 +872,12 @@ async fn add_inline_comment(
         actor = who.subject,
         "pull inline comment added"
     );
+    let summary = if line > 0 {
+        format!("{path}:{line}: {body}")
+    } else {
+        format!("{path}: {body}")
+    };
+    notify_pull_author(state, &who.subject, &repo, &pull, &summary);
     Ok((path, line, who.subject, body))
 }
 
@@ -772,6 +889,10 @@ async fn add_inline_comment(
 pub struct MetadataForm {
     #[serde(default)]
     pub csrf_token: String,
+    #[serde(default)]
+    pub assignee: String,
+    #[serde(default)]
+    pub reviewer: String,
     #[serde(default)]
     pub milestone_id: String,
     #[serde(default, deserialize_with = "crate::handlers::form_vec")]
@@ -804,10 +925,22 @@ pub async fn metadata(
     }
     let (milestone_id, label_ids) =
         clean_pull_metadata(&state, &repo, &form.milestone_id, &form.labels).await?;
+    let assignee = clean_subject_field(&form.assignee);
+    let reviewer = clean_subject_field(&form.reviewer);
     state
         .store
-        .set_pull_metadata(&pull.id, &milestone_id, &label_ids)
+        .set_pull_metadata(&pull.id, &assignee, &reviewer, &milestone_id, &label_ids)
         .await?;
+    notify_pull_assignment_changes(
+        &state,
+        &who.subject,
+        &repo,
+        &pull,
+        &pull.assignee_sub,
+        &assignee,
+        &pull.reviewer_sub,
+        &reviewer,
+    );
     tracing::info!(
         repo = repo.id,
         number,
@@ -938,7 +1071,7 @@ async fn render_compare(
             .list_milestones(&repo.id)
             .await
             .unwrap_or_default();
-        let metadata_fields = render_pull_metadata_fields(&labels, &milestones, "", &[]);
+        let metadata_fields = render_pull_metadata_fields(&labels, &milestones, "", "", "", &[]);
 
         // Prefill the title from the single/top commit subject, else "head into base".
         let default_title = commits
@@ -1083,6 +1216,16 @@ fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Miles
         .find(|m| m.id == pull.milestone_id)
         .map(|m| format!(" · milestone {}", esc(&m.title)))
         .unwrap_or_default();
+    let assignee = if pull.assignee_sub.is_empty() {
+        String::new()
+    } else {
+        format!(" · assigned to {}", esc(&pull.assignee_sub))
+    };
+    let reviewer = if pull.reviewer_sub.is_empty() {
+        String::new()
+    } else {
+        format!(" · reviewer {}", esc(&pull.reviewer_sub))
+    };
     format!(
         r##"<li class="pr-item">
   <div class="pr-item__head">
@@ -1090,7 +1233,7 @@ fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Miles
     <a class="pr-item__title" href="/r/{owner}/{name}/pulls/{number}">#{number} {title}</a>
   </div>
   <div class="label-row">{label_chips}</div>
-  <span class="pr-item__meta">{head} &rarr; {base} · opened {when} by {author}{milestone}</span>
+  <span class="pr-item__meta">{head} &rarr; {base} · opened {when} by {author}{assignee}{reviewer}{milestone}</span>
 </li>"##,
         cls = cls,
         label = label,
@@ -1103,6 +1246,8 @@ fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Miles
         base = esc(&pull.base),
         when = esc(&fmt_ts(pull.created_at)),
         author = esc(&pull.author_sub),
+        assignee = assignee,
+        reviewer = reviewer,
         milestone = milestone,
     )
 }
@@ -1186,6 +1331,8 @@ fn render_label_chips(labels: &[Label]) -> String {
 fn render_pull_metadata_fields(
     labels: &[Label],
     milestones: &[Milestone],
+    assignee: &str,
+    reviewer: &str,
     milestone_id: &str,
     selected_labels: &[Label],
 ) -> String {
@@ -1211,6 +1358,14 @@ fn render_pull_metadata_fields(
     };
     format!(
         r##"<div class="field">
+  <label for="pr-assignee">Assignee</label>
+  <input type="text" id="pr-assignee" name="assignee" maxlength="128" value="{assignee}" autocomplete="off" spellcheck="false">
+</div>
+<div class="field">
+  <label for="pr-reviewer">Reviewer</label>
+  <input type="text" id="pr-reviewer" name="reviewer" maxlength="128" value="{reviewer}" autocomplete="off" spellcheck="false">
+</div>
+<div class="field">
   <label for="pr-milestone-id">Milestone</label>
   <select id="pr-milestone-id" name="milestone_id">{milestones}</select>
 </div>
@@ -1218,6 +1373,8 @@ fn render_pull_metadata_fields(
   <label>Labels</label>
   <div class="check-list">{label_checks}</div>
 </div>"##,
+        assignee = esc(assignee),
+        reviewer = esc(reviewer),
         milestones = render_milestone_options(milestones, milestone_id, "No milestone"),
         label_checks = label_checks,
     )
@@ -1249,6 +1406,16 @@ async fn render_detail(
         .find(|m| m.id == pull.milestone_id)
         .map(|m| esc(&m.title))
         .unwrap_or_else(|| "No milestone".to_string());
+    let assignee = if pull.assignee_sub.is_empty() {
+        "Unassigned".to_string()
+    } else {
+        esc(&pull.assignee_sub)
+    };
+    let reviewer = if pull.reviewer_sub.is_empty() {
+        "No reviewer".to_string()
+    } else {
+        esc(&pull.reviewer_sub)
+    };
 
     let body_html = if pull.body.trim().is_empty() {
         "<p class=\"muted\">No description provided.</p>".to_string()
@@ -1284,8 +1451,14 @@ async fn render_detail(
     let reviews_card =
         render_reviews_card(repo, reviews, review_comments, csrf, pull, who, headers);
     let metadata_form = if can_gate(repo, pull, who) || auth::is_admin(headers) {
-        let fields =
-            render_pull_metadata_fields(labels, milestones, &pull.milestone_id, pull_labels);
+        let fields = render_pull_metadata_fields(
+            labels,
+            milestones,
+            &pull.assignee_sub,
+            &pull.reviewer_sub,
+            &pull.milestone_id,
+            pull_labels,
+        );
         format!(
             r##"<section class="card">
   <div class="card__head"><h2>Metadata</h2></div>
@@ -1371,7 +1544,7 @@ async fn render_detail(
     <span class="state-badge {cls}" id="state-badge-main">{label}</span>
     <h1 class="pr-title">#{number} {title}</h1>
   </div>
-  <p class="sub"><code>{head}</code> &rarr; <code>{base}</code> · opened {when} by {author} · milestone {milestone}</p>
+  <p class="sub"><code>{head}</code> &rarr; <code>{base}</code> · opened {when} by {author} · assignee {assignee} · reviewer {reviewer} · milestone {milestone}</p>
   <div class="label-row">{label_chips}{review_badges}</div>
 </div>
 <section class="card">
@@ -1396,6 +1569,8 @@ async fn render_detail(
         base = esc(&pull.base),
         when = esc(&fmt_ts(pull.created_at)),
         author = esc(&pull.author_sub),
+        assignee = assignee,
+        reviewer = reviewer,
         milestone = milestone,
         label_chips = label_chips,
         review_badges = review_badges,
@@ -1677,7 +1852,9 @@ fn render_diff(diff: &str) -> String {
         }
     }
 
-    let mut out = String::from("<div class=\"diff-toolbar\" data-diff-toolbar></div><div class=\"diff-files\">");
+    let mut out = String::from(
+        "<div class=\"diff-toolbar\" data-diff-toolbar></div><div class=\"diff-files\">",
+    );
     for f in &files {
         out.push_str(&render_diff_file(f));
     }

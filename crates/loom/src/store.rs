@@ -184,10 +184,12 @@ pub trait Store: Send + Sync {
     /// Count of OPEN pull requests on a repo (for the repo header badge).
     async fn open_pull_count(&self, repo_id: &str) -> Result<i64, StoreError>;
 
-    /// Replace pull-request milestone/label metadata in one operation.
+    /// Replace pull-request assignee/reviewer/milestone/label metadata in one operation.
     async fn set_pull_metadata(
         &self,
         pull_id: &str,
+        assignee_sub: &str,
+        reviewer_sub: &str,
         milestone_id: &str,
         label_ids: &[String],
     ) -> Result<bool, StoreError>;
@@ -670,6 +672,8 @@ impl Store for InMemoryStore {
             base: base.to_string(),
             head: head.to_string(),
             author_sub: author_sub.to_string(),
+            assignee_sub: String::new(),
+            reviewer_sub: String::new(),
             milestone_id: String::new(),
             state: "open".to_string(),
             created_at,
@@ -751,6 +755,8 @@ impl Store for InMemoryStore {
     async fn set_pull_metadata(
         &self,
         pull_id: &str,
+        assignee_sub: &str,
+        reviewer_sub: &str,
         milestone_id: &str,
         label_ids: &[String],
     ) -> Result<bool, StoreError> {
@@ -758,6 +764,8 @@ impl Store for InMemoryStore {
         let Some(pull) = pulls.iter_mut().find(|p| p.id == pull_id) else {
             return Ok(false);
         };
+        pull.assignee_sub = assignee_sub.to_string();
+        pull.reviewer_sub = reviewer_sub.to_string();
         pull.milestone_id = milestone_id.to_string();
         drop(pulls);
 
@@ -1069,7 +1077,7 @@ const ISSUE_COLS: &str =
     "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
 const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
 const PULL_COLS: &str =
-    "id, repo_id, number, title, body, base_branch, head_branch, author_sub, milestone_id, state, created_at, merged_at";
+    "id, repo_id, number, title, body, base_branch, head_branch, author_sub, assignee_sub, reviewer_sub, milestone_id, state, created_at, merged_at";
 const PAT_COLS: &str = "id, owner_sub, name, token_hash, created_at";
 const LABEL_COLS: &str = "id, repo_id, name, color, created_at";
 const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
@@ -1229,11 +1237,23 @@ impl PgStore {
                  base_branch TEXT NOT NULL, \
                  head_branch TEXT NOT NULL, \
                  author_sub TEXT NOT NULL, \
+                 assignee_sub TEXT NOT NULL DEFAULT '', \
+                 reviewer_sub TEXT NOT NULL DEFAULT '', \
                  milestone_id TEXT NOT NULL DEFAULT '', \
                  state TEXT NOT NULL DEFAULT 'open', \
                  created_at BIGINT NOT NULL, \
                  merged_at BIGINT NOT NULL DEFAULT 0\
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pulls ADD COLUMN IF NOT EXISTS assignee_sub TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pulls ADD COLUMN IF NOT EXISTS reviewer_sub TEXT NOT NULL DEFAULT ''",
         )
         .execute(&self.pool)
         .await?;
@@ -1413,6 +1433,8 @@ impl PgStore {
             base: row.try_get("base_branch")?,
             head: row.try_get("head_branch")?,
             author_sub: row.try_get("author_sub")?,
+            assignee_sub: row.try_get("assignee_sub")?,
+            reviewer_sub: row.try_get("reviewer_sub")?,
             milestone_id: row.try_get("milestone_id")?,
             state: row.try_get("state")?,
             created_at: row.try_get("created_at")?,
@@ -1929,8 +1951,8 @@ impl Store for PgStore {
             let result = sqlx::query(
                 "INSERT INTO pulls \
                      (id, repo_id, number, title, body, base_branch, head_branch, author_sub, \
-                      milestone_id, state, created_at, merged_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', 'open', $9, 0) \
+                      assignee_sub, reviewer_sub, milestone_id, state, created_at, merged_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', '', '', 'open', $9, 0) \
                  ON CONFLICT (repo_id, number) DO NOTHING",
             )
             .bind(id)
@@ -1956,6 +1978,8 @@ impl Store for PgStore {
                     base: base.to_string(),
                     head: head.to_string(),
                     author_sub: author_sub.to_string(),
+                    assignee_sub: String::new(),
+                    reviewer_sub: String::new(),
                     milestone_id: String::new(),
                     state: "open".to_string(),
                     created_at,
@@ -2054,6 +2078,8 @@ impl Store for PgStore {
     async fn set_pull_metadata(
         &self,
         pull_id: &str,
+        assignee_sub: &str,
+        reviewer_sub: &str,
         milestone_id: &str,
         label_ids: &[String],
     ) -> Result<bool, StoreError> {
@@ -2062,12 +2088,16 @@ impl Store for PgStore {
             .begin()
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
-        let result = sqlx::query("UPDATE pulls SET milestone_id = $1 WHERE id = $2")
-            .bind(milestone_id)
-            .bind(pull_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let result = sqlx::query(
+            "UPDATE pulls SET assignee_sub = $1, reviewer_sub = $2, milestone_id = $3 WHERE id = $4",
+        )
+        .bind(assignee_sub)
+        .bind(reviewer_sub)
+        .bind(milestone_id)
+        .bind(pull_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
         if result.rows_affected() == 0 {
             tx.rollback()
                 .await
@@ -2700,9 +2730,18 @@ mod tests {
             .await
             .unwrap();
         assert!(s
-            .set_pull_metadata(&pull.id, &milestone.id, std::slice::from_ref(&label.id))
+            .set_pull_metadata(
+                &pull.id,
+                "bob",
+                "carol",
+                &milestone.id,
+                std::slice::from_ref(&label.id),
+            )
             .await
             .unwrap());
+        let pull = s.get_pull("r", 1).await.unwrap().unwrap();
+        assert_eq!(pull.assignee_sub, "bob");
+        assert_eq!(pull.reviewer_sub, "carol");
         assert_eq!(s.pull_labels(&pull.id).await.unwrap(), vec![label.clone()]);
         assert_eq!(
             s.list_pulls_filtered("r", &label.id, &milestone.id)

@@ -22,6 +22,7 @@ pub mod gitops;
 pub mod handlers;
 pub mod markdown;
 pub mod model;
+mod notify;
 pub mod store;
 
 use std::sync::Arc;
@@ -35,6 +36,7 @@ use rand::RngCore;
 
 use crate::config::Config;
 use crate::gitops::GitOps;
+pub use crate::notify::KlaxonNotifier;
 use crate::store::{InMemoryStore, PgStore, Store};
 
 /// Outer request-body cap on the git smart-HTTP routes (1 GiB). A push body is buffered in
@@ -48,6 +50,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<dyn Store>,
     pub git: GitOps,
+    pub klaxon: Option<Arc<KlaxonNotifier>>,
 }
 
 /// Build the router wiring all endpoints onto `state`.
@@ -200,6 +203,7 @@ pub fn build_dev_state_at(data_dir: impl Into<String>) -> AppState {
         config: Arc::new(config),
         store: Arc::new(InMemoryStore::new()),
         git,
+        klaxon: None,
     }
 }
 
@@ -241,6 +245,7 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         config: Arc::new(config),
         store,
         git,
+        klaxon: KlaxonNotifier::from_env().map(Arc::new),
     })
 }
 

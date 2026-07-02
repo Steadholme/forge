@@ -148,6 +148,7 @@ async fn build_git() -> Result<Router, String> {
         config: Arc::new(config),
         store: Arc::new(pg),
         git,
+        klaxon: loom::KlaxonNotifier::from_env().map(Arc::new),
     };
     Ok(loom::app(state))
 }

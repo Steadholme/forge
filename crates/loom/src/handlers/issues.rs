@@ -27,6 +27,9 @@ const ISSUES_PER_PAGE: i64 = 25;
 /// Hard caps on the stored text so a single request cannot store an unbounded blob.
 const MAX_TITLE_CHARS: usize = 300;
 const MAX_BODY_CHARS: usize = 20_000;
+const KLAXON_SOURCE: &str = "loom";
+const NOTIFY_TITLE_CHARS: usize = 96;
+const NOTIFY_BODY_CHARS: usize = 240;
 
 // ===========================================================================
 // Shared helpers
@@ -46,6 +49,46 @@ fn normalize_filter(raw: Option<&str>) -> &'static str {
 /// admin (group-based). Admin membership is read from the HMAC-verified `X-Auth-Groups` header.
 fn can_moderate(repo: &Repo, issue: &Issue, who: &Identity, headers: &HeaderMap) -> bool {
     issue.author_sub == who.subject || repo.owner_sub == who.subject || auth::is_admin(headers)
+}
+
+fn truncate_notify(s: &str, max: usize) -> String {
+    let mut iter = s.trim().chars();
+    let mut out: String = iter.by_ref().take(max).collect();
+    if iter.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+fn issue_notify_url(state: &AppState, repo: &Repo, number: i64) -> String {
+    format!(
+        "{}/r/{}/{}/issues/{number}",
+        state.config.public_base_url.trim_end_matches('/'),
+        repo.owner_sub,
+        repo.name,
+    )
+}
+
+fn notify_issue_assigned(
+    state: &AppState,
+    actor_sub: &str,
+    recipient_sub: &str,
+    repo: &Repo,
+    issue: &Issue,
+) {
+    if recipient_sub.is_empty() || recipient_sub == actor_sub {
+        return;
+    }
+    let Some(k) = &state.klaxon else {
+        return;
+    };
+    let title = format!(
+        "{actor_sub} assigned you issue: {}",
+        truncate_notify(&issue.title, NOTIFY_TITLE_CHARS)
+    );
+    let body = truncate_notify(&issue.title, NOTIFY_BODY_CHARS);
+    let url = issue_notify_url(state, repo, issue.number);
+    k.notify(KLAXON_SOURCE, recipient_sub, &title, &body, &url);
 }
 
 /// Render the repo header on the "Issues" tab (fetches the open issue/PR badge counts).
@@ -256,6 +299,7 @@ pub async fn create(
         .store
         .set_issue_metadata(&issue.id, &assignee, &milestone_id, &label_ids)
         .await?;
+    notify_issue_assigned(&state, &who.subject, &assignee, &repo, &issue);
 
     tracing::info!(
         repo = repo.id,
@@ -484,6 +528,9 @@ pub async fn metadata(
         .store
         .set_issue_metadata(&issue.id, &assignee, &milestone_id, &label_ids)
         .await?;
+    if assignee != issue.assignee_sub {
+        notify_issue_assigned(&state, &who.subject, &assignee, &repo, &issue);
+    }
     tracing::info!(
         repo = repo.id,
         number,
@@ -525,7 +572,12 @@ pub async fn toggle_json(
 ) -> Result<Response, AppError> {
     let next = apply_issue_toggle(&state, &headers, &owner, &name, number, &form).await?;
     let (badge_class, badge_label, button_label, message) = if next == "closed" {
-        ("state-badge--closed", "Closed", "Reopen issue", "Issue closed")
+        (
+            "state-badge--closed",
+            "Closed",
+            "Reopen issue",
+            "Issue closed",
+        )
     } else {
         ("state-badge--open", "Open", "Close issue", "Issue reopened")
     };
@@ -654,8 +706,14 @@ async fn render_list(
         closed_count,
         all_count,
     );
-    let filters =
-        render_metadata_filters(repo, &labels, &milestones, filter, label_filter, milestone_filter);
+    let filters = render_metadata_filters(
+        repo,
+        &labels,
+        &milestones,
+        filter,
+        label_filter,
+        milestone_filter,
+    );
 
     let list = if issues.is_empty() {
         format!(

@@ -21,7 +21,7 @@ axum = "0.8"
 # written concurrently with stdout read, so a large push never deadlocks the pipe); `io-util`
 # for AsyncWriteExt. The Store trait is async: handlers `.await` it directly and PgStore uses
 # sqlx natively, so a worker thread is NEVER blocked (no block_in_place, no sync-over-async).
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "fs", "net", "time"] }
 # Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (same seam as the
 # rest of the estate).
 async-trait = "0.1"

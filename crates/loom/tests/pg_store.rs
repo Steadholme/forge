@@ -318,9 +318,18 @@ async fn pg_store_full_integration() {
     assert_eq!(store.open_pull_count(&repo_id).await.unwrap(), 0);
 
     assert!(store
-        .set_pull_metadata("pl2", &milestone.id, std::slice::from_ref(&label.id))
+        .set_pull_metadata(
+            "pl2",
+            "bob",
+            "carol",
+            &milestone.id,
+            std::slice::from_ref(&label.id),
+        )
         .await
         .unwrap());
+    let assigned_pull = store.get_pull(&repo_id, 2).await.unwrap().unwrap();
+    assert_eq!(assigned_pull.assignee_sub, "bob");
+    assert_eq!(assigned_pull.reviewer_sub, "carol");
     assert_eq!(store.pull_labels("pl2").await.unwrap(), vec![label.clone()]);
     assert_eq!(
         store

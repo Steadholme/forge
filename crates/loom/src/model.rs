@@ -98,6 +98,10 @@ pub struct Pull {
     pub head: String,
     /// Author subject from `X-Auth-Subject`.
     pub author_sub: String,
+    /// Optional assignee subject. Empty means unassigned.
+    pub assignee_sub: String,
+    /// Optional requested reviewer subject. Empty means no requested reviewer.
+    pub reviewer_sub: String,
     /// Optional milestone id. Empty means no milestone.
     pub milestone_id: String,
     /// `open`, `merged`, or `closed`.
