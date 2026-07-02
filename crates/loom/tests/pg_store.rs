@@ -411,16 +411,28 @@ async fn pg_store_full_integration() {
     // --- pulls: sequential numbering + state + merge guard -----------------
     let pr1 = store
         .create_pull(
-            "pl1", &repo_id, "add x", "body", "main", "feat", "alice", now,
+            "pl1", &repo_id, "add x", "body", "main", "feat", "alice", false, now,
         )
         .await
         .unwrap();
     let pr2 = store
-        .create_pull("pl2", &repo_id, "add y", "", "main", "fix", "bob", now + 1)
+        .create_pull(
+            "pl2",
+            &repo_id,
+            "add y",
+            "",
+            "main",
+            "fix",
+            "bob",
+            true,
+            now + 1,
+        )
         .await
         .unwrap();
     assert_eq!(pr1.number, 1);
     assert_eq!(pr2.number, 2);
+    assert!(!pr1.is_draft);
+    assert!(pr2.is_draft);
     assert_eq!(store.open_pull_count(&repo_id).await.unwrap(), 2);
 
     let listed_pulls: Vec<i64> = store
@@ -432,6 +444,9 @@ async fn pg_store_full_integration() {
         .collect();
     assert_eq!(listed_pulls, vec![2, 1]); // newest number first
 
+    assert!(!store.merge_pull("pl2", now + 4).await.unwrap());
+    assert!(store.set_pull_draft("pl2", false).await.unwrap());
+    assert!(!store.get_pull(&repo_id, 2).await.unwrap().unwrap().is_draft);
     assert!(store.set_pull_state("pl2", "closed").await.unwrap());
     assert!(store.merge_pull("pl1", now + 5).await.unwrap());
     let merged = store.get_pull(&repo_id, 1).await.unwrap().unwrap();

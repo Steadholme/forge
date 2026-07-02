@@ -131,6 +131,8 @@ pub struct Pull {
     pub reviewer_sub: String,
     /// Optional milestone id. Empty means no milestone.
     pub milestone_id: String,
+    /// Whether this pull request is a draft and cannot be merged yet.
+    pub is_draft: bool,
     /// `open`, `merged`, or `closed`.
     pub state: String,
     /// Creation time, epoch seconds.

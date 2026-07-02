@@ -1009,6 +1009,7 @@ async fn pull_request_compare_create_and_merge() {
     .await;
     assert_eq!(cmp.status, StatusCode::OK);
     assert!(cmp.body.contains("Create pull request"));
+    assert!(cmp.body.contains("Create as draft"));
     assert!(
         cmp.body.contains("diff-row--add"),
         "diff shows an added line"
@@ -1029,6 +1030,7 @@ async fn pull_request_compare_create_and_merge() {
                 ("body", "please review"),
                 ("assignee", "bob"),
                 ("reviewer", "carol"),
+                ("is_draft", "on"),
             ],
             &csrf,
             Some("alice"),
@@ -1040,18 +1042,24 @@ async fn pull_request_compare_create_and_merge() {
     let pull = store.get_pull(&repo.id, 1).await.unwrap().unwrap();
     assert_eq!(pull.assignee_sub, "bob");
     assert_eq!(pull.reviewer_sub, "carol");
+    assert!(pull.is_draft);
 
-    // List shows the open PR.
+    // List shows the open draft PR.
     let list = send(&app, get("/r/alice/proj/pulls", Some("alice"))).await;
     assert!(list.body.contains("#1"));
     assert!(list.body.contains("Open"));
+    assert!(list.body.contains("pr-draft-badge"));
+    assert!(list.body.contains("Draft"));
     assert!(list.body.contains("assigned to bob"));
     assert!(list.body.contains("reviewer carol"));
 
-    // Detail shows the merge button for the owner.
+    // Detail shows draft state for the owner and hides the merge button.
     let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
     assert_eq!(detail.status, StatusCode::OK);
-    assert!(detail.body.contains("Merge pull request"));
+    assert!(!detail.body.contains("Merge pull request"));
+    assert!(detail.body.contains("Draft pull requests cannot be merged"));
+    assert!(detail.body.contains("btn-ready-review"));
+    assert!(!detail.body.contains("btn-convert-draft"));
     assert!(detail.body.contains("assignee bob"));
     assert!(detail.body.contains("reviewer carol"));
     assert!(detail.body.contains("class=\"pr-filetree\""));
@@ -1062,6 +1070,93 @@ async fn pull_request_compare_create_and_merge() {
         .contains("name=\"file_path\" value=\"file.txt\""));
     assert!(detail.body.contains("data-viewed=\"false\""));
     let csrf = detail.csrf_cookie().expect("csrf on detail");
+
+    let blocked_draft_merge = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(blocked_draft_merge.status, StatusCode::BAD_REQUEST);
+    assert!(blocked_draft_merge
+        .body
+        .contains("Draft pull requests cannot be merged"));
+    let main_oid = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_ne!(main_oid, feature_oid, "draft PR did not merge on disk");
+
+    let bob_draft_detail = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    let bob_draft_csrf = bob_draft_detail
+        .csrf_cookie()
+        .expect("csrf on bob draft detail");
+    let forbidden_ready = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/ready",
+            &[("csrf_token", &bob_draft_csrf)],
+            &bob_draft_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden_ready.status, StatusCode::FORBIDDEN);
+
+    let draft_detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = draft_detail.csrf_cookie().expect("csrf on draft detail");
+    let ready = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/ready",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(ready.status, StatusCode::FOUND);
+    assert!(!store.get_pull(&repo.id, 1).await.unwrap().unwrap().is_draft);
+
+    let ready_detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(ready_detail.body.contains("Merge pull request"));
+    assert!(ready_detail.body.contains("btn-convert-draft"));
+    let csrf = ready_detail.csrf_cookie().expect("csrf on ready detail");
+    let converted = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/draft",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(converted.status, StatusCode::FOUND);
+    assert!(store.get_pull(&repo.id, 1).await.unwrap().unwrap().is_draft);
+
+    let converted_detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(converted_detail.body.contains("btn-ready-review"));
+    let csrf = converted_detail
+        .csrf_cookie()
+        .expect("csrf on converted detail");
+    let ready_again = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/ready",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(ready_again.status, StatusCode::FOUND);
+    assert!(!store.get_pull(&repo.id, 1).await.unwrap().unwrap().is_draft);
+
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(detail.body.contains("Merge pull request"));
+    let csrf = detail.csrf_cookie().expect("csrf after ready");
 
     let bob_detail = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
     let bob_csrf = bob_detail.csrf_cookie().expect("csrf on bob detail");

@@ -271,6 +271,8 @@ pub struct CreateForm {
     pub milestone_id: String,
     #[serde(default, deserialize_with = "crate::handlers::form_vec")]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub is_draft: String,
 }
 
 pub async fn create(
@@ -335,6 +337,7 @@ pub async fn create(
         clean_pull_metadata(&state, &repo, &form.milestone_id, &form.labels).await?;
     let assignee = clean_subject_field(&form.assignee);
     let reviewer = clean_subject_field(&form.reviewer);
+    let is_draft = form.is_draft == "on";
 
     let pull = state
         .store
@@ -346,6 +349,7 @@ pub async fn create(
             &base,
             &head,
             &who.subject,
+            is_draft,
             now_secs(),
         )
         .await?;
@@ -372,6 +376,7 @@ pub async fn create(
         base = base,
         head = head,
         author = who.subject,
+        draft = is_draft,
         "pull request opened"
     );
     Ok(redirect(&format!(
@@ -503,6 +508,30 @@ pub async fn merge(
     if !pull.is_open() {
         return Err(AppError::BadRequest(
             "This pull request is no longer open.".to_string(),
+        ));
+    }
+    if pull.is_draft {
+        let csrf = auth::new_csrf_token();
+        let header = pr_header(&state, &repo, "pulls").await;
+        let body = render_detail_with_fresh_metadata(
+            &state,
+            &repo,
+            &pull,
+            &header,
+            &who,
+            &headers,
+            &csrf,
+            Some("Draft pull requests cannot be merged. Mark this pull request ready for review before merging."),
+        )
+        .await?;
+        return Ok(html_with_csrf(
+            StatusCode::BAD_REQUEST,
+            page(
+                &format!("{owner}/{name} · PR #{number}"),
+                Some(&who.email),
+                &body,
+            ),
+            &csrf,
         ));
     }
     let reviews = state.store.list_pull_reviews(&pull.id).await?;
@@ -1245,6 +1274,79 @@ pub async fn toggle(
 }
 
 // ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/ready|draft — draft state
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DraftForm {
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+pub async fn ready_for_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<DraftForm>,
+) -> Result<Response, AppError> {
+    set_draft_state(state, headers, owner, name, number, form.csrf_token, false).await
+}
+
+pub async fn convert_to_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<DraftForm>,
+) -> Result<Response, AppError> {
+    set_draft_state(state, headers, owner, name, number, form.csrf_token, true).await
+}
+
+async fn set_draft_state(
+    state: AppState,
+    headers: HeaderMap,
+    owner: String,
+    name: String,
+    number: i64,
+    csrf_token: String,
+    is_draft: bool,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+
+    if !can_gate(&repo, &pull, &who) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner or the pull-request author can change this.".to_string(),
+        ));
+    }
+    if !pull.is_open() {
+        return Err(AppError::BadRequest(
+            "Only open pull requests can change draft state.".to_string(),
+        ));
+    }
+    if pull.is_draft != is_draft {
+        state.store.set_pull_draft(&pull.id, is_draft).await?;
+    }
+    tracing::info!(
+        repo = repo.id,
+        number,
+        draft = is_draft,
+        actor = who.subject,
+        "pull request draft state changed"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+// ===========================================================================
 // Rendering
 // ===========================================================================
 
@@ -1254,6 +1356,14 @@ fn state_badge(pull: &Pull) -> (&'static str, &'static str) {
         "merged" => ("state-badge--merged", "Merged"),
         "closed" => ("state-badge--closed", "Closed"),
         _ => ("state-badge--open", "Open"),
+    }
+}
+
+fn draft_badge(pull: &Pull) -> &'static str {
+    if pull.is_draft {
+        "<span class=\"state-badge pr-draft-badge\">Draft</span>"
+    } else {
+        ""
     }
 }
 
@@ -1341,6 +1451,9 @@ async fn render_compare(
         <textarea id="pr-body" name="body" class="issue-input" placeholder="Optional details…"></textarea>
       </div>
       {metadata_fields}
+      <div class="field field--check">
+        <label class="check"><input type="checkbox" name="is_draft" value="on"> Create as draft</label>
+      </div>
       <div class="actions">
         <button class="btn btn-primary" type="submit">Create pull request</button>
       </div>
@@ -1453,6 +1566,7 @@ fn render_list(
 
 fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Milestone]) -> String {
     let (cls, label) = state_badge(pull);
+    let draft_badge_html = draft_badge(pull);
     let label_chips = render_label_chips(labels);
     let milestone = milestones
         .iter()
@@ -1473,6 +1587,7 @@ fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Miles
         r##"<li class="pr-item">
   <div class="pr-item__head">
     <span class="state-badge {cls}">{label}</span>
+    {draft_badge_html}
     <a class="pr-item__title" href="/r/{owner}/{name}/pulls/{number}">#{number} {title}</a>
   </div>
   <div class="label-row">{label_chips}</div>
@@ -1480,6 +1595,7 @@ fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Miles
 </li>"##,
         cls = cls,
         label = label,
+        draft_badge_html = draft_badge_html,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         number = pull.number,
@@ -1641,6 +1757,7 @@ async fn render_detail(
     error: Option<&str>,
 ) -> Result<String, AppError> {
     let (cls, label) = state_badge(pull);
+    let draft_badge_html = draft_badge(pull);
     let error_block = error_block(error);
     let summary = review_summary(reviews);
     let review_badges = render_review_badges(&summary);
@@ -1756,13 +1873,35 @@ async fn render_detail(
         String::new()
     };
 
-    // Action strip: merge + open/close, shown only to a gated user on an OPEN PR.
-    let actions = if pull.is_open() && can_gate(repo, pull, who) {
+    // Action strip: merge/draft + open/close, shown only to a gated user on an OPEN PR.
+    let actions = if pull.is_open() && pull.is_draft && can_gate(repo, pull, who) {
+        format!(
+            r##"<div class="pr-actions">
+  <p class="pr-status pr-status--draft">Draft pull requests cannot be merged. Mark this pull request ready for review before merging.</p>
+  <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/ready">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <button class="btn btn-primary btn-ready-review" type="submit">Ready for review</button>
+  </form>
+  <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/toggle">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <button class="btn btn-ghost" type="submit">Close</button>
+  </form>
+</div>"##,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            number = pull.number,
+            csrf = esc(csrf),
+        )
+    } else if pull.is_open() && can_gate(repo, pull, who) {
         format!(
             r##"<div class="pr-actions">
   <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/merge">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <button class="btn btn-primary" type="submit">Merge pull request</button>
+  </form>
+  <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/draft">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <button class="btn btn-secondary btn-convert-draft" type="submit">Convert to draft</button>
   </form>
   <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/toggle">
     <input type="hidden" name="csrf_token" value="{csrf}">
@@ -1793,6 +1932,9 @@ async fn render_detail(
             number = pull.number,
             csrf = esc(csrf),
         )
+    } else if pull.is_open() && pull.is_draft {
+        "<p class=\"pr-status pr-status--draft\">Draft pull requests cannot be merged yet.</p>"
+            .to_string()
     } else {
         format!(
             "<p class=\"pr-status\">This pull request is {}.</p>",
@@ -1816,6 +1958,7 @@ async fn render_detail(
 <div class="console__head">
   <div class="repo-title">
     <span class="state-badge {cls}" id="state-badge-main">{label}</span>
+    {draft_badge_html}
     <h1 class="pr-title">#{number} {title}</h1>
   </div>
   <p class="sub"><code>{head}</code> &rarr; <code>{base}</code> · opened {when} by {author} · assignee {assignee} · reviewer {reviewer} · milestone {milestone}</p>
@@ -1838,6 +1981,7 @@ async fn render_detail(
 </section>"##,
         cls = cls,
         label = label,
+        draft_badge_html = draft_badge_html,
         number = pull.number,
         title = esc(&pull.title),
         head = esc(&pull.head),

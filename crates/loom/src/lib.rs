@@ -177,6 +177,14 @@ pub fn app(state: AppState) -> Router {
             post(handlers::pulls::merge),
         )
         .route(
+            "/r/{owner}/{name}/pulls/{number}/ready",
+            post(handlers::pulls::ready_for_review),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/draft",
+            post(handlers::pulls::convert_to_draft),
+        )
+        .route(
             "/r/{owner}/{name}/pulls/{number}/review",
             post(handlers::pulls::review),
         )

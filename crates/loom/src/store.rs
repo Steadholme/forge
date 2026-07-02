@@ -209,6 +209,7 @@ pub trait Store: Send + Sync {
         base: &str,
         head: &str,
         author_sub: &str,
+        is_draft: bool,
         created_at: i64,
     ) -> Result<Pull, StoreError>;
 
@@ -228,6 +229,9 @@ pub trait Store: Send + Sync {
 
     /// Set a PR's state (`open`/`closed`) by id. Returns whether a row changed.
     async fn set_pull_state(&self, id: &str, state: &str) -> Result<bool, StoreError>;
+
+    /// Set or clear a PR's draft marker. Returns whether an open row changed.
+    async fn set_pull_draft(&self, id: &str, is_draft: bool) -> Result<bool, StoreError>;
 
     /// Mark a PR merged: sets `state='merged'` and records `merged_at`. Returns whether a row
     /// changed (false when the PR is already non-open, guarding a double-merge).
@@ -872,6 +876,7 @@ impl Store for InMemoryStore {
         base: &str,
         head: &str,
         author_sub: &str,
+        is_draft: bool,
         created_at: i64,
     ) -> Result<Pull, StoreError> {
         let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
@@ -894,6 +899,7 @@ impl Store for InMemoryStore {
             assignee_sub: String::new(),
             reviewer_sub: String::new(),
             milestone_id: String::new(),
+            is_draft,
             state: "open".to_string(),
             created_at,
             merged_at: 0,
@@ -950,11 +956,23 @@ impl Store for InMemoryStore {
         Ok(false)
     }
 
+    async fn set_pull_draft(&self, id: &str, is_draft: bool) -> Result<bool, StoreError> {
+        let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
+        for p in pulls.iter_mut() {
+            if p.id == id && p.is_open() {
+                let changed = p.is_draft != is_draft;
+                p.is_draft = is_draft;
+                return Ok(changed);
+            }
+        }
+        Ok(false)
+    }
+
     async fn merge_pull(&self, id: &str, merged_at: i64) -> Result<bool, StoreError> {
         let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
         for p in pulls.iter_mut() {
-            // Only an OPEN PR can transition to merged (guards a concurrent double-merge).
-            if p.id == id && p.is_open() {
+            // Only a non-draft OPEN PR can transition to merged (guards a concurrent double-merge).
+            if p.id == id && p.is_open() && !p.is_draft {
                 p.state = "merged".to_string();
                 p.merged_at = merged_at;
                 return Ok(true);
@@ -1545,7 +1563,7 @@ const REPO_COLS: &str = "id, owner_sub, name, description, is_private, default_b
 const RELEASE_COLS: &str = "id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, created_by, created_at, published_at";
 const ISSUE_COLS: &str = "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
 const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
-const PULL_COLS: &str = "id, repo_id, number, title, body, base_branch, head_branch, author_sub, assignee_sub, reviewer_sub, milestone_id, state, created_at, merged_at";
+const PULL_COLS: &str = "id, repo_id, number, title, body, base_branch, head_branch, author_sub, assignee_sub, reviewer_sub, milestone_id, is_draft, state, created_at, merged_at";
 const PAT_COLS: &str = "id, owner_sub, name, token_hash, created_at";
 const LABEL_COLS: &str = "id, repo_id, name, color, created_at";
 const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
@@ -1741,6 +1759,7 @@ impl PgStore {
                  assignee_sub TEXT NOT NULL DEFAULT '', \
                  reviewer_sub TEXT NOT NULL DEFAULT '', \
                  milestone_id TEXT NOT NULL DEFAULT '', \
+                 is_draft BOOLEAN NOT NULL DEFAULT FALSE, \
                  state TEXT NOT NULL DEFAULT 'open', \
                  created_at BIGINT NOT NULL, \
                  merged_at BIGINT NOT NULL DEFAULT 0\
@@ -1760,6 +1779,11 @@ impl PgStore {
         .await?;
         sqlx::query(
             "ALTER TABLE pulls ADD COLUMN IF NOT EXISTS milestone_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pulls ADD COLUMN IF NOT EXISTS is_draft BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&self.pool)
         .await?;
@@ -2026,6 +2050,7 @@ impl PgStore {
             assignee_sub: row.try_get("assignee_sub")?,
             reviewer_sub: row.try_get("reviewer_sub")?,
             milestone_id: row.try_get("milestone_id")?,
+            is_draft: row.try_get("is_draft")?,
             state: row.try_get("state")?,
             created_at: row.try_get("created_at")?,
             merged_at: row.try_get("merged_at")?,
@@ -2682,6 +2707,7 @@ impl Store for PgStore {
         base: &str,
         head: &str,
         author_sub: &str,
+        is_draft: bool,
         created_at: i64,
     ) -> Result<Pull, StoreError> {
         // Allocate the next per-repo number and insert; on the rare concurrent collision the
@@ -2701,8 +2727,8 @@ impl Store for PgStore {
             let result = sqlx::query(
                 "INSERT INTO pulls \
                      (id, repo_id, number, title, body, base_branch, head_branch, author_sub, \
-                      assignee_sub, reviewer_sub, milestone_id, state, created_at, merged_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', '', '', 'open', $9, 0) \
+                      assignee_sub, reviewer_sub, milestone_id, is_draft, state, created_at, merged_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', '', '', $9, 'open', $10, 0) \
                  ON CONFLICT (repo_id, number) DO NOTHING",
             )
             .bind(id)
@@ -2713,6 +2739,7 @@ impl Store for PgStore {
             .bind(base)
             .bind(head)
             .bind(author_sub)
+            .bind(is_draft)
             .bind(created_at)
             .execute(&self.pool)
             .await
@@ -2731,6 +2758,7 @@ impl Store for PgStore {
                     assignee_sub: String::new(),
                     reviewer_sub: String::new(),
                     milestone_id: String::new(),
+                    is_draft,
                     state: "open".to_string(),
                     created_at,
                     merged_at: 0,
@@ -2799,12 +2827,25 @@ impl Store for PgStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn set_pull_draft(&self, id: &str, is_draft: bool) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE pulls SET is_draft = $1 \
+             WHERE id = $2 AND state = 'open'",
+        )
+        .bind(is_draft)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn merge_pull(&self, id: &str, merged_at: i64) -> Result<bool, StoreError> {
-        // Guard the transition in SQL: only an OPEN row flips to merged, so two racing merges
-        // cannot both succeed (the second sees 0 rows affected).
+        // Guard the transition in SQL: only a non-draft OPEN row flips to merged, so two racing
+        // merges cannot both succeed (the second sees 0 rows affected).
         let result = sqlx::query(
             "UPDATE pulls SET state = 'merged', merged_at = $1 \
-             WHERE id = $2 AND state = 'open'",
+             WHERE id = $2 AND state = 'open' AND is_draft = FALSE",
         )
         .bind(merged_at)
         .bind(id)
@@ -3802,21 +3843,23 @@ mod tests {
     async fn pull_numbers_state_and_merge_guard() {
         let s = InMemoryStore::new();
         let p1 = s
-            .create_pull("pl1", "r", "first", "b", "main", "feat", "u", 10)
+            .create_pull("pl1", "r", "first", "b", "main", "feat", "u", false, 10)
             .await
             .unwrap();
         let p2 = s
-            .create_pull("pl2", "r", "second", "", "main", "fix", "v", 11)
+            .create_pull("pl2", "r", "second", "", "main", "fix", "v", true, 11)
             .await
             .unwrap();
         let other = s
-            .create_pull("pl3", "other", "x", "", "main", "wip", "u", 12)
+            .create_pull("pl3", "other", "x", "", "main", "wip", "u", false, 12)
             .await
             .unwrap();
         assert_eq!(p1.number, 1);
         assert_eq!(p2.number, 2);
         assert_eq!(other.number, 1); // independent per repo
         assert!(p1.is_open());
+        assert!(!p1.is_draft);
+        assert!(p2.is_draft);
         assert_eq!(s.open_pull_count("r").await.unwrap(), 2);
 
         // newest number first
@@ -3828,6 +3871,11 @@ mod tests {
             .map(|p| p.number)
             .collect();
         assert_eq!(listed, vec![2, 1]);
+
+        // Draft PRs stay open but cannot merge until marked ready.
+        assert!(!s.merge_pull("pl2", 88).await.unwrap());
+        assert!(s.set_pull_draft("pl2", false).await.unwrap());
+        assert!(!s.get_pull("r", 2).await.unwrap().unwrap().is_draft);
 
         // Close p2, merge p1.
         assert!(s.set_pull_state("pl2", "closed").await.unwrap());
@@ -3884,7 +3932,7 @@ mod tests {
         );
 
         let pull = s
-            .create_pull("pl1", "r", "first", "", "main", "feat", "u", 5)
+            .create_pull("pl1", "r", "first", "", "main", "feat", "u", false, 5)
             .await
             .unwrap();
         assert!(s
