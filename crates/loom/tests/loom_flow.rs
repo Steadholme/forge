@@ -692,6 +692,53 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
 }
 
 #[tokio::test]
+async fn blame_view_renders_groups_and_graceful_notices() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "docs", "").await;
+
+    let git_dir = git.repo_path("alice", "docs").to_string_lossy().to_string();
+    seed_repo(
+        &git_dir,
+        "main",
+        &[
+            ("main.rs", "fn main() {\n    println!(\"<hi>\");\n}\n"),
+            ("bin.dat", "a\0b"),
+        ],
+    );
+    let head = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+
+    let blob = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
+    assert_eq!(blob.status, StatusCode::OK);
+    assert!(blob
+        .body
+        .contains(r#"href="/r/alice/docs/blame/HEAD/main.rs""#));
+
+    let blame = send(&app, get("/r/alice/docs/blame/HEAD/main.rs", Some("alice"))).await;
+    assert_eq!(blame.status, StatusCode::OK);
+    assert!(blame.body.contains("class=\"blame-table\""));
+    assert!(blame.body.contains("class=\"blame-row\""));
+    assert!(blame.body.contains("class=\"blame-commit\""));
+    assert!(blame.body.contains("rowspan=\"3\""));
+    assert!(blame.body.contains(&format!("/r/alice/docs/commit/{head}")));
+    assert!(!blame.body.contains("println!(\"<hi>\");"));
+    assert!(blame.body.contains("println!(&quot;&lt;hi&gt;&quot;);"));
+
+    let binary = send(&app, get("/r/alice/docs/blame/HEAD/bin.dat", Some("alice"))).await;
+    assert_eq!(binary.status, StatusCode::OK);
+    assert!(binary.body.contains("Binary file blame is not shown."));
+
+    let missing = send(
+        &app,
+        get("/r/alice/docs/blame/HEAD/missing.rs", Some("alice")),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::OK);
+    assert!(missing.body.contains("No such file at this ref."));
+}
+
+#[tokio::test]
 async fn fork_clones_bare_repo_and_shows_attribution() {
     let state = temp_state();
     let git = state.git.clone();
@@ -1340,7 +1387,7 @@ async fn commit_status_api_updates_json_and_ssr_checks() {
     .await;
     assert_eq!(before.status, StatusCode::OK);
     assert!(
-        !before.body.contains("commit-status"),
+        !before.body.contains("title=\"Checks:"),
         "commits without statuses do not render a badge"
     );
 
@@ -1411,8 +1458,8 @@ async fn commit_status_api_updates_json_and_ssr_checks() {
     )
     .await;
     assert_eq!(hist.status, StatusCode::OK);
-    assert!(hist.body.contains("commit-status--failure"));
-    assert!(hist.body.contains("status-dot--failure"));
+    assert!(hist.body.contains("title=\"Checks: failure\""));
+    assert!(hist.body.contains("aria-label=\"Checks: failure\""));
 
     let commit = send(
         &app,
@@ -1423,7 +1470,7 @@ async fn commit_status_api_updates_json_and_ssr_checks() {
     )
     .await;
     assert_eq!(commit.status, StatusCode::OK);
-    assert!(commit.body.contains("commit-status--failure"));
+    assert!(commit.body.contains("title=\"Checks: failure\""));
 
     let cmp = send(
         &app,

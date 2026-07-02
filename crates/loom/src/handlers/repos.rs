@@ -19,8 +19,8 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::config::COMMIT_LIMIT;
 use crate::error::AppError;
-use crate::gitops::TreeEntry;
-use crate::handlers::{esc, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
+use crate::gitops::{BlameLine, TreeEntry};
+use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
 use crate::model::{validate_owner_sub, validate_repo_name, Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
@@ -274,6 +274,69 @@ pub async fn blob(
 }
 
 // ===========================================================================
+// GET /r/{owner}/{name}/blame/{ref}/{*path} — line-level blame for a file
+// ===========================================================================
+
+pub async fn blame(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, ref_name, path)): Path<(String, String, String, String)>,
+) -> Result<Response, AppError> {
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let path = clean_blame_subpath(&path)?;
+    let ref_name = ref_name.trim();
+    if ref_name.is_empty() {
+        return Err(AppError::BadRequest("Invalid ref.".to_string()));
+    }
+
+    let header = header_with_counts(&state, &repo, "code").await;
+    let title = format!("{owner}/{name} · Blame");
+    let Some(commit) = resolve_blame_ref(&state, &repo, ref_name).await else {
+        let body = render_blame_notice(&repo, &header, &path, "No such ref in this repository.");
+        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+    };
+    let Some(bytes) = state
+        .git
+        .read_blob(&repo.owner_sub, &repo.name, &commit, &path)
+        .await
+    else {
+        let body = render_blame_notice(&repo, &header, &path, "No such file at this ref.");
+        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+    };
+
+    let body = if bytes.contains(&0) {
+        render_blame_notice(&repo, &header, &path, "Binary file blame is not shown.")
+    } else if bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
+        render_blame_notice(
+            &repo,
+            &header,
+            &path,
+            &format!(
+                "File is too large to blame inline ({}).",
+                human_size(bytes.len() as i64)
+            ),
+        )
+    } else {
+        match state
+            .git
+            .blame(&repo.owner_sub, &repo.name, &commit, &path)
+            .await
+        {
+            Some(lines) => render_blame(&repo, &header, ref_name, &path, &commit, &lines),
+            None => render_blame_notice(
+                &repo,
+                &header,
+                &path,
+                "Could not compute blame for this file.",
+            ),
+        }
+    };
+
+    Ok(html_ok(page(&title, Some(&who.email), &body)))
+}
+
+// ===========================================================================
 // Shared loaders
 // ===========================================================================
 
@@ -344,6 +407,41 @@ fn clean_subpath(path: &str) -> Result<String, AppError> {
         }
     }
     Ok(trimmed.to_string())
+}
+
+fn clean_blame_subpath(path: &str) -> Result<String, AppError> {
+    if path.starts_with('/') {
+        return Err(AppError::BadRequest("Invalid path.".to_string()));
+    }
+    clean_subpath(path)
+}
+
+async fn resolve_blame_ref(state: &AppState, repo: &Repo, ref_name: &str) -> Option<String> {
+    if ref_name == "HEAD" {
+        return state.git.head_commit(&repo.owner_sub, &repo.name).await;
+    }
+    if is_hex_oid(ref_name) {
+        if let Some(oid) = state
+            .git
+            .resolve_commit(&repo.owner_sub, &repo.name, ref_name)
+            .await
+        {
+            return Some(oid);
+        }
+    }
+    let branches = state.git.branches(&repo.owner_sub, &repo.name).await;
+    if branches.iter().any(|b| b == ref_name) {
+        state
+            .git
+            .branch_oid(&repo.owner_sub, &repo.name, ref_name)
+            .await
+    } else {
+        None
+    }
+}
+
+fn is_hex_oid(s: &str) -> bool {
+    (4..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 // ===========================================================================
@@ -900,6 +998,7 @@ fn render_blob(
         release_count,
         "code",
     );
+    let blame_href = format!("/r/{}/{}/blame/HEAD/{}", repo.owner_sub, repo.name, path);
     let content = if bytes.contains(&0) {
         "<div class=\"card__body\"><p class=\"muted\">Binary file not shown.</p></div>".to_string()
     } else if bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
@@ -926,14 +1025,111 @@ fn render_blob(
     format!(
         r##"{header}
 <section class="card">
-  <div class="card__head">{breadcrumb}<span class="muted">{size}</span></div>
+  <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm" href="{blame_href}">Blame</a><span class="muted">{size}</span></span></div>
   {content}
 </section>"##,
         header = header,
         breadcrumb = render_breadcrumb(repo, path, true),
+        blame_href = esc(&blame_href),
         size = esc(&human_size(bytes.len() as i64)),
         content = content,
     )
+}
+
+fn render_blame_notice(repo: &Repo, header: &str, path: &str, message: &str) -> String {
+    format!(
+        r##"{header}
+<section class="card">
+  <div class="card__head">{breadcrumb}<span class="muted">Blame</span></div>
+  <div class="card__body"><p class="muted">{message}</p></div>
+</section>"##,
+        header = header,
+        breadcrumb = render_breadcrumb(repo, path, true),
+        message = esc(message),
+    )
+}
+
+fn render_blame(
+    repo: &Repo,
+    header: &str,
+    ref_name: &str,
+    path: &str,
+    commit: &str,
+    lines: &[BlameLine],
+) -> String {
+    let content = if lines.is_empty() {
+        "<div class=\"card__body\"><p class=\"muted\">Empty file.</p></div>".to_string()
+    } else {
+        format!(
+            "<div class=\"card__body card__body--code\">{}</div>",
+            render_blame_table(repo, lines)
+        )
+    };
+    format!(
+        r##"{header}
+<section class="card">
+  <div class="card__head">
+    {breadcrumb}
+    <span class="muted">Blame {ref_name} at <a href="/r/{owner}/{name}/commit/{commit}"><code class="oid">{short}</code></a></span>
+  </div>
+  {content}
+</section>"##,
+        header = header,
+        breadcrumb = render_breadcrumb(repo, path, true),
+        ref_name = esc(ref_name),
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        commit = esc(commit),
+        short = esc(&short_oid(commit)),
+        content = content,
+    )
+}
+
+fn render_blame_table(repo: &Repo, lines: &[BlameLine]) -> String {
+    let now = now_secs();
+    let mut rows = String::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = &lines[i];
+        let mut run_len = 1usize;
+        while i + run_len < lines.len() && lines[i + run_len].oid == line.oid {
+            run_len += 1;
+        }
+        for offset in 0..run_len {
+            let current = &lines[i + offset];
+            let commit_cell = if offset == 0 {
+                format!(
+                    "<td class=\"blame-commit\" rowspan=\"{run_len}\">\
+                       <a href=\"/r/{owner}/{name}/commit/{oid}\"><code class=\"oid\">{short}</code></a>\
+                       <span class=\"blame-author\">{author}</span>\
+                       <span class=\"blame-time\" title=\"{abs}\">{rel}</span>\
+                     </td>",
+                    run_len = run_len,
+                    owner = esc(&repo.owner_sub),
+                    name = esc(&repo.name),
+                    oid = esc(&current.oid),
+                    short = esc(&short_oid(&current.oid)),
+                    author = esc(&current.author_name),
+                    abs = esc(&fmt_ts(current.time)),
+                    rel = esc(&fmt_rel(now, current.time)),
+                )
+            } else {
+                String::new()
+            };
+            rows.push_str(&format!(
+                "<tr class=\"blame-row\">\
+                   {commit_cell}\
+                   <td class=\"blame-lineno\">{lineno}</td>\
+                   <td class=\"blame-code\"><code>{code}</code></td>\
+                 </tr>",
+                commit_cell = commit_cell,
+                lineno = current.lineno,
+                code = esc(&current.content),
+            ));
+        }
+        i += run_len;
+    }
+    format!("<table class=\"blame-table\"><tbody>{rows}</tbody></table>")
 }
 
 /// Path breadcrumb. `is_blob` makes the final segment a non-link leaf.
@@ -1058,6 +1254,8 @@ mod tests {
         assert!(clean_subpath("a/../b").is_err());
         assert_eq!(clean_subpath("/src/main.rs/").unwrap(), "src/main.rs");
         assert_eq!(clean_subpath("").unwrap(), "");
+        assert!(clean_blame_subpath("/src/main.rs").is_err());
+        assert_eq!(clean_blame_subpath("src/main.rs").unwrap(), "src/main.rs");
     }
 
     #[test]
@@ -1102,5 +1300,50 @@ mod tests {
         // HTML metacharacters in the content are escaped, never live markup.
         assert!(!html.contains("<b>two</b>"));
         assert!(html.contains("&lt;b&gt;two&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn blame_table_groups_commits_and_escapes_code() {
+        let repo = Repo {
+            id: "rp_test".to_string(),
+            owner_sub: "alice".to_string(),
+            name: "demo".to_string(),
+            description: String::new(),
+            is_private: false,
+            default_branch: "main".to_string(),
+            require_approval: false,
+            protect_default_branch: false,
+            forked_from_id: String::new(),
+            created_at: 0,
+        };
+        let lines = vec![
+            BlameLine {
+                oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                author_name: "Ada".to_string(),
+                time: 0,
+                lineno: 1,
+                content: "let x = 1;".to_string(),
+            },
+            BlameLine {
+                oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                author_name: "Ada".to_string(),
+                time: 0,
+                lineno: 2,
+                content: "<script>".to_string(),
+            },
+            BlameLine {
+                oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                author_name: "Bob".to_string(),
+                time: 0,
+                lineno: 3,
+                content: "done".to_string(),
+            },
+        ];
+        let html = render_blame_table(&repo, &lines);
+        assert!(html.contains("class=\"blame-table\""));
+        assert!(html.contains("rowspan=\"2\""));
+        assert!(html.contains("/r/alice/demo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
     }
 }

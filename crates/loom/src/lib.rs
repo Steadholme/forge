@@ -74,6 +74,10 @@ pub fn app(state: AppState) -> Router {
         .route("/r/{owner}/{name}/fork", post(handlers::repos::fork))
         .route("/r/{owner}/{name}/tree/{*path}", get(handlers::repos::tree))
         .route("/r/{owner}/{name}/blob/{*path}", get(handlers::repos::blob))
+        .route(
+            "/r/{owner}/{name}/blame/{ref}/{*path}",
+            get(handlers::repos::blame),
+        )
         .route("/r/{owner}/{name}/commits", get(handlers::commits::history))
         .route(
             "/r/{owner}/{name}/commits/{sha}/status",

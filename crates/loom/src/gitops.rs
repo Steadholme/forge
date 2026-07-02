@@ -12,6 +12,7 @@
 //! stdin while concurrently reading its stdout (so a large push never deadlocks the pipe), and
 //! translate the CGI header block into an axum response.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -70,6 +71,18 @@ impl CommitDetail {
     pub fn subject(&self) -> &str {
         self.message.lines().next().unwrap_or("")
     }
+}
+
+/// One rendered line from `git blame --porcelain`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlameLine {
+    pub oid: String,
+    pub author_name: String,
+    /// Author time, epoch seconds.
+    pub time: i64,
+    /// Final line number in the blamed file.
+    pub lineno: usize,
+    pub content: String,
 }
 
 /// One branch row for the branches page: head OID + head-commit subject and time.
@@ -276,7 +289,7 @@ impl GitOps {
         commit_oid: &str,
         path: &str,
     ) -> Option<Vec<u8>> {
-        if path.is_empty() {
+        if !is_safe_repo_path(path) {
             return None;
         }
         let repo = self.repo_path(owner, name);
@@ -295,6 +308,32 @@ impl GitOps {
             .ok()?;
         if out.status {
             Some(out.stdout)
+        } else {
+            None
+        }
+    }
+
+    /// Line-level blame for a blob at `path` in a resolved commit OID.
+    pub async fn blame(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+        path: &str,
+    ) -> Option<Vec<BlameLine>> {
+        if !is_safe_repo_path(path) {
+            return None;
+        }
+        let repo = self.repo_path(owner, name);
+        let out = self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["blame", "--porcelain", commit_oid, "--", path],
+            )
+            .await
+            .ok()?;
+        if out.status {
+            Some(parse_blame_porcelain(&String::from_utf8_lossy(&out.stdout)))
         } else {
             None
         }
@@ -878,6 +917,83 @@ fn parse_commit_detail(text: &str) -> Option<CommitDetail> {
     })
 }
 
+#[derive(Clone, Debug, Default)]
+struct BlameCommitMeta {
+    author_name: String,
+    time: i64,
+}
+
+/// Parse `git blame --porcelain` output. Git emits commit metadata only when it has not already
+/// been seen in the stream, so metadata is cached by commit OID and reused by later rows.
+fn parse_blame_porcelain(text: &str) -> Vec<BlameLine> {
+    let mut metas: HashMap<String, BlameCommitMeta> = HashMap::new();
+    let mut rows = Vec::new();
+    let mut lines = text.lines();
+
+    while let Some(header) = lines.next() {
+        let Some((oid, lineno)) = parse_blame_header(header) else {
+            continue;
+        };
+        let mut author_name = None;
+        let mut author_time = None;
+        let mut content = None;
+
+        for line in lines.by_ref() {
+            if let Some(code) = line.strip_prefix('\t') {
+                content = Some(code.to_string());
+                break;
+            }
+            if let Some(value) = line.strip_prefix("author ") {
+                author_name = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("author-time ") {
+                author_time = value.trim().parse::<i64>().ok();
+            }
+        }
+
+        if author_name.is_some() || author_time.is_some() {
+            let previous = metas.get(&oid).cloned().unwrap_or_default();
+            metas.insert(
+                oid.clone(),
+                BlameCommitMeta {
+                    author_name: author_name.unwrap_or(previous.author_name),
+                    time: author_time.unwrap_or(previous.time),
+                },
+            );
+        }
+
+        let Some(content) = content else { continue };
+        let meta = metas.get(&oid).cloned().unwrap_or_default();
+        rows.push(BlameLine {
+            oid,
+            author_name: meta.author_name,
+            time: meta.time,
+            lineno,
+            content,
+        });
+    }
+
+    rows
+}
+
+fn parse_blame_header(line: &str) -> Option<(String, usize)> {
+    let mut parts = line.split_whitespace();
+    let raw_oid = parts.next()?.trim_start_matches('^');
+    if raw_oid.is_empty() || !raw_oid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let _original_lineno = parts.next()?;
+    let final_lineno = parts.next()?.parse::<usize>().ok()?;
+    Some((raw_oid.to_string(), final_lineno))
+}
+
+fn is_safe_repo_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 /// Parse `for-each-ref` branch lines (`name US oid US unixtime US subject`) into [`BranchInfo`]s.
 fn parse_branch_refs(text: &str) -> Vec<BranchInfo> {
     let mut out = Vec::new();
@@ -1025,6 +1141,43 @@ mod tests {
         let root = parse_commit_detail("abc\u{1f}A\u{1f}a@x\u{1f}1\u{1f}\u{1f}init").unwrap();
         assert!(root.parents.is_empty());
         assert!(parse_commit_detail("").is_none());
+    }
+
+    #[test]
+    fn blame_porcelain_parses_metadata_reuse_and_content() {
+        let raw = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 2\n\
+author Ada\n\
+author-time 1700000000\n\
+filename src/main.rs\n\
+\tfn main() {}\n\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\n\
+filename src/main.rs\n\
+\t\tprintln!(\"<x>\");\n\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 1 3 1\n\
+author Bob\n\
+author-time nope\n\
+filename src/main.rs\n\
+\tlast\n";
+        let rows = parse_blame_porcelain(raw);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].oid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(rows[0].author_name, "Ada");
+        assert_eq!(rows[0].time, 1700000000);
+        assert_eq!(rows[0].lineno, 1);
+        assert_eq!(rows[1].author_name, "Ada");
+        assert_eq!(rows[1].content, "\tprintln!(\"<x>\");");
+        assert_eq!(rows[2].author_name, "Bob");
+        assert_eq!(rows[2].time, 0);
+        assert_eq!(rows[2].lineno, 3);
+    }
+
+    #[test]
+    fn blame_paths_stay_relative_to_repo() {
+        assert!(is_safe_repo_path("src/main.rs"));
+        assert!(!is_safe_repo_path(""));
+        assert!(!is_safe_repo_path("/etc/passwd"));
+        assert!(!is_safe_repo_path("src/../secret"));
+        assert!(!is_safe_repo_path("src//main.rs"));
     }
 
     #[test]
