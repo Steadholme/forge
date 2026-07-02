@@ -2036,3 +2036,39 @@ mark.code-search-hit {
 .reaction-picker__emoji:active { transform:none; }
 .reaction-picker__emoji:focus-visible { outline:2px solid var(--ring);
   outline-offset:-2px; }
+
+/* ---- Syntax highlighting (token colours for <pre><code>) ---------------
+   The backend highlighter wraps tokens in .tok-* spans inside the blob view
+   (.blob-line__code), the raw code view (.code-pre), and fenced markdown
+   blocks (.markdown-body pre code). Every one of those sits on --surface-2
+   (#f7f8fa, near-white), so each colour below is a GitHub-flavoured hue picked
+   to clear WCAG AA (>=4.5:1) against that single near-white ground.
+
+   Palette is centralised in --code-* custom properties so a future dark theme
+   can redefine them in one place (matching this sheet's token-only model). No
+   prefers-color-scheme:dark block is added here on purpose: no rule in this
+   sheet yet gives the code ground a dark value, so flipping only the token
+   ink would strand dark text on the still-light --surface-2. When a real dark
+   ground lands, override these seven vars alongside it.
+
+   Contrast on --surface-2 (measured): kw 5.0 · str 12.1 · num 7.2 · com 6.0
+   · fn 6.9 · type 7.0 · attr 6.4 — all AA-clear. */
+:root {
+  --code-kw:   #cf222e;  /* keywords: if/fn/return/const — GitHub red         */
+  --code-str:  #0a3069;  /* string literals — deep navy                       */
+  --code-num:  #0550ae;  /* numeric literals — blue                           */
+  --code-com:  #57606a;  /* comments — muted grey, clearly weaker than body   */
+  --code-fn:   #6639ba;  /* function names — violet                           */
+  --code-type: #953800;  /* types / CamelCase idents — amber-brown            */
+  --code-attr: #4b5a86;  /* attributes / annotations (#[derive]) — slate-blue */
+}
+.tok-kw    { color:var(--code-kw);   font-weight:500; }
+.tok-str   { color:var(--code-str); }
+.tok-num   { color:var(--code-num); }
+.tok-com   { color:var(--code-com);  font-style:italic; }
+.tok-fn    { color:var(--code-fn); }
+.tok-type  { color:var(--code-type); }
+.tok-attr  { color:var(--code-attr); }
+/* Punctuation stays near the body ink, a touch quieter so it never competes
+   with the coloured tokens above. */
+.tok-punct { color:var(--ink-2); }
