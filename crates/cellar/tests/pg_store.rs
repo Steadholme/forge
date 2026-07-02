@@ -43,7 +43,7 @@ async fn pg_store_full_integration() {
 
     // Raw pool to reset the tables for a clean run.
     let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    for t in ["tags", "manifests", "blobs", "repositories"] {
+    for t in ["tags", "manifests", "blobs", "repositories", "pull_stats", "retention_rules", "robot_accounts"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
     }
 
@@ -104,6 +104,50 @@ async fn pg_store_full_integration() {
     let remaining: Vec<String> = store.tags_for(repo).await.unwrap().into_iter().map(|t| t.tag).collect();
     assert_eq!(remaining, vec!["latest".to_string()]);
 
+    // --- pull statistics (portable upsert) ---------------------------------
+    assert_eq!(store.pull_stat(repo).await.unwrap(), None);
+    store.increment_pull(repo, now).await.unwrap();
+    store.increment_pull(repo, now + 10).await.unwrap();
+    let stat = store.pull_stat(repo).await.unwrap().unwrap();
+    assert_eq!(stat.pulls, 2);
+    assert_eq!(stat.last_pulled_at, now + 10);
+
+    // --- retention rules (CRUD) -------------------------------------------
+    let rule = cellar::model::RetentionRule {
+        id: "ret-pg".to_string(),
+        repo_pattern: "library/*".to_string(),
+        keep_last: 5,
+        keep_days: 30,
+        enabled: true,
+    };
+    store.create_retention_rule(&rule).await.unwrap();
+    assert_eq!(store.list_retention_rules().await.unwrap(), vec![rule.clone()]);
+    assert!(store.set_retention_enabled("ret-pg", false).await.unwrap());
+    assert!(!store.list_retention_rules().await.unwrap()[0].enabled);
+    assert!(store.delete_retention_rule("ret-pg").await.unwrap());
+    assert!(store.list_retention_rules().await.unwrap().is_empty());
+
+    // --- robot accounts (CRUD + name uniqueness + touch) -------------------
+    let robot = cellar::model::RobotAccount {
+        id: "rob-pg".to_string(),
+        name: "ci".to_string(),
+        token_hash: "deadbeef".to_string(),
+        scope: "pushpull".to_string(),
+        repo_pattern: "library/*".to_string(),
+        enabled: true,
+        created_at: now,
+        last_used_at: 0,
+    };
+    store.create_robot(&robot).await.unwrap();
+    assert!(store.create_robot(&robot).await.is_err(), "duplicate name must be rejected");
+    assert_eq!(store.get_robot_by_name("ci").await.unwrap().unwrap().id, "rob-pg");
+    store.touch_robot("rob-pg", now + 5).await.unwrap();
+    assert_eq!(store.get_robot_by_name("ci").await.unwrap().unwrap().last_used_at, now + 5);
+    assert!(store.set_robot_enabled("rob-pg", false).await.unwrap());
+    assert!(!store.get_robot_by_name("ci").await.unwrap().unwrap().enabled);
+    assert!(store.delete_robot("rob-pg").await.unwrap());
+    assert!(store.list_robots().await.unwrap().is_empty());
+
     // --- the full HTTP app boots against Postgres (healthz) ----------------
     let state = AppState {
         config: build_dev_state().config,
@@ -133,7 +177,7 @@ async fn pg_store_full_integration() {
         .unwrap();
     assert_eq!(n, 1);
 
-    for t in ["tags", "manifests", "blobs", "repositories"] {
+    for t in ["tags", "manifests", "blobs", "repositories", "pull_stats", "retention_rules", "robot_accounts"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
     }
     eprintln!("pg_store integration test passed.");

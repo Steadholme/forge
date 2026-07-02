@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Retention · Cellar · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="appbar">{{USERBOX}}</header>
+
+  <main class="console">
+    <div class="console__head console__head--row">
+      <div>
+        <h1>Tag retention</h1>
+        <p class="sub">Keep-rules decide which tags survive. <b>Preview</b> is a dry run;
+          <b>Apply</b> deletes every non-kept tag and reclaims its storage through garbage
+          collection. A tag named <code>latest</code> is never deleted.</p>
+      </div>
+      <a class="btn btn-ghost btn-sm" href="/">All repositories</a>
+    </div>
+
+    {{TABS}}
+
+    {{NOTICE}}
+
+    {{PREVIEW}}
+
+    <div class="card">
+      <div class="card__head"><h2>Add a keep-rule</h2></div>
+      <div class="card__body">
+        <form method="post" action="/admin/retention/create" class="grid grid--4" style="align-items:end">
+          <div class="field">
+            <label>Repository pattern</label>
+            <input type="text" name="repo_pattern" placeholder="library/* or an exact name" required>
+          </div>
+          <div class="field">
+            <label>Keep newest tags</label>
+            <input type="number" name="keep_last" min="0" value="10">
+          </div>
+          <div class="field">
+            <label>Keep within days (0 = ignore)</label>
+            <input type="number" name="keep_days" min="0" value="0">
+          </div>
+          <div class="field">
+            <input type="hidden" name="csrf_token" value="{{CSRF}}">
+            <button class="btn" type="submit">Add rule</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="section-head">
+      <h2>Keep-rules</h2>
+      <span class="count-badge">{{COUNT}}</span>
+    </div>
+
+    <div class="table-wrap">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>Repository pattern</th>
+            <th>Keep newest</th>
+            <th>Keep days</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{RULE_ROWS}}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="actions" style="margin-top:22px">
+      <form method="post" action="/admin/retention/preview">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <button class="btn btn-ghost" type="submit">Preview deletions</button>
+      </form>
+      <form method="post" action="/admin/retention/apply"
+            onsubmit="return confirm('Apply retention now? This permanently deletes every non-kept tag and reclaims its storage.');">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <button class="btn btn-danger" type="submit">Apply now</button>
+      </form>
+    </div>
+  </main>
+
+  <footer class="site-foot">
+    <span>HOLDFAST · Cellar</span>
+    <span>Container registry · part of the HOLDFAST estate</span>
+  </footer>
+</body>
+</html>

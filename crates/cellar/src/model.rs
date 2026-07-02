@@ -219,6 +219,80 @@ pub struct Repository {
     pub created_at: i64,
 }
 
+// --------------------------------------------------------------------------------------
+// Harbor-style operator/consumer features: pull statistics, retention rules, robot accounts.
+// --------------------------------------------------------------------------------------
+
+/// Robot scope: pull-only, or push AND pull. Stored verbatim in `robot_accounts.scope`.
+pub const ROBOT_SCOPE_PULL: &str = "pull";
+pub const ROBOT_SCOPE_PUSHPULL: &str = "pushpull";
+
+/// True when `scope` is a recognised robot scope string.
+pub fn is_valid_robot_scope(scope: &str) -> bool {
+    scope == ROBOT_SCOPE_PULL || scope == ROBOT_SCOPE_PUSHPULL
+}
+
+/// Match a repository name against a retention/robot `repo_pattern`: an exact name, or a
+/// `prefix*` glob (only a single trailing `*` is significant). A bare `*` matches every repo.
+pub fn repo_pattern_matches(pattern: &str, repo: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => repo.starts_with(prefix),
+        None => repo == pattern,
+    }
+}
+
+/// Per-repository pull statistics: how many real `/v2/` manifest GETs a repo has served, and when
+/// the most recent one landed. Mirrors `pull_stats(repo PK, pulls, last_pulled_at)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullStat {
+    pub repo: String,
+    pub pulls: i64,
+    /// Epoch seconds of the most recent pull (0 = never, though a row only exists once pulled).
+    pub last_pulled_at: i64,
+}
+
+/// A retention rule. Tags in a repo matching `repo_pattern` are KEPT when they are among the
+/// newest `keep_last` tags OR were pushed within `keep_days` days (0 = ignore that dimension);
+/// anything else is a deletion candidate. Mirrors
+/// `retention_rules(id PK, repo_pattern, keep_last, keep_days, enabled)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionRule {
+    pub id: String,
+    pub repo_pattern: String,
+    pub keep_last: i64,
+    pub keep_days: i64,
+    pub enabled: bool,
+}
+
+/// A robot account — an ADDITIONAL `/v2/` credential (alongside the human `CELLAR_USER`), scoped to
+/// pull or pushpull on repos matching `repo_pattern`. The secret is shown once at mint time; only
+/// its `token_hash` (sha256 hex) is stored. Mirrors `robot_accounts(id PK, name, token_hash, scope,
+/// repo_pattern, enabled, created_at, last_used_at)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RobotAccount {
+    pub id: String,
+    /// The bare robot name; the `/v2/` Basic username is `robot$<name>`.
+    pub name: String,
+    /// sha256 hex of the minted token (never the token itself).
+    pub token_hash: String,
+    /// [`ROBOT_SCOPE_PULL`] or [`ROBOT_SCOPE_PUSHPULL`].
+    pub scope: String,
+    pub repo_pattern: String,
+    pub enabled: bool,
+    pub created_at: i64,
+    /// Epoch seconds of the last authenticated use (0 = never used).
+    pub last_used_at: i64,
+}
+
+impl RobotAccount {
+    /// Whether this (enabled) robot is permitted to WRITE (push) to `repo`.
+    pub fn may_push(&self, repo: &str) -> bool {
+        self.enabled
+            && self.scope == ROBOT_SCOPE_PUSHPULL
+            && repo_pattern_matches(&self.repo_pattern, repo)
+    }
+}
+
 /// A stored manifest (the JSON document a tag/digest resolves to).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManifestRec {
@@ -276,6 +350,10 @@ pub struct RepoSummary {
     pub total_size: i64,
     /// Most recent push time (max of manifest/tag timestamps), epoch seconds.
     pub last_pushed: i64,
+    /// Total real `/v2/` manifest GETs this repo has served.
+    pub pulls: i64,
+    /// Epoch seconds of the most recent pull (0 = never pulled).
+    pub last_pulled_at: i64,
 }
 
 /// A tag row on the repository detail page.
@@ -388,6 +466,44 @@ mod tests {
         let idx = r#"{"schemaVersion":2,"manifests":[{"digest":"sha256:x"}]}"#;
         assert!(manifest_config(idx).is_none());
         assert!(manifest_layers(idx).is_empty());
+    }
+
+    #[test]
+    fn repo_pattern_exact_and_prefix() {
+        // Exact match.
+        assert!(repo_pattern_matches("library/app", "library/app"));
+        assert!(!repo_pattern_matches("library/app", "library/app2"));
+        assert!(!repo_pattern_matches("library/app", "library/ap"));
+        // Prefix glob.
+        assert!(repo_pattern_matches("library/*", "library/app"));
+        assert!(repo_pattern_matches("library/*", "library/nested/app"));
+        assert!(!repo_pattern_matches("library/*", "other/app"));
+        // A bare `*` matches everything.
+        assert!(repo_pattern_matches("*", "anything/at/all"));
+    }
+
+    #[test]
+    fn robot_scope_and_push_gate() {
+        assert!(is_valid_robot_scope(ROBOT_SCOPE_PULL));
+        assert!(is_valid_robot_scope(ROBOT_SCOPE_PUSHPULL));
+        assert!(!is_valid_robot_scope("admin"));
+
+        let base = RobotAccount {
+            id: "r1".into(),
+            name: "ci".into(),
+            token_hash: "h".into(),
+            scope: ROBOT_SCOPE_PUSHPULL.into(),
+            repo_pattern: "team/*".into(),
+            enabled: true,
+            created_at: 0,
+            last_used_at: 0,
+        };
+        assert!(base.may_push("team/app"));
+        assert!(!base.may_push("other/app")); // pattern miss
+        let pull_only = RobotAccount { scope: ROBOT_SCOPE_PULL.into(), ..base.clone() };
+        assert!(!pull_only.may_push("team/app")); // pull scope never pushes
+        let disabled = RobotAccount { enabled: false, ..base.clone() };
+        assert!(!disabled.may_push("team/app")); // disabled never pushes
     }
 
     #[test]

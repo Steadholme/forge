@@ -15,14 +15,14 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::WebError;
 use crate::handlers::{
-    esc, fmt_ts, human_size, short_digest, userbox, APP_CSS, LAYERS_SVG, SHIELD_SVG,
+    esc, fmt_ts, human_size, short_digest, time_ago, userbox, APP_CSS, LAYERS_SVG, SHIELD_SVG,
 };
 use crate::model::{
     image_size, index_child_digests, index_entries, index_platforms, is_manifest_list,
     manifest_config, manifest_layers, Descriptor, IndexEntry, ManifestRec, RepoSummary, TagDetail,
 };
 use crate::names::reference_is_digest;
-use crate::AppState;
+use crate::{now_secs, AppState};
 
 const INDEX_HTML: &str = include_str!("../../templates/index.html");
 const REPO_HTML: &str = include_str!("../../templates/repo.html");
@@ -59,9 +59,15 @@ pub async fn repo_detail(
         )));
     }
     let details = tag_details(&state, &name).await?;
+    let stat = state.store.pull_stat(&name).await?;
+    let pulls = pull_summary(
+        stat.as_ref().map(|s| s.pulls).unwrap_or(0),
+        stat.as_ref().map(|s| s.last_pulled_at).unwrap_or(0),
+        now_secs(),
+    );
     let host = registry_host(&state.config.public_base);
     let csrf = auth::new_csrf_token();
-    let html = render_repo(&who, &name, &details, &host, &csrf);
+    let html = render_repo(&who, &name, &details, &host, &csrf, &pulls);
     Ok((
         StatusCode::OK,
         [(header::SET_COOKIE, auth::csrf_cookie(&csrf))],
@@ -181,12 +187,15 @@ async fn repo_summaries(state: &AppState) -> Result<Vec<RepoSummary>, WebError> 
             .chain(tags.iter().map(|t| t.updated_at))
             .max()
             .unwrap_or(repo.created_at);
+        let stat = state.store.pull_stat(&repo.name).await?;
         out.push(RepoSummary {
             name: repo.name,
             manifest_count: manifests.len() as i64,
             tag_count: tags.len() as i64,
             total_size,
             last_pushed,
+            pulls: stat.as_ref().map(|s| s.pulls).unwrap_or(0),
+            last_pulled_at: stat.as_ref().map(|s| s.last_pulled_at).unwrap_or(0),
         });
     }
     // Most-recently-pushed first.
@@ -243,6 +252,19 @@ fn resolved_size(manifests: &[ManifestRec], digest: &str) -> i64 {
     image_size(&m.raw)
 }
 
+/// The "N pulls · last pulled X ago" line for a repository (or "Never pulled"). Surfaced on the
+/// repository list and the repository detail header.
+fn pull_summary(pulls: i64, last_pulled_at: i64, now: i64) -> String {
+    if pulls <= 0 {
+        return "Never pulled".to_string();
+    }
+    format!(
+        "{pulls} pull{s} · last pulled {ago}",
+        s = if pulls == 1 { "" } else { "s" },
+        ago = time_ago(last_pulled_at, now),
+    )
+}
+
 /// Strip the scheme from `PUBLIC_BASE_URL` to get the registry host used in `docker` commands.
 fn registry_host(public_base: &str) -> String {
     public_base
@@ -271,7 +293,7 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
 fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
     if repos.is_empty() {
         return format!(
-            "<tr class=\"empty-row\"><td colspan=\"4\">\
+            "<tr class=\"empty-row\"><td colspan=\"6\">\
                No images have been pushed yet. Authenticate and push one:<br>\
                <code>docker login {host}</code><br>\
                <code>docker tag alpine {host}/alpine:latest</code><br>\
@@ -280,6 +302,7 @@ fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
             host = esc(host),
         );
     }
+    let now = now_secs();
     repos
         .iter()
         .map(|r| {
@@ -290,6 +313,7 @@ fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
                    <td>{tags}</td>\
                    <td class=\"num\">{size}</td>\
                    <td class=\"muted\">{date}</td>\
+                   <td class=\"muted\">{pulls}</td>\
                  </tr>",
                 name_attr = esc(&r.name),
                 glyph = LAYERS_SVG,
@@ -298,13 +322,21 @@ fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
                 tags = r.tag_count,
                 size = esc(&human_size(r.total_size)),
                 date = esc(&fmt_ts(r.last_pushed)),
+                pulls = esc(&pull_summary(r.pulls, r.last_pulled_at, now)),
             )
         })
         .collect::<Vec<_>>()
         .join("")
 }
 
-fn render_repo(who: &Identity, name: &str, tags: &[TagDetail], host: &str, csrf: &str) -> String {
+fn render_repo(
+    who: &Identity,
+    name: &str,
+    tags: &[TagDetail],
+    host: &str,
+    csrf: &str,
+    pulls: &str,
+) -> String {
     let count = match tags.len() {
         0 => "No tags".to_string(),
         1 => "1 tag".to_string(),
@@ -319,6 +351,7 @@ fn render_repo(who: &Identity, name: &str, tags: &[TagDetail], host: &str, csrf:
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
         .replace("{{NAME}}", &esc(name))
         .replace("{{COUNT}}", &esc(&count))
+        .replace("{{PULLS}}", &esc(pulls))
         .replace("{{PULL_CMD}}", &esc(&pull_cmd))
         .replace("{{TAG_ROWS}}", &render_tag_rows(name, tags, csrf))
 }

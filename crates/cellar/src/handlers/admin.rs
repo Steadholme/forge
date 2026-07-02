@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{esc, human_size, userbox, APP_CSS, SHIELD_SVG};
+use crate::handlers::{admin_tabs, esc, human_size, userbox, APP_CSS, SHIELD_SVG};
 use crate::model::{is_manifest_list, index_child_digests, manifest_blob_digests, ManifestRec};
 use crate::AppState;
 
@@ -234,14 +234,16 @@ struct Orphans {
 }
 
 /// The outcome of a GC sweep.
-struct GcOutcome {
-    manifests_deleted: i64,
-    blobs_deleted: i64,
-    bytes_freed: i64,
+pub(crate) struct GcOutcome {
+    pub(crate) manifests_deleted: i64,
+    pub(crate) blobs_deleted: i64,
+    pub(crate) bytes_freed: i64,
 }
 
-/// Delete every unreferenced manifest + blob (metadata AND bytes), summing the bytes freed.
-async fn run_gc(state: &AppState) -> Result<GcOutcome, WebError> {
+/// Delete every unreferenced manifest + blob (metadata AND bytes), summing the bytes freed. Shared
+/// by the GC panel and by retention "Apply" (which deletes tags, then reclaims the now-orphaned
+/// content through this exact path).
+pub(crate) async fn run_gc(state: &AppState) -> Result<GcOutcome, WebError> {
     let orphans = analyze(state).await?.orphans();
 
     let mut bytes_freed = 0i64;
@@ -332,6 +334,7 @@ fn render_admin(who: &Identity, view: &AdminView, csrf: &str, notice: &str) -> S
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
+        .replace("{{TABS}}", &admin_tabs("overview"))
         .replace("{{NOTICE}}", notice)
         .replace("{{TOTAL_SIZE}}", &esc(&human_size(view.total_bytes)))
         .replace("{{BLOB_COUNT}}", &esc(&view.blob_count.to_string()))

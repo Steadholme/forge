@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Robot accounts · Cellar · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="appbar">{{USERBOX}}</header>
+
+  <main class="console">
+    <div class="console__head console__head--row">
+      <div>
+        <h1>Robot accounts</h1>
+        <p class="sub">Machine credentials for <code>docker login</code>, scoped to <b>pull</b> or
+          <b>push + pull</b> on matching repositories. They are an additional credential alongside the
+          human login. The token is shown <b>once</b>, at creation.</p>
+      </div>
+      <a class="btn btn-ghost btn-sm" href="/">All repositories</a>
+    </div>
+
+    {{TABS}}
+
+    {{NOTICE}}
+
+    {{TOKEN}}
+
+    <div class="card">
+      <div class="card__head"><h2>Mint a robot</h2></div>
+      <div class="card__body">
+        <form method="post" action="/admin/robots/create" class="grid grid--4" style="align-items:end">
+          <div class="field">
+            <label>Name</label>
+            <input type="text" name="name" placeholder="ci" required>
+          </div>
+          <div class="field">
+            <label>Scope</label>
+            <select name="scope">
+              <option value="pull">pull</option>
+              <option value="pushpull">push + pull</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Repository pattern</label>
+            <input type="text" name="repo_pattern" placeholder="library/* or *" required>
+          </div>
+          <div class="field">
+            <input type="hidden" name="csrf_token" value="{{CSRF}}">
+            <button class="btn" type="submit">Create robot</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="section-head">
+      <h2>Robots</h2>
+      <span class="count-badge">{{COUNT}}</span>
+    </div>
+
+    <div class="table-wrap">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Scope</th>
+            <th>Repositories</th>
+            <th>Status</th>
+            <th>Created</th>
+            <th>Last used</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ROBOT_ROWS}}
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <footer class="site-foot">
+    <span>HOLDFAST · Cellar</span>
+    <span>Container registry · part of the HOLDFAST estate</span>
+  </footer>
+</body>
+</html>

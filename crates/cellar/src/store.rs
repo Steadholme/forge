@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::model::{BlobRec, ManifestRec, Repository, TagRec};
+use crate::model::{
+    BlobRec, ManifestRec, PullStat, Repository, RetentionRule, RobotAccount, TagRec,
+};
 
 /// Storage failure surfaced to the handler layer (mapped to an internal error).
 #[derive(Debug, Error)]
@@ -74,6 +76,46 @@ pub trait Store: Send + Sync {
     /// Delete a tag pointer. Returns `true` when a row was removed. The manifest + blobs remain
     /// (untagged); reclaiming unreferenced content is a DEFERRED garbage-collection sweep.
     async fn delete_tag(&self, repo: &str, tag: &str) -> Result<bool, StoreError>;
+
+    // ---- pull statistics --------------------------------------------------
+    /// Record one real `/v2/` manifest pull for `repo`: increments the counter and stamps
+    /// `last_pulled_at` (creates the row on the first pull).
+    async fn increment_pull(&self, repo: &str, now: i64) -> Result<(), StoreError>;
+
+    /// The pull statistics for `repo`, or `None` when it has never been pulled.
+    async fn pull_stat(&self, repo: &str) -> Result<Option<PullStat>, StoreError>;
+
+    // ---- retention rules --------------------------------------------------
+    /// Insert a retention rule (the caller mints `id`).
+    async fn create_retention_rule(&self, rule: &RetentionRule) -> Result<(), StoreError>;
+
+    /// All retention rules, id-sorted.
+    async fn list_retention_rules(&self) -> Result<Vec<RetentionRule>, StoreError>;
+
+    /// Toggle a rule's `enabled` flag. Returns `true` when a row was updated.
+    async fn set_retention_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError>;
+
+    /// Delete a retention rule. Returns `true` when a row was removed.
+    async fn delete_retention_rule(&self, id: &str) -> Result<bool, StoreError>;
+
+    // ---- robot accounts ---------------------------------------------------
+    /// Insert a robot account (the caller mints `id`, hashes the token). `name` is UNIQUE.
+    async fn create_robot(&self, robot: &RobotAccount) -> Result<(), StoreError>;
+
+    /// All robot accounts, name-sorted.
+    async fn list_robots(&self) -> Result<Vec<RobotAccount>, StoreError>;
+
+    /// Look up a robot by its bare `name` (the `/v2/` Basic username is `robot$<name>`).
+    async fn get_robot_by_name(&self, name: &str) -> Result<Option<RobotAccount>, StoreError>;
+
+    /// Toggle a robot's `enabled` flag. Returns `true` when a row was updated.
+    async fn set_robot_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError>;
+
+    /// Stamp a robot's `last_used_at` on a successful authentication.
+    async fn touch_robot(&self, id: &str, now: i64) -> Result<(), StoreError>;
+
+    /// Delete a robot account. Returns `true` when a row was removed.
+    async fn delete_robot(&self, id: &str) -> Result<bool, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -86,6 +128,9 @@ struct Inner {
     manifests: Vec<ManifestRec>,
     tags: Vec<TagRec>,
     blobs: Vec<(String, i64, i64)>, // (digest, size, created_at)
+    pull_stats: Vec<PullStat>,
+    retention_rules: Vec<RetentionRule>,
+    robots: Vec<RobotAccount>,
 }
 
 /// In-memory `Store`. The `Mutex` critical sections are fully synchronous (no `.await` held
@@ -230,6 +275,107 @@ impl Store for InMemoryStore {
         g.tags.retain(|t| !(t.repo == repo && t.tag == tag));
         Ok(g.tags.len() != before)
     }
+
+    async fn increment_pull(&self, repo: &str, now: i64) -> Result<(), StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        if let Some(s) = g.pull_stats.iter_mut().find(|s| s.repo == repo) {
+            s.pulls += 1;
+            s.last_pulled_at = now;
+        } else {
+            g.pull_stats.push(PullStat {
+                repo: repo.to_string(),
+                pulls: 1,
+                last_pulled_at: now,
+            });
+        }
+        Ok(())
+    }
+
+    async fn pull_stat(&self, repo: &str) -> Result<Option<PullStat>, StoreError> {
+        let g = self.inner.lock().expect("store lock poisoned");
+        Ok(g.pull_stats.iter().find(|s| s.repo == repo).cloned())
+    }
+
+    async fn create_retention_rule(&self, rule: &RetentionRule) -> Result<(), StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        g.retention_rules.push(rule.clone());
+        Ok(())
+    }
+
+    async fn list_retention_rules(&self) -> Result<Vec<RetentionRule>, StoreError> {
+        let g = self.inner.lock().expect("store lock poisoned");
+        let mut out = g.retention_rules.clone();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn set_retention_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        match g.retention_rules.iter_mut().find(|r| r.id == id) {
+            Some(r) => {
+                r.enabled = enabled;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_retention_rule(&self, id: &str) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        let before = g.retention_rules.len();
+        g.retention_rules.retain(|r| r.id != id);
+        Ok(g.retention_rules.len() != before)
+    }
+
+    async fn create_robot(&self, robot: &RobotAccount) -> Result<(), StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        if g.robots.iter().any(|r| r.name == robot.name) {
+            return Err(StoreError::Backend(format!(
+                "robot name {} already exists",
+                robot.name
+            )));
+        }
+        g.robots.push(robot.clone());
+        Ok(())
+    }
+
+    async fn list_robots(&self) -> Result<Vec<RobotAccount>, StoreError> {
+        let g = self.inner.lock().expect("store lock poisoned");
+        let mut out = g.robots.clone();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn get_robot_by_name(&self, name: &str) -> Result<Option<RobotAccount>, StoreError> {
+        let g = self.inner.lock().expect("store lock poisoned");
+        Ok(g.robots.iter().find(|r| r.name == name).cloned())
+    }
+
+    async fn set_robot_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        match g.robots.iter_mut().find(|r| r.id == id) {
+            Some(r) => {
+                r.enabled = enabled;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn touch_robot(&self, id: &str, now: i64) -> Result<(), StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        if let Some(r) = g.robots.iter_mut().find(|r| r.id == id) {
+            r.last_used_at = now;
+        }
+        Ok(())
+    }
+
+    async fn delete_robot(&self, id: &str) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store lock poisoned");
+        let before = g.robots.len();
+        g.robots.retain(|r| r.id != id);
+        Ok(g.robots.len() != before)
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -307,6 +453,41 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pull_stats (\
+                 repo TEXT PRIMARY KEY, \
+                 pulls BIGINT NOT NULL, \
+                 last_pulled_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS retention_rules (\
+                 id TEXT PRIMARY KEY, \
+                 repo_pattern TEXT NOT NULL, \
+                 keep_last BIGINT NOT NULL, \
+                 keep_days BIGINT NOT NULL, \
+                 enabled BOOLEAN NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS robot_accounts (\
+                 id TEXT PRIMARY KEY, \
+                 name TEXT NOT NULL, \
+                 token_hash TEXT NOT NULL, \
+                 scope TEXT NOT NULL, \
+                 repo_pattern TEXT NOT NULL, \
+                 enabled BOOLEAN NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 last_used_at BIGINT NOT NULL, \
+                 UNIQUE(name)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -321,7 +502,33 @@ impl PgStore {
             created_at: row.try_get("created_at")?,
         })
     }
+
+    fn retention_from_row(row: &sqlx::postgres::PgRow) -> Result<RetentionRule, sqlx::Error> {
+        Ok(RetentionRule {
+            id: row.try_get("id")?,
+            repo_pattern: row.try_get("repo_pattern")?,
+            keep_last: row.try_get("keep_last")?,
+            keep_days: row.try_get("keep_days")?,
+            enabled: row.try_get("enabled")?,
+        })
+    }
+
+    fn robot_from_row(row: &sqlx::postgres::PgRow) -> Result<RobotAccount, sqlx::Error> {
+        Ok(RobotAccount {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            token_hash: row.try_get("token_hash")?,
+            scope: row.try_get("scope")?,
+            repo_pattern: row.try_get("repo_pattern")?,
+            enabled: row.try_get("enabled")?,
+            created_at: row.try_get("created_at")?,
+            last_used_at: row.try_get("last_used_at")?,
+        })
+    }
 }
+
+const ROBOT_COLS: &str =
+    "id, name, token_hash, scope, repo_pattern, enabled, created_at, last_used_at";
 
 const MANIFEST_COLS: &str = "id, repo, digest, media_type, raw, size, created_at";
 
@@ -518,6 +725,155 @@ impl Store for PgStore {
             .map_err(be)?;
         Ok(res.rows_affected() > 0)
     }
+
+    async fn increment_pull(&self, repo: &str, now: i64) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO pull_stats (repo, pulls, last_pulled_at) VALUES ($1, 1, $2) \
+             ON CONFLICT (repo) DO UPDATE SET \
+                 pulls = pull_stats.pulls + 1, last_pulled_at = EXCLUDED.last_pulled_at",
+        )
+        .bind(repo)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(be)?;
+        Ok(())
+    }
+
+    async fn pull_stat(&self, repo: &str) -> Result<Option<PullStat>, StoreError> {
+        let row = sqlx::query("SELECT repo, pulls, last_pulled_at FROM pull_stats WHERE repo = $1")
+            .bind(repo)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        match row {
+            Some(r) => Ok(Some(PullStat {
+                repo: r.try_get("repo").map_err(be)?,
+                pulls: r.try_get("pulls").map_err(be)?,
+                last_pulled_at: r.try_get("last_pulled_at").map_err(be)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn create_retention_rule(&self, rule: &RetentionRule) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO retention_rules (id, repo_pattern, keep_last, keep_days, enabled) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&rule.id)
+        .bind(&rule.repo_pattern)
+        .bind(rule.keep_last)
+        .bind(rule.keep_days)
+        .bind(rule.enabled)
+        .execute(&self.pool)
+        .await
+        .map_err(be)?;
+        Ok(())
+    }
+
+    async fn list_retention_rules(&self) -> Result<Vec<RetentionRule>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, repo_pattern, keep_last, keep_days, enabled FROM retention_rules ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(be)?;
+        rows.iter()
+            .map(Self::retention_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(be)
+    }
+
+    async fn set_retention_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError> {
+        let res = sqlx::query("UPDATE retention_rules SET enabled = $2 WHERE id = $1")
+            .bind(id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn delete_retention_rule(&self, id: &str) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM retention_rules WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn create_robot(&self, robot: &RobotAccount) -> Result<(), StoreError> {
+        sqlx::query(&format!(
+            "INSERT INTO robot_accounts ({ROBOT_COLS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        ))
+        .bind(&robot.id)
+        .bind(&robot.name)
+        .bind(&robot.token_hash)
+        .bind(&robot.scope)
+        .bind(&robot.repo_pattern)
+        .bind(robot.enabled)
+        .bind(robot.created_at)
+        .bind(robot.last_used_at)
+        .execute(&self.pool)
+        .await
+        .map_err(be)?;
+        Ok(())
+    }
+
+    async fn list_robots(&self) -> Result<Vec<RobotAccount>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ROBOT_COLS} FROM robot_accounts ORDER BY name ASC"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(be)?;
+        rows.iter()
+            .map(Self::robot_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(be)
+    }
+
+    async fn get_robot_by_name(&self, name: &str) -> Result<Option<RobotAccount>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {ROBOT_COLS} FROM robot_accounts WHERE name = $1"
+        ))
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(be)?;
+        row.as_ref().map(Self::robot_from_row).transpose().map_err(be)
+    }
+
+    async fn set_robot_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError> {
+        let res = sqlx::query("UPDATE robot_accounts SET enabled = $2 WHERE id = $1")
+            .bind(id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn touch_robot(&self, id: &str, now: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE robot_accounts SET last_used_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(())
+    }
+
+    async fn delete_robot(&self, id: &str) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM robot_accounts WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 /// Map any sqlx error to a backend `StoreError`.
@@ -571,5 +927,69 @@ mod tests {
         assert_eq!(tags, vec!["latest", "v2"]);
         assert!(s.delete_tag("app", "v2").await.unwrap());
         assert!(!s.delete_tag("app", "v2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pull_stats_increment_and_read() {
+        let s = InMemoryStore::new();
+        assert_eq!(s.pull_stat("app").await.unwrap(), None);
+        s.increment_pull("app", 100).await.unwrap();
+        s.increment_pull("app", 200).await.unwrap();
+        let stat = s.pull_stat("app").await.unwrap().unwrap();
+        assert_eq!(stat.pulls, 2);
+        assert_eq!(stat.last_pulled_at, 200); // stamped with the latest pull
+        // A different repo is tracked independently.
+        assert_eq!(s.pull_stat("other").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn retention_rule_crud() {
+        let s = InMemoryStore::new();
+        let rule = RetentionRule {
+            id: "ret-1".into(),
+            repo_pattern: "team/*".into(),
+            keep_last: 5,
+            keep_days: 30,
+            enabled: true,
+        };
+        s.create_retention_rule(&rule).await.unwrap();
+        assert_eq!(s.list_retention_rules().await.unwrap(), vec![rule.clone()]);
+        // Toggle enabled.
+        assert!(s.set_retention_enabled("ret-1", false).await.unwrap());
+        assert!(!s.list_retention_rules().await.unwrap()[0].enabled);
+        assert!(!s.set_retention_enabled("nope", true).await.unwrap());
+        // Delete.
+        assert!(s.delete_retention_rule("ret-1").await.unwrap());
+        assert!(!s.delete_retention_rule("ret-1").await.unwrap());
+        assert!(s.list_retention_rules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn robot_crud_and_name_uniqueness() {
+        let s = InMemoryStore::new();
+        let robot = RobotAccount {
+            id: "rob-1".into(),
+            name: "ci".into(),
+            token_hash: "hash".into(),
+            scope: "pushpull".into(),
+            repo_pattern: "*".into(),
+            enabled: true,
+            created_at: 1,
+            last_used_at: 0,
+        };
+        s.create_robot(&robot).await.unwrap();
+        // Duplicate name is rejected.
+        assert!(s.create_robot(&robot).await.is_err());
+        assert_eq!(s.get_robot_by_name("ci").await.unwrap().unwrap().id, "rob-1");
+        assert_eq!(s.get_robot_by_name("missing").await.unwrap(), None);
+        // Touch stamps last_used_at.
+        s.touch_robot("rob-1", 999).await.unwrap();
+        assert_eq!(s.get_robot_by_name("ci").await.unwrap().unwrap().last_used_at, 999);
+        // Disable + delete.
+        assert!(s.set_robot_enabled("rob-1", false).await.unwrap());
+        assert!(!s.get_robot_by_name("ci").await.unwrap().unwrap().enabled);
+        assert!(s.delete_robot("rob-1").await.unwrap());
+        assert!(!s.delete_robot("rob-1").await.unwrap());
+        assert!(s.list_robots().await.unwrap().is_empty());
     }
 }

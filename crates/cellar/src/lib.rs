@@ -63,6 +63,18 @@ pub fn app(state: AppState) -> Router {
         // --- /admin subtree (admin-gated: storage accounting + garbage collection) ---
         .route("/admin", get(handlers::admin::index))
         .route("/admin/gc", post(handlers::admin::gc))
+        // Retention: keep-rules, dry-run preview, and an apply (delete + GC) action.
+        .route("/admin/retention", get(handlers::retention::index))
+        .route("/admin/retention/create", post(handlers::retention::create))
+        .route("/admin/retention/toggle", post(handlers::retention::toggle))
+        .route("/admin/retention/delete", post(handlers::retention::delete))
+        .route("/admin/retention/preview", post(handlers::retention::preview))
+        .route("/admin/retention/apply", post(handlers::retention::apply))
+        // Robot accounts: mint (token shown once), list, disable, delete.
+        .route("/admin/robots", get(handlers::robots::index))
+        .route("/admin/robots/create", post(handlers::robots::create))
+        .route("/admin/robots/toggle", post(handlers::robots::toggle))
+        .route("/admin/robots/delete", post(handlers::robots::delete))
         // --- /v2/ registry protocol (Basic auth done inside the handlers) ---
         .route("/v2", any(handlers::registry::version_check))
         .route("/v2/", any(handlers::registry::version_check))

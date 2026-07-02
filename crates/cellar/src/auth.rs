@@ -58,6 +58,46 @@ pub fn check_basic(headers: &HeaderMap, cfg: &Config) -> Cred {
     }
 }
 
+/// Whether `(user, pass)` match the configured HUMAN credentials, constant-time over both fields.
+/// The ADDITIONAL robot path is checked separately (see [`crate::handlers::registry`]); this stays
+/// the exact human check `check_basic` performs, so the existing `CELLAR_USER` path is untouched.
+pub fn human_basic_ok(user: &str, pass: &str, cfg: &Config) -> bool {
+    ct_eq(user.as_bytes(), cfg.user.as_bytes()) & ct_eq(pass.as_bytes(), cfg.password.as_bytes())
+}
+
+/// The `/v2/` Basic-username prefix that marks a robot credential: `robot$<name>`.
+pub const ROBOT_USER_PREFIX: &str = "robot$";
+
+/// Parse `Authorization: Bearer <token>` into the bare token (a robot secret).
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let tok = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let tok = tok.trim();
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
+
+/// Mint a fresh robot token (a URL-safe alphanumeric secret from the OS CSPRNG). Shown ONCE at
+/// mint time; only its [`hash_token`] is stored.
+pub fn new_robot_token() -> String {
+    random_alnum(ROBOT_TOKEN_LEN)
+}
+
+const ROBOT_TOKEN_LEN: usize = 48;
+
+/// The stored form of a robot token: its lowercase-hex SHA-256.
+pub fn hash_token(token: &str) -> String {
+    crate::digest::sha256_hex(token.as_bytes())
+}
+
+/// Constant-time check that a presented `token` hashes to the stored `token_hash`.
+pub fn token_matches(token: &str, token_hash: &str) -> bool {
+    ct_eq(hash_token(token).as_bytes(), token_hash.as_bytes())
+}
+
 /// Parse `Authorization: Basic base64(user:password)` into `(user, password)`.
 pub fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -446,6 +486,33 @@ mod tests {
         random.insert(HEADER_GROUPS, HeaderValue::from_static("random-group"));
         assert!(!is_admin(&random));
         assert!(require_admin(&random).is_err());
+    }
+
+    #[test]
+    fn robot_token_hash_and_match() {
+        let token = new_robot_token();
+        assert_eq!(token.len(), ROBOT_TOKEN_LEN);
+        let hash = hash_token(&token);
+        // The stored hash is never the token itself.
+        assert_ne!(hash, token);
+        assert!(token_matches(&token, &hash));
+        assert!(!token_matches("wrong-secret", &hash));
+    }
+
+    #[test]
+    fn bearer_and_human_basic_parsing() {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer tok-123"));
+        assert_eq!(bearer_token(&h), Some("tok-123".to_string()));
+        // A Basic header is not a Bearer token.
+        let mut b = HeaderMap::new();
+        b.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic cm9ib3Q6czNjcmV0"));
+        assert_eq!(bearer_token(&b), None);
+
+        let cfg = cfg_with_auth(); // user=robot, pass=s3cret
+        assert!(human_basic_ok("robot", "s3cret", &cfg));
+        assert!(!human_basic_ok("robot", "nope", &cfg));
+        assert!(!human_basic_ok("robot$ci", "s3cret", &cfg));
     }
 
     #[test]

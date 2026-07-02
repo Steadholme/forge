@@ -12,6 +12,8 @@
 pub mod admin;
 pub mod health;
 pub mod registry;
+pub mod retention;
+pub mod robots;
 pub mod web;
 
 use axum::http::StatusCode;
@@ -63,6 +65,42 @@ pub fn human_size(bytes: i64) -> String {
         unit += 1;
     }
     format!("{size:.1} {}", units[unit])
+}
+
+/// Compact relative time from `then` to `now` (both epoch seconds): `just now`, `3 minutes ago`,
+/// `2 days ago`, ... Used for the "last pulled X ago" / robot "last used" lines.
+pub fn time_ago(then: i64, now: i64) -> String {
+    let d = (now - then).max(0);
+    if d < 60 {
+        return "just now".to_string();
+    }
+    let (n, unit) = if d < 3_600 {
+        (d / 60, "minute")
+    } else if d < 86_400 {
+        (d / 3_600, "hour")
+    } else if d < 2_592_000 {
+        (d / 86_400, "day")
+    } else if d < 31_536_000 {
+        (d / 2_592_000, "month")
+    } else {
+        (d / 31_536_000, "year")
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+/// The Odyssey v2 tab-strip shared by the `/admin` subtree. `active` is `"overview"`, `"retention"`
+/// or `"robots"`; the matching tab gets `is-active`.
+pub fn admin_tabs(active: &str) -> String {
+    let tab = |href: &str, key: &str, label: &str| {
+        let cls = if key == active { "tab is-active" } else { "tab" };
+        format!("<a class=\"{cls}\" href=\"{href}\">{label}</a>")
+    };
+    format!(
+        "<nav class=\"tabs\" aria-label=\"Admin sections\">{}{}{}</nav>",
+        tab("/admin", "overview", "Storage &amp; GC"),
+        tab("/admin/retention", "retention", "Retention"),
+        tab("/admin/robots", "robots", "Robot accounts"),
+    )
 }
 
 /// A short `sha256:abcd…wxyz` digest for compact display (full value kept in `title`).
@@ -196,6 +234,27 @@ mod tests {
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(1024), "1.0 KB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn time_ago_scales() {
+        assert_eq!(time_ago(100, 100), "just now");
+        assert_eq!(time_ago(100, 130), "just now"); // < 60s
+        assert_eq!(time_ago(0, 60), "1 minute ago");
+        assert_eq!(time_ago(0, 7200), "2 hours ago");
+        assert_eq!(time_ago(0, 86_400), "1 day ago");
+        assert_eq!(time_ago(0, 3 * 86_400), "3 days ago");
+        // A future timestamp clamps to "just now" (never negative).
+        assert_eq!(time_ago(200, 100), "just now");
+    }
+
+    #[test]
+    fn admin_tabs_marks_active() {
+        let html = admin_tabs("retention");
+        assert!(html.contains("href=\"/admin/retention\""));
+        assert!(html.contains("tab is-active"));
+        // Only one tab is active.
+        assert_eq!(html.matches("is-active").count(), 1);
     }
 
     #[test]

@@ -17,10 +17,10 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::{check_basic, Cred};
+use crate::auth::{self, HEADER_SUBJECT};
 use crate::digest::{is_valid_digest, sha256_digest};
 use crate::error::{RegError, API_VERSION};
-use crate::model::{is_manifest_media_type, ManifestRec, MEDIA_OCI_MANIFEST};
+use crate::model::{is_manifest_media_type, ManifestRec, RobotAccount, MEDIA_OCI_MANIFEST};
 use crate::names::{is_valid_name, is_valid_reference, reference_is_digest};
 use crate::{now_secs, AppState};
 
@@ -37,12 +37,88 @@ const H_API_VERSION: &str = "docker-distribution-api-version";
 
 /// `GET|HEAD /v2/` — 200 with the API-version header when authenticated; otherwise a 401 Basic
 /// challenge. This is what `docker login` validates against, and what makes any client attach its
-/// stored credentials before pushing.
+/// stored credentials before pushing. A valid ROBOT token authenticates here too (a robot
+/// `docker login` succeeds).
 pub async fn version_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match check_basic(&headers, &state.config) {
-        Cred::Ok => build(StatusCode::OK, vec![json_ct()], b"{}".to_vec()),
+    match authenticate(&state, &headers).await {
+        Principal::Human | Principal::Robot(_) => build(StatusCode::OK, vec![json_ct()], b"{}".to_vec()),
         _ => RegError::Unauthorized.into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Principal resolution — the human path PLUS the additional robot credential
+// ---------------------------------------------------------------------------
+
+/// Who is making a `/v2/` request, after checking credentials. Robots are an ADDITIONAL credential
+/// layered on the unchanged human `CELLAR_USER` Basic path — a robot NEVER weakens it.
+enum Principal {
+    /// The configured human credentials, or auth disabled (dev). Full push/pull on every repo.
+    Human,
+    /// A verified, enabled robot account (its scope + repo_pattern gate writes).
+    Robot(RobotAccount),
+    /// No `Authorization` header — anonymous (public reads; challenged on writes).
+    Anonymous,
+    /// Credentials present but invalid (wrong human password, unknown/disabled robot).
+    Bad,
+}
+
+/// Resolve the request's [`Principal`].
+///
+/// Order preserves the existing behaviour exactly: when auth is DISABLED everything is [`Human`];
+/// otherwise the human `CELLAR_USER`/`CELLAR_PASSWORD` Basic check runs FIRST (unchanged). Only when
+/// that does not match do we try the robot paths — `robot$<name>` Basic, or a `Bearer` token — so a
+/// robot is purely additive. `last_used_at` is stamped whenever a robot token verifies.
+async fn authenticate(state: &AppState, headers: &HeaderMap) -> Principal {
+    // Auth disabled (empty CELLAR_USER, the dev default): every request is Human, exactly as before.
+    if !state.config.auth_enabled() {
+        return Principal::Human;
+    }
+
+    // Basic first — the human path is checked before any robot lookup.
+    if let Some((user, pass)) = auth::basic_credentials(headers) {
+        if auth::human_basic_ok(&user, &pass, &state.config) {
+            return Principal::Human;
+        }
+        if let Some(name) = user.strip_prefix(auth::ROBOT_USER_PREFIX) {
+            if let Some(robot) = verify_robot_secret(state, name, &pass).await {
+                return Principal::Robot(robot);
+            }
+        }
+        return Principal::Bad; // credentials present but neither human nor a valid robot
+    }
+
+    // Bearer — a robot token presented without a username.
+    if let Some(token) = auth::bearer_token(headers) {
+        if let Some(robot) = verify_robot_bearer(state, &token).await {
+            return Principal::Robot(robot);
+        }
+        return Principal::Bad;
+    }
+
+    Principal::Anonymous
+}
+
+/// Verify a `robot$<name>` Basic secret against its stored hash; stamp `last_used_at` on success.
+async fn verify_robot_secret(state: &AppState, name: &str, secret: &str) -> Option<RobotAccount> {
+    let robot = state.store.get_robot_by_name(name).await.ok()??;
+    if robot.enabled && auth::token_matches(secret, &robot.token_hash) {
+        let _ = state.store.touch_robot(&robot.id, now_secs()).await;
+        Some(robot)
+    } else {
+        None
+    }
+}
+
+/// Verify a `Bearer` robot token by scanning enabled robots for a matching hash; stamp on success.
+async fn verify_robot_bearer(state: &AppState, token: &str) -> Option<RobotAccount> {
+    for robot in state.store.list_robots().await.ok()? {
+        if robot.enabled && auth::token_matches(token, &robot.token_hash) {
+            let _ = state.store.touch_robot(&robot.id, now_secs()).await;
+            return Some(robot);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -58,10 +134,10 @@ pub async fn dispatch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let cred = check_basic(&headers, &state.config);
+    let principal = authenticate(&state, &headers).await;
     let route = parse_route(&path);
     let query = parse_query(raw_query.as_deref().unwrap_or(""));
-    match handle(&state, &method, route, &headers, cred, &query, body).await {
+    match handle(&state, &method, route, &headers, &principal, &query, body).await {
         Ok(r) => r,
         Err(e) => e.into_response(),
     }
@@ -138,7 +214,7 @@ async fn handle(
     method: &Method,
     route: Route,
     headers: &HeaderMap,
-    cred: Cred,
+    principal: &Principal,
     query: &Query,
     body: Bytes,
 ) -> Result<Response, RegError> {
@@ -146,7 +222,7 @@ async fn handle(
     match route {
         // ---- GET /v2/_catalog --------------------------------------------
         Route::Catalog if method == Method::GET => {
-            read_guard(cred)?;
+            read_guard(principal)?;
             let names: Vec<String> = state
                 .store
                 .list_repositories()
@@ -159,7 +235,7 @@ async fn handle(
 
         // ---- GET /v2/{name}/tags/list ------------------------------------
         Route::TagsList { name } if method == Method::GET => {
-            read_guard(cred)?;
+            read_guard(principal)?;
             valid_name(&name)?;
             if !state.store.repo_exists(&name).await? {
                 return Err(RegError::NameUnknown(format!("repository {name} not found")));
@@ -176,7 +252,7 @@ async fn handle(
 
         // ---- POST /v2/{name}/blobs/uploads/ ------------------------------
         Route::UploadInit { name } if method == Method::POST => {
-            write_guard(cred)?;
+            write_guard(principal, &name)?;
             valid_name(&name)?;
             state.store.ensure_repository(&name, now).await?;
 
@@ -207,7 +283,7 @@ async fn handle(
 
         // ---- PATCH /v2/{name}/blobs/uploads/{uuid} -----------------------
         Route::UploadSession { name, uuid } if method == Method::PATCH => {
-            write_guard(cred)?;
+            write_guard(principal, &name)?;
             valid_name(&name)?;
             let total = state.blobs.append(&uuid, &body).await?;
             accepted_upload(&name, &uuid, total)
@@ -215,7 +291,7 @@ async fn handle(
 
         // ---- PUT /v2/{name}/blobs/uploads/{uuid}?digest= -----------------
         Route::UploadSession { name, uuid } if method == Method::PUT => {
-            write_guard(cred)?;
+            write_guard(principal, &name)?;
             valid_name(&name)?;
             let digest = query
                 .digest
@@ -234,7 +310,7 @@ async fn handle(
 
         // ---- GET /v2/{name}/blobs/uploads/{uuid} (status) ----------------
         Route::UploadSession { name, uuid } if method == Method::GET => {
-            write_guard(cred)?;
+            write_guard(principal, &name)?;
             valid_name(&name)?;
             let total = state.blobs.upload_len(&uuid).await?;
             let end = total.saturating_sub(1);
@@ -251,7 +327,7 @@ async fn handle(
 
         // ---- DELETE /v2/{name}/blobs/uploads/{uuid} (cancel) -------------
         Route::UploadSession { name, uuid } if method == Method::DELETE => {
-            write_guard(cred)?;
+            write_guard(principal, &name)?;
             valid_name(&name)?;
             state.blobs.cancel(&uuid).await?;
             Ok(build(StatusCode::NO_CONTENT, vec![], Vec::new()))
@@ -259,7 +335,7 @@ async fn handle(
 
         // ---- HEAD/GET /v2/{name}/blobs/{digest} --------------------------
         Route::Blob { name, digest } if method == Method::HEAD || method == Method::GET => {
-            read_guard(cred)?;
+            read_guard(principal)?;
             valid_name(&name)?;
             if !is_valid_digest(&digest) {
                 return Err(RegError::DigestInvalid(format!("invalid digest {digest}")));
@@ -287,7 +363,7 @@ async fn handle(
 
         // ---- PUT /v2/{name}/manifests/{reference} ------------------------
         Route::Manifest { name, reference } if method == Method::PUT => {
-            write_guard(cred)?;
+            write_guard(principal, &name)?;
             valid_name(&name)?;
             if !is_valid_reference(&reference) {
                 return Err(RegError::ManifestInvalid(format!(
@@ -340,7 +416,7 @@ async fn handle(
 
         // ---- HEAD/GET /v2/{name}/manifests/{reference} -------------------
         Route::Manifest { name, reference } if method == Method::HEAD || method == Method::GET => {
-            read_guard(cred)?;
+            read_guard(principal)?;
             valid_name(&name)?;
             let digest = if reference_is_digest(&reference) {
                 reference.clone()
@@ -366,6 +442,13 @@ async fn handle(
             if method == Method::HEAD {
                 Ok(build(StatusCode::OK, common, Vec::new()))
             } else {
+                // A real registry pull: count it. A HEAD existence-probe is a separate arm above
+                // (never counted), and the SSO web console reads manifests via the store — NOT via
+                // `/v2/` — so it never reaches here. The `is_registry_client` guard additionally
+                // excludes any `/v2/` request that DID arrive with a gateway SSO identity.
+                if is_registry_client(headers) {
+                    state.store.increment_pull(&name, now).await?;
+                }
                 Ok(build(StatusCode::OK, common, m.raw.into_bytes()))
             }
         }
@@ -384,20 +467,36 @@ async fn handle(
 // Auth guards
 // ---------------------------------------------------------------------------
 
-/// Writes (and uploads) require valid credentials.
-fn write_guard(cred: Cred) -> Result<(), RegError> {
-    match cred {
-        Cred::Ok => Ok(()),
-        _ => Err(RegError::Unauthorized),
+/// Writes (and uploads) require valid credentials AND, for a robot, push scope on the target repo.
+/// A human (or auth-disabled dev) may write anything; a robot may write only when its scope is
+/// `pushpull` and its `repo_pattern` matches `repo` — otherwise `403 DENIED` (authenticated but not
+/// permitted, e.g. a pull-only token attempting a push). Anonymous / bad credentials get `401`.
+fn write_guard(principal: &Principal, repo: &str) -> Result<(), RegError> {
+    match principal {
+        Principal::Human => Ok(()),
+        Principal::Robot(r) if r.may_push(repo) => Ok(()),
+        Principal::Robot(r) => Err(RegError::Denied(format!(
+            "robot {} is not permitted to push to {repo}",
+            r.name
+        ))),
+        Principal::Anonymous | Principal::Bad => Err(RegError::Unauthorized),
     }
 }
 
-/// Reads allow anonymous access (public pull) but reject WRONG credentials.
-fn read_guard(cred: Cred) -> Result<(), RegError> {
-    match cred {
-        Cred::Bad => Err(RegError::Unauthorized),
+/// Reads allow anonymous access (public pull) — a human, a robot (of any scope) and an anonymous
+/// caller may all read — but WRONG credentials are still rejected.
+fn read_guard(principal: &Principal) -> Result<(), RegError> {
+    match principal {
+        Principal::Bad => Err(RegError::Unauthorized),
         _ => Ok(()),
     }
+}
+
+/// True for a genuine registry-protocol client: a `/v2/` request WITHOUT a gateway SSO identity
+/// (`X-Auth-Subject`). The SSO web console always carries that header; a docker/oci CLI never does.
+/// Keeps the web console's own reads out of the pull counter (only real pulls count).
+fn is_registry_client(headers: &HeaderMap) -> bool {
+    headers.get(HEADER_SUBJECT).is_none()
 }
 
 fn valid_name(name: &str) -> Result<(), RegError> {
