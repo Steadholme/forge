@@ -1888,3 +1888,60 @@ mark.code-search-hit {
 /* Reduced motion + dark mode: no transition/animation and no literal colours
    are added above, so the global reduced-motion guard and the Odyssey token
    theme layer both apply here with no extra rule. */
+
+
+/* ==========================================================================
+   Markdown / GFM engine — visual layer for the SSR-rendered extras.
+   The engine (crates/loom/src/markdown.rs) emits four class hooks inside the
+   existing `.markdown-body` container plus a plain <del>: `.task-list-item`
+   (an <li> carrying a disabled checkbox), `.md-table` (every rendered table),
+   and `.gfm-ref` / `.gfm-mention` (the #123 issue/PR and @user auto-links).
+   Everything below scopes under `.markdown-body`, reuses the Odyssey v2 tokens
+   and the shared table (`.data`) / chip (`.oid`) idioms already in this file,
+   and adds no literal colours — so the global reduced-motion guard and the
+   token theme layer cover motion + dark with no extra rule. */
+
+/* 1. Task lists — GFM `- [ ] / - [x]`. Drop the list marker and pull the
+   checkbox back into the list gutter so the label text lines up with ordinary
+   list content. The checkbox is server-rendered `disabled` (read-only): keep
+   it fully opaque (not the browser's faded default) and tint it with --accent
+   so a checked item reads as clearly "done". */
+.markdown-body .task-list-item { list-style:none; }
+.markdown-body .task-list-item > input[type="checkbox"] {
+  width:14px; height:14px; margin:0 .5em 0 -1.45em; vertical-align:middle;
+  accent-color:var(--accent); opacity:1; cursor:default;
+}
+
+/* 2. Tables — reuse the `.data` idiom (uppercase-free, readable header on a
+   raised surface, hairline body rows, zebra striping) and make wide tables
+   scroll horizontally on their own (no SSR wrapper exists) via display:block +
+   width:max-content, so a big table never stretches the prose column. */
+.markdown-body .md-table {
+  display:block; width:max-content; max-width:100%; overflow-x:auto;
+  border-collapse:collapse; border-radius:var(--r-sm);
+}
+.markdown-body .md-table th,
+.markdown-body .md-table td { padding:8px 14px; border:1px solid var(--border); }
+.markdown-body .md-table thead th {
+  background:var(--surface-3); color:var(--ink); font-weight:650;
+  border-bottom:2px solid var(--border-2); white-space:nowrap;
+}
+.markdown-body .md-table tbody tr:nth-child(even) { background:var(--surface-2); }
+
+/* 3. Auto-links — `#123` refs and `@user` mentions. Give them a light accent
+   chip (same accent-soft / accent-ink family as the `.oid` commit chip) so
+   they stand apart from ordinary body links; hover deepens the chip rather
+   than underlining, keeping the inline flow clean. */
+.markdown-body .gfm-ref,
+.markdown-body .gfm-mention {
+  display:inline-block; padding:0 5px; border-radius:var(--r-xs); line-height:1.45;
+  background:var(--accent-soft); color:var(--accent-ink); font-weight:600;
+  transition:background var(--dur) var(--ease);
+}
+.markdown-body .gfm-ref { font-family:var(--mono); font-size:.92em; }
+.markdown-body .gfm-ref:hover,
+.markdown-body .gfm-mention:hover { background:var(--accent-soft-2); text-decoration:none; }
+
+/* 4. Strikethrough — GFM `~~text~~`. Keep the browser line-through but recede
+   the whole run to --ink-3 so removed/obsolete text reads as de-emphasised. */
+.markdown-body del { color:var(--ink-3); text-decoration-color:var(--ink-4); }
