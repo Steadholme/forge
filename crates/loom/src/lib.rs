@@ -238,6 +238,10 @@ pub fn app(state: AppState) -> Router {
             "/r/{owner}/{name}/pulls/{number}/comments/{comment_id}/reactions",
             post(handlers::pulls::react_comment),
         )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/comments/{comment_id}/suggestion/apply",
+            post(handlers::pulls::apply_suggestion),
+        )
         // JSON sibling backing the "click a diff line → comment" affordance (optimistic insert).
         // Progressive enhancement: the standalone inline-comment form above still works with JS off.
         .route(

@@ -2047,6 +2047,154 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
 }
 
 #[tokio::test]
+async fn pull_review_suggestion_renders_and_applies_to_head_branch() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    seed_two_branches(&git_dir);
+    open_pull(
+        &app,
+        "alice/proj",
+        "main",
+        "feature",
+        "Suggest change",
+        "",
+        "bob",
+    )
+    .await;
+
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = detail.csrf_cookie().unwrap();
+    let suggested = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/inline-comment",
+            &[
+                ("csrf_token", &csrf),
+                ("path", "file.txt"),
+                ("line", "2"),
+                ("body", "```suggestion\nTWO <safe>\n```"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(suggested.status, StatusCode::FOUND);
+
+    let reviewed = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    assert!(reviewed.body.contains("class=\"suggestion\""));
+    assert!(reviewed.body.contains("class=\"suggestion__old\""));
+    assert!(reviewed.body.contains("- two"));
+    assert!(reviewed.body.contains("+ TWO &lt;safe&gt;"));
+    assert!(reviewed.body.contains("btn-apply-suggestion"));
+    let csrf = reviewed.csrf_cookie().unwrap();
+    let action = first_action_with_prefix(&reviewed.body, "/r/alice/proj/pulls/1/comments/");
+    assert!(action.ends_with("/suggestion/apply"));
+
+    let applied = send(
+        &app,
+        post_form(&action, &[("csrf_token", &csrf)], &csrf, Some("bob")),
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::FOUND);
+    assert_eq!(applied.location(), "/r/alice/proj/pulls/1");
+
+    let feature_file = git_capture(&git_dir, &["show", "refs/heads/feature:file.txt"], "");
+    assert_eq!(feature_file, "one\nTWO <safe>");
+    let main_file = git_capture(&git_dir, &["show", "refs/heads/main:file.txt"], "");
+    assert_eq!(main_file, "one");
+    let message = git_capture(
+        &git_dir,
+        &["log", "-1", "--pretty=%s", "refs/heads/feature"],
+        "",
+    );
+    assert_eq!(message, "Apply suggestion from code review");
+
+    let pull = store.get_pull(&repo.id, 1).await.unwrap().unwrap();
+    let comments = store.list_pull_review_comments(&pull.id).await.unwrap();
+    assert!(comments.iter().any(|comment| comment.applied));
+
+    let after = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    assert!(after.body.contains("Suggestion applied."));
+    assert!(!after.body.contains("btn-apply-suggestion"));
+}
+
+#[tokio::test]
+async fn pull_review_suggestion_rejects_moved_head_branch() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+    open_pull(
+        &app,
+        "alice/proj",
+        "main",
+        "feature",
+        "Reject stale suggestion",
+        "",
+        "bob",
+    )
+    .await;
+
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = detail.csrf_cookie().unwrap();
+    let suggested = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/inline-comment",
+            &[
+                ("csrf_token", &csrf),
+                ("path", "file.txt"),
+                ("line", "2"),
+                ("body", "```suggestion\nTWO\n```"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(suggested.status, StatusCode::FOUND);
+
+    let drift = commit_files(
+        &git_dir,
+        Some(&feature_oid),
+        "drift",
+        &[("file.txt", "one\ndrift\n")],
+    );
+    git_capture(
+        &git_dir,
+        &["update-ref", "refs/heads/feature", &drift, &feature_oid],
+        "",
+    );
+
+    let reviewed = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    let csrf = reviewed.csrf_cookie().unwrap();
+    let action = first_action_with_prefix(&reviewed.body, "/r/alice/proj/pulls/1/comments/");
+    let rejected = send(
+        &app,
+        post_form(&action, &[("csrf_token", &csrf)], &csrf, Some("bob")),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::CONFLICT);
+    assert!(rejected.body.contains("pull request branch changed"));
+    let feature_file = git_capture(&git_dir, &["show", "refs/heads/feature:file.txt"], "");
+    assert_eq!(feature_file, "one\ndrift");
+
+    let pull = store.get_pull(&repo.id, 1).await.unwrap().unwrap();
+    let comments = store.list_pull_review_comments(&pull.id).await.unwrap();
+    assert!(comments.iter().all(|comment| !comment.applied));
+}
+
+#[tokio::test]
 async fn pull_reactions_toggle_body_and_inline_comments() {
     let state = temp_state();
     let git = state.git.clone();
@@ -2989,7 +3137,9 @@ async fn settings_collaborators_and_owner_only_delete() {
         "repo admin collaborator can open settings"
     );
     assert!(bob_settings.body.contains("Collaborators"));
-    assert!(!bob_settings.body.contains("btn-delete-repo"));
+    assert!(!bob_settings
+        .body
+        .contains("<form class=\"delete-repo-form\""));
     let bob_csrf = bob_settings.csrf_cookie().expect("csrf for bob settings");
 
     let bob_adds_carol = send(

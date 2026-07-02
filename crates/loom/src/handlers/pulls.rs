@@ -1169,8 +1169,9 @@ async fn add_inline_comment(
         ));
     }
     let line = form.line.max(0);
+    let anchor = inline_comment_anchor(state, &repo, &pull, &path, line).await;
     let pending = form.mode.trim() == "pending";
-    let comment = if pending {
+    let mut comment = if pending {
         state
             .store
             .create_pending_pull_review_comment(
@@ -1198,6 +1199,16 @@ async fn add_inline_comment(
             )
             .await?
     };
+    if let Some((anchor_head_oid, anchor_text)) = anchor {
+        if state
+            .store
+            .set_pull_review_comment_anchor(&comment.id, &anchor_head_oid, &anchor_text)
+            .await?
+        {
+            comment.anchor_head_oid = anchor_head_oid;
+            comment.anchor_text = anchor_text;
+        }
+    }
     tracing::info!(
         repo = repo.id,
         number,
@@ -1214,6 +1225,133 @@ async fn add_inline_comment(
         notify_pull_author(state, &who.subject, &repo, &pull, &summary);
     }
     Ok(comment)
+}
+
+async fn inline_comment_anchor(
+    state: &AppState,
+    repo: &Repo,
+    pull: &Pull,
+    path: &str,
+    line: i64,
+) -> Option<(String, String)> {
+    if line <= 0 {
+        return None;
+    }
+    let head_oid = state
+        .git
+        .branch_oid(&repo.owner_sub, &repo.name, &pull.head)
+        .await?;
+    let blob = state
+        .git
+        .read_blob(&repo.owner_sub, &repo.name, &head_oid, path)
+        .await?;
+    let text = line_text_from_blob(&blob, line)?;
+    Some((head_oid, text))
+}
+
+fn line_text_from_blob(blob: &[u8], line: i64) -> Option<String> {
+    if line <= 0 {
+        return None;
+    }
+    let text = std::str::from_utf8(blob).ok()?;
+    text.lines()
+        .nth(line as usize - 1)
+        .map(|line| line.trim_end_matches('\r').to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplySuggestionForm {
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+pub async fn apply_suggestion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number, comment_id)): Path<(String, String, i64, String)>,
+    Form(form): Form<ApplySuggestionForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    let repo_writer = can_write_repo(&state, &repo, &who, &headers).await?;
+    if !can_gate(&pull, &who, repo_writer) {
+        return Err(AppError::Forbidden(
+            "Only the pull-request author, a repository writer, or an administrator can apply suggestions."
+                .to_string(),
+        ));
+    }
+    if !pull.is_open() {
+        return Err(AppError::BadRequest(
+            "This pull request is no longer open.".to_string(),
+        ));
+    }
+
+    let comment = state
+        .store
+        .list_pull_review_comments(&pull.id)
+        .await?
+        .into_iter()
+        .find(|comment| comment.id == comment_id)
+        .ok_or_else(|| AppError::NotFound("No such review comment.".to_string()))?;
+    if comment.applied {
+        return Err(AppError::BadRequest(
+            "This suggestion has already been applied.".to_string(),
+        ));
+    }
+    if comment.line <= 0 || comment.anchor_head_oid.is_empty() {
+        return Err(AppError::BadRequest(
+            "This suggestion is missing a stable line anchor. Add a new review comment and try again."
+                .to_string(),
+        ));
+    }
+    let suggestion = crate::markdown::extract_first_suggestion(&comment.body).ok_or_else(|| {
+        AppError::BadRequest("This review comment does not contain a suggestion.".to_string())
+    })?;
+
+    let commit = state
+        .git
+        .apply_suggestion(
+            &repo.owner_sub,
+            &repo.name,
+            &pull.head,
+            &comment.path,
+            comment.line as usize,
+            &comment.anchor_head_oid,
+            &comment.anchor_text,
+            &suggestion,
+            "Apply suggestion from code review",
+            &who.subject,
+            &who.email,
+        )
+        .await
+        .map_err(AppError::Conflict)?;
+    if !state
+        .store
+        .mark_pull_review_comment_applied(&comment.id)
+        .await?
+    {
+        return Err(AppError::NotFound("No such review comment.".to_string()));
+    }
+    webhooks::emit_push(&state, &repo, &who.subject);
+    tracing::info!(
+        repo = repo.id,
+        number,
+        comment = comment.id,
+        commit,
+        actor = who.subject,
+        "pull suggestion applied"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
 }
 
 // ===========================================================================
@@ -3253,8 +3391,14 @@ fn render_inline_threads(
         .map(|thread| {
             let has_published = thread.comments.iter().any(|comment| !comment.pending);
             let resolution = resolved_thread(&thread.key, thread_resolutions);
-            let comments_html =
-                render_inline_thread_comments(repo, pull, &thread.comments, comment_reactions, csrf);
+            let comments_html = render_inline_thread_comments(
+                repo,
+                pull,
+                &thread.comments,
+                comment_reactions,
+                csrf,
+                can_resolve,
+            );
             let count_label = comment_count_label(thread.comments.len());
             let anchor = format!("{}:{}", esc(&thread.path), thread.line);
             let form = if can_resolve && has_published {
@@ -3315,6 +3459,7 @@ fn render_inline_thread_comments(
     comments: &[&PullReviewComment],
     comment_reactions: &ReactionMap,
     csrf: &str,
+    can_apply_suggestions: bool,
 ) -> String {
     comments
         .iter()
@@ -3347,21 +3492,74 @@ fn render_inline_thread_comments(
                     csrf,
                 )
             };
+            let suggestion = crate::markdown::extract_first_suggestion(&comment.body);
+            let body = if suggestion.is_some() {
+                crate::markdown::render_for_repo_with_suggestion(
+                    &comment.body,
+                    &repo.owner_sub,
+                    &repo.name,
+                    crate::markdown::SuggestionContext {
+                        old: &comment.anchor_text,
+                    },
+                )
+            } else {
+                crate::markdown::render_for_repo(&comment.body, &repo.owner_sub, &repo.name)
+            };
+            let suggestion_action = render_suggestion_action(
+                repo,
+                pull,
+                comment,
+                csrf,
+                can_apply_suggestions && pull.is_open(),
+                suggestion.is_some(),
+            );
             format!(
                 r##"<div class="{item_class}">
   <div class="issue-item__meta">{author} {action} {when}</div>
   <div class="issue-item__body markdown-body">{body}</div>
+  {suggestion_action}
   {reactions}
 </div>"##,
                 item_class = item_class,
                 author = esc(&comment.author_sub),
                 action = action,
                 when = esc(&fmt_ts(comment.created_at)),
-                body = crate::markdown::render_for_repo(&comment.body, &repo.owner_sub, &repo.name),
+                body = body,
+                suggestion_action = suggestion_action,
                 reactions = reactions,
             )
         })
         .collect::<String>()
+}
+
+fn render_suggestion_action(
+    repo: &Repo,
+    pull: &Pull,
+    comment: &PullReviewComment,
+    csrf: &str,
+    can_apply: bool,
+    has_suggestion: bool,
+) -> String {
+    if !has_suggestion || comment.pending {
+        return String::new();
+    }
+    if comment.applied {
+        return "<div class=\"suggestion__status\">Suggestion applied.</div>".to_string();
+    }
+    if !can_apply {
+        return String::new();
+    }
+    format!(
+        r##"<form class="inline-form suggestion__actions" method="post" action="/r/{owner}/{name}/pulls/{number}/comments/{comment_id}/suggestion/apply">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <button class="btn btn-secondary btn-sm btn-apply-suggestion" type="submit">Apply suggestion</button>
+</form>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        number = pull.number,
+        comment_id = esc(&comment.id),
+        csrf = esc(csrf),
+    )
 }
 
 fn comment_count_label(count: usize) -> String {

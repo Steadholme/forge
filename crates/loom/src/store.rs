@@ -445,6 +445,17 @@ pub trait Store: Send + Sync {
         created_at: i64,
     ) -> Result<PullReviewComment, StoreError>;
 
+    /// Attach immutable head-line anchor metadata to a PR review comment.
+    async fn set_pull_review_comment_anchor(
+        &self,
+        id: &str,
+        anchor_head_oid: &str,
+        anchor_text: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Mark a PR review comment's suggestion as applied.
+    async fn mark_pull_review_comment_applied(&self, id: &str) -> Result<bool, StoreError>;
+
     /// Published inline comments on a PR, ordered by anchor then time.
     async fn list_pull_review_comments(
         &self,
@@ -1763,6 +1774,9 @@ impl Store for InMemoryStore {
             author_sub: author_sub.to_string(),
             body: body.to_string(),
             pending: false,
+            anchor_head_oid: String::new(),
+            anchor_text: String::new(),
+            applied: false,
             created_at,
         };
         self.pull_review_comments
@@ -1791,6 +1805,9 @@ impl Store for InMemoryStore {
             author_sub: author_sub.to_string(),
             body: body.to_string(),
             pending: true,
+            anchor_head_oid: String::new(),
+            anchor_text: String::new(),
+            applied: false,
             created_at,
         };
         self.pull_review_comments
@@ -1798,6 +1815,40 @@ impl Store for InMemoryStore {
             .expect("pull_review_comments lock poisoned")
             .push(comment.clone());
         Ok(comment)
+    }
+
+    async fn set_pull_review_comment_anchor(
+        &self,
+        id: &str,
+        anchor_head_oid: &str,
+        anchor_text: &str,
+    ) -> Result<bool, StoreError> {
+        let mut comments = self
+            .pull_review_comments
+            .lock()
+            .expect("pull_review_comments lock poisoned");
+        for comment in comments.iter_mut() {
+            if comment.id == id {
+                comment.anchor_head_oid = anchor_head_oid.to_string();
+                comment.anchor_text = anchor_text.to_string();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn mark_pull_review_comment_applied(&self, id: &str) -> Result<bool, StoreError> {
+        let mut comments = self
+            .pull_review_comments
+            .lock()
+            .expect("pull_review_comments lock poisoned");
+        for comment in comments.iter_mut() {
+            if comment.id == id {
+                comment.applied = true;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn list_pull_review_comments(
@@ -2029,7 +2080,7 @@ const LABEL_COLS: &str = "id, repo_id, name, color, created_at";
 const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
 const REVIEW_COLS: &str = "id, pull_id, reviewer_sub, verdict, body, created_at";
 const REVIEW_COMMENT_COLS: &str =
-    "id, pull_id, review_id, path, line, author_sub, body, pending, created_at";
+    "id, pull_id, review_id, path, line, author_sub, body, pending, anchor_head_oid, anchor_text, applied, created_at";
 const PR_FILE_VIEWED_COLS: &str = "pr_id, user_sub, file_path, viewed, updated_at";
 const PR_THREAD_RESOLVED_COLS: &str = "pr_id, thread_key, resolved, resolved_by, resolved_at";
 const COMMIT_STATUS_COLS: &str =
@@ -2406,6 +2457,9 @@ impl PgStore {
                  author_sub TEXT NOT NULL, \
                  body TEXT NOT NULL DEFAULT '', \
                  pending BOOLEAN NOT NULL DEFAULT FALSE, \
+                 anchor_head_oid TEXT NOT NULL DEFAULT '', \
+                 anchor_text TEXT NOT NULL DEFAULT '', \
+                 applied BOOLEAN NOT NULL DEFAULT FALSE, \
                  created_at BIGINT NOT NULL\
              )",
         )
@@ -2413,6 +2467,21 @@ impl PgStore {
         .await?;
         sqlx::query(
             "ALTER TABLE pr_review_comments ADD COLUMN IF NOT EXISTS pending BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pr_review_comments ADD COLUMN IF NOT EXISTS anchor_head_oid TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pr_review_comments ADD COLUMN IF NOT EXISTS anchor_text TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pr_review_comments ADD COLUMN IF NOT EXISTS applied BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&self.pool)
         .await?;
@@ -2670,6 +2739,9 @@ impl PgStore {
             author_sub: row.try_get("author_sub")?,
             body: row.try_get("body")?,
             pending: row.try_get("pending")?,
+            anchor_head_oid: row.try_get("anchor_head_oid")?,
+            anchor_text: row.try_get("anchor_text")?,
+            applied: row.try_get("applied")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -4202,6 +4274,9 @@ impl Store for PgStore {
             author_sub: author_sub.to_string(),
             body: body.to_string(),
             pending: false,
+            anchor_head_oid: String::new(),
+            anchor_text: String::new(),
+            applied: false,
             created_at,
         })
     }
@@ -4240,8 +4315,44 @@ impl Store for PgStore {
             author_sub: author_sub.to_string(),
             body: body.to_string(),
             pending: true,
+            anchor_head_oid: String::new(),
+            anchor_text: String::new(),
+            applied: false,
             created_at,
         })
+    }
+
+    async fn set_pull_review_comment_anchor(
+        &self,
+        id: &str,
+        anchor_head_oid: &str,
+        anchor_text: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE pr_review_comments \
+             SET anchor_head_oid = $1, anchor_text = $2 \
+             WHERE id = $3",
+        )
+        .bind(anchor_head_oid)
+        .bind(anchor_text)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn mark_pull_review_comment_applied(&self, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE pr_review_comments \
+             SET applied = TRUE \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_pull_review_comments(
@@ -5184,9 +5295,17 @@ mod tests {
         s.create_pull_review("rv1", &pull.id, "alice", "approve", "ok", 6)
             .await
             .unwrap();
-        s.create_pull_review_comment("rc1", &pull.id, "rv1", "file.txt", 2, "alice", "note", 7)
+        let comment = s
+            .create_pull_review_comment("rc1", &pull.id, "rv1", "file.txt", 2, "alice", "note", 7)
             .await
             .unwrap();
+        assert!(!comment.applied);
+        assert!(comment.anchor_head_oid.is_empty());
+        assert!(s
+            .set_pull_review_comment_anchor("rc1", "abc123", "old line")
+            .await
+            .unwrap());
+        assert!(s.mark_pull_review_comment_applied("rc1").await.unwrap());
         s.create_pending_pull_review_comment("rc2", &pull.id, "src/lib.rs", 4, "alice", "draft", 8)
             .await
             .unwrap();
@@ -5241,6 +5360,10 @@ mod tests {
         assert_eq!(s.list_pull_reviews(&pull.id).await.unwrap().len(), 2);
         let published_comments = s.list_pull_review_comments(&pull.id).await.unwrap();
         assert_eq!(published_comments.len(), 2);
+        assert!(published_comments.iter().any(|c| c.id == "rc1"
+            && c.anchor_head_oid == "abc123"
+            && c.anchor_text == "old line"
+            && c.applied));
         assert!(published_comments
             .iter()
             .any(|c| c.id == "rc2" && c.review_id == "rv2" && !c.pending));

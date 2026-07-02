@@ -903,6 +903,81 @@ impl GitOps {
         }
     }
 
+    /// Apply one code-review suggestion to a PR head branch without checking out a work tree.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_suggestion(
+        &self,
+        owner: &str,
+        name: &str,
+        branch: &str,
+        path: &str,
+        line: usize,
+        expected_head_oid: &str,
+        expected_old: &str,
+        replacement: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<String, String> {
+        if !is_safe_repo_path(path) || path.starts_with('-') {
+            return Err("invalid suggestion path".to_string());
+        }
+        if line == 0 {
+            return Err("suggestions need an anchored line".to_string());
+        }
+
+        let repo = self.repo_path(owner, name);
+        let dir = repo.to_string_lossy().to_string();
+        let head_ref = format!("refs/heads/{branch}");
+        let head_oid = self
+            .rev(&dir, &head_ref)
+            .await
+            .ok_or_else(|| format!("head branch '{branch}' no longer exists"))?;
+        if head_oid != expected_head_oid {
+            return Err(
+                "the pull request branch changed since this suggestion was written; reload and review it again"
+                    .to_string(),
+            );
+        }
+
+        let original = self
+            .blob_text(&dir, &head_oid, path)
+            .await?
+            .ok_or_else(|| {
+                "the suggested file no longer exists on the pull request branch".to_string()
+            })?;
+        let updated = replace_anchored_line(&original, line, expected_old, replacement)?;
+        if updated == original {
+            return Err("the suggestion already matches the file".to_string());
+        }
+
+        let index_path =
+            std::env::temp_dir().join(format!("loom-suggestion-{}.idx", crate::random_alnum(16)));
+        let index = index_path.to_string_lossy().to_string();
+        let tree_result = self
+            .write_tree_with_replacement(&dir, &head_oid, path, updated.as_bytes(), &index)
+            .await;
+        let _ = tokio::fs::remove_file(&index).await;
+        let tree = tree_result?;
+        let commit = self
+            .commit_tree(
+                &dir,
+                &tree,
+                &[&head_oid],
+                message,
+                author_name,
+                author_email,
+            )
+            .await?;
+        self.update_ref(&dir, &head_ref, &commit, &head_oid)
+            .await
+            .map_err(|_| {
+                "the pull request branch moved while applying the suggestion; reload and review it again"
+                    .to_string()
+            })?;
+        Ok(commit)
+    }
+
     async fn merge_refs(
         &self,
         dir: &str,
@@ -1025,6 +1100,98 @@ impl GitOps {
                 .await,
             Ok(out) if out.status
         )
+    }
+
+    async fn blob_text(
+        &self,
+        dir: &str,
+        commit_oid: &str,
+        path: &str,
+    ) -> Result<Option<String>, String> {
+        let spec = format!("{commit_oid}:{path}");
+        let kind = self
+            .run_git_in_capture(dir, &["cat-file", "-t", &spec])
+            .await
+            .map_err(|e| format!("cat-file failed: {e}"))?;
+        if !kind.status {
+            return Ok(None);
+        }
+        if String::from_utf8_lossy(&kind.stdout).trim() != "blob" {
+            return Err("the suggestion target is not a file".to_string());
+        }
+        let out = self
+            .run_git_in_capture(dir, &["cat-file", "-p", &spec])
+            .await
+            .map_err(|e| format!("cat-file failed: {e}"))?;
+        if !out.status {
+            return Ok(None);
+        }
+        String::from_utf8(out.stdout)
+            .map(Some)
+            .map_err(|_| "suggestions can only be applied to UTF-8 text files".to_string())
+    }
+
+    async fn write_tree_with_replacement(
+        &self,
+        dir: &str,
+        head_oid: &str,
+        path: &str,
+        content: &[u8],
+        index: &str,
+    ) -> Result<String, String> {
+        let env = [("GIT_INDEX_FILE", index)];
+        let read = self
+            .run_git_capture_env(dir, &["read-tree", head_oid], &env)
+            .await
+            .map_err(|e| format!("read-tree failed: {e}"))?;
+        if !read.status {
+            return Err("could not prepare the pull request tree".to_string());
+        }
+
+        let blob = self
+            .run_git_capture_env_stdin(dir, &["hash-object", "-w", "--stdin"], &[], content)
+            .await
+            .map_err(|e| format!("hash-object failed: {e}"))?;
+        if !blob.status {
+            return Err("could not write the suggested file content".to_string());
+        }
+        let blob_oid = String::from_utf8_lossy(&blob.stdout).trim().to_string();
+        if blob_oid.is_empty() {
+            return Err("hash-object produced no blob".to_string());
+        }
+
+        let update = self
+            .run_git_capture_env(
+                dir,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    "100644",
+                    &blob_oid,
+                    path,
+                ],
+                &env,
+            )
+            .await
+            .map_err(|e| format!("update-index failed: {e}"))?;
+        if !update.status {
+            return Err("could not update the pull request tree".to_string());
+        }
+
+        let tree = self
+            .run_git_capture_env(dir, &["write-tree"], &env)
+            .await
+            .map_err(|e| format!("write-tree failed: {e}"))?;
+        if !tree.status {
+            return Err("could not write the pull request tree".to_string());
+        }
+        let tree_oid = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+        if tree_oid.is_empty() {
+            Err("write-tree produced no tree".to_string())
+        } else {
+            Ok(tree_oid)
+        }
     }
 
     /// `git merge-tree --write-tree <base> <head>` → the merged tree OID. Errors (with git's
@@ -1394,6 +1561,38 @@ impl GitOps {
             stdout: out.stdout,
         })
     }
+
+    async fn run_git_capture_env_stdin(
+        &self,
+        repo_dir: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        stdin: &[u8],
+    ) -> std::io::Result<CapturedOut> {
+        let mut full: Vec<&str> = vec!["--git-dir", repo_dir];
+        full.extend_from_slice(args);
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.args(&full)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "safe.directory")
+            .env("GIT_CONFIG_VALUE_0", "*")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn()?;
+        if let Some(mut writer) = child.stdin.take() {
+            writer.write_all(stdin).await?;
+            writer.shutdown().await?;
+        }
+        let out = child.wait_with_output().await?;
+        Ok(CapturedOut {
+            status: out.status.success(),
+            stdout: out.stdout,
+        })
+    }
 }
 
 struct CapturedOut {
@@ -1405,6 +1604,72 @@ struct ReplayCommit {
     author_name: String,
     author_email: String,
     message: String,
+}
+
+fn replace_anchored_line(
+    text: &str,
+    line: usize,
+    expected_old: &str,
+    replacement: &str,
+) -> Result<String, String> {
+    let mut offset = 0;
+    for (idx, raw) in text.split_inclusive('\n').enumerate() {
+        let line_no = idx + 1;
+        let start = offset;
+        offset += raw.len();
+        if line_no != line {
+            continue;
+        }
+        let (body, ending) = split_line_ending(raw);
+        if body != expected_old {
+            return Err(
+                "the suggested line changed since this comment was written; reload and review it again"
+                    .to_string(),
+            );
+        }
+        let mut out = String::new();
+        out.push_str(&text[..start]);
+        out.push_str(&replacement_with_line_ending(replacement, ending));
+        out.push_str(&text[offset..]);
+        return Ok(out);
+    }
+
+    if !text.ends_with('\n') && offset < text.len() {
+        let start = offset;
+        let body = &text[start..];
+        if line == text[..start].matches('\n').count() + 1 {
+            if body != expected_old {
+                return Err(
+                    "the suggested line changed since this comment was written; reload and review it again"
+                        .to_string(),
+                );
+            }
+            let mut out = String::new();
+            out.push_str(&text[..start]);
+            out.push_str(replacement);
+            return Ok(out);
+        }
+    }
+
+    Err("the suggested line no longer exists on the pull request branch".to_string())
+}
+
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+fn replacement_with_line_ending(replacement: &str, ending: &str) -> String {
+    if replacement.is_empty() || ending.is_empty() || replacement.ends_with('\n') {
+        replacement.to_string()
+    } else {
+        format!("{replacement}{ending}")
+    }
 }
 
 fn push_code_search_hit(files: &mut Vec<CodeSearchFile>, hit: CodeSearchHit) {

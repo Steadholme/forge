@@ -343,6 +343,12 @@ pub struct PullReviewComment {
     pub body: String,
     /// Pending comments are visible only to their author until the review is finished.
     pub pending: bool,
+    /// Head commit when the line anchor was created. Empty for legacy comments without anchor data.
+    pub anchor_head_oid: String,
+    /// Original text of the anchored head line, without its line ending.
+    pub anchor_text: String,
+    /// Whether a suggestion block in this comment has already been applied.
+    pub applied: bool,
     /// Creation time, epoch seconds.
     pub created_at: i64,
 }

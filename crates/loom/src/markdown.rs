@@ -22,14 +22,20 @@ pub struct RenderContext<'a> {
     pub repo_name: &'a str,
 }
 
+/// Comment-local context for GitHub-style suggested changes.
+#[derive(Clone, Copy)]
+pub struct SuggestionContext<'a> {
+    pub old: &'a str,
+}
+
 /// Render `md` to sanitised HTML safe to embed directly in a page.
 pub fn render(md: &str) -> String {
-    render_inner(md, None)
+    render_inner(md, None, None)
 }
 
 /// Render `md` with repository-scoped GFM reference links (`#123`, `@user`).
 pub fn render_with_context(md: &str, context: RenderContext<'_>) -> String {
-    render_inner(md, Some(context))
+    render_inner(md, Some(context), None)
 }
 
 /// Convenience wrapper for repository-scoped markdown surfaces.
@@ -43,19 +49,77 @@ pub fn render_for_repo(md: &str, repo_owner: &str, repo_name: &str) -> String {
     )
 }
 
-fn render_inner(md: &str, context: Option<RenderContext<'_>>) -> String {
+/// Render repository-scoped markdown with special handling for ```suggestion fences.
+pub fn render_for_repo_with_suggestion(
+    md: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    suggestion: SuggestionContext<'_>,
+) -> String {
+    render_inner(
+        md,
+        Some(RenderContext {
+            repo_owner,
+            repo_name,
+        }),
+        Some(suggestion),
+    )
+}
+
+/// Return the first GitHub-style suggested-change fenced code block, if present.
+pub fn extract_first_suggestion(md: &str) -> Option<String> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
 
-    let events = highlight_code_blocks(Parser::new_ext(md, options).map(sanitize_event));
+    let mut events = Parser::new_ext(md, options).peekable();
+    while let Some(event) = events.next() {
+        if let Event::Start(Tag::CodeBlock(kind)) = event {
+            let is_suggestion = matches!(
+                &kind,
+                CodeBlockKind::Fenced(info) if is_suggestion_info(info)
+            );
+            let mut code = String::new();
+            while let Some(inner) = events.next() {
+                match inner {
+                    Event::End(TagEnd::CodeBlock) => break,
+                    Event::Text(s) | Event::Code(s) | Event::Html(s) | Event::InlineHtml(s) => {
+                        code.push_str(&s)
+                    }
+                    Event::SoftBreak | Event::HardBreak => code.push('\n'),
+                    _ => {}
+                }
+            }
+            if is_suggestion {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn render_inner(
+    md: &str,
+    context: Option<RenderContext<'_>>,
+    suggestion: Option<SuggestionContext<'_>>,
+) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let events =
+        highlight_code_blocks(Parser::new_ext(md, options).map(sanitize_event), suggestion);
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
     add_gfm_classes_and_links(&out, context)
 }
 
-fn highlight_code_blocks<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>> {
+fn highlight_code_blocks<'a>(
+    events: impl Iterator<Item = Event<'a>>,
+    suggestion: Option<SuggestionContext<'_>>,
+) -> Vec<Event<'a>> {
     let mut out = Vec::new();
     let mut events = events.peekable();
     while let Some(event) = events.next() {
@@ -72,12 +136,48 @@ fn highlight_code_blocks<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Eve
                         _ => {}
                     }
                 }
-                out.push(Event::Html(CowStr::Boxed(
-                    render_code_block(&code, &kind).into_boxed_str(),
-                )));
+                let html =
+                    if let (CodeBlockKind::Fenced(info), Some(suggestion)) = (&kind, suggestion) {
+                        if is_suggestion_info(info) {
+                            render_suggestion_block(suggestion.old, &code)
+                        } else {
+                            render_code_block(&code, &kind)
+                        }
+                    } else {
+                        render_code_block(&code, &kind)
+                    };
+                out.push(Event::Html(CowStr::Boxed(html.into_boxed_str())));
             }
             other => out.push(other),
         }
+    }
+    out
+}
+
+fn is_suggestion_info(info: &str) -> bool {
+    info.split_whitespace().next() == Some("suggestion")
+}
+
+fn render_suggestion_block(old: &str, new: &str) -> String {
+    format!(
+        "<div class=\"suggestion\"><div class=\"suggestion__diff\"><pre class=\"suggestion__old\"><code>{old}</code></pre><pre class=\"suggestion__new\"><code>{new}</code></pre></div></div>\n",
+        old = render_suggestion_lines("-", old),
+        new = render_suggestion_lines("+", new),
+    )
+}
+
+fn render_suggestion_lines(prefix: &str, text: &str) -> String {
+    if text.is_empty() {
+        return escape_html(prefix);
+    }
+    let mut out = String::new();
+    for raw in text.split_inclusive('\n') {
+        out.push_str(prefix);
+        out.push(' ');
+        out.push_str(&escape_html(raw));
+    }
+    if !text.ends_with('\n') {
+        out.push('\n');
     }
     out
 }
@@ -445,6 +545,32 @@ mod tests {
         assert!(!html.contains("<span class=\"tok-"));
         assert!(!html.contains("<b>x</b>"));
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn suggestion_fence_renders_review_diff_card() {
+        let html = render_for_repo_with_suggestion(
+            "Try this:\n\n```suggestion\nnew <b>x</b>\n```",
+            "alice",
+            "proj",
+            SuggestionContext { old: "old <x>" },
+        );
+        assert!(html.contains("class=\"suggestion\""));
+        assert!(html.contains("class=\"suggestion__diff\""));
+        assert!(html.contains("class=\"suggestion__old\""));
+        assert!(html.contains("class=\"suggestion__new\""));
+        assert!(html.contains("- old &lt;x&gt;"));
+        assert!(html.contains("+ new &lt;b&gt;x&lt;/b&gt;"));
+        assert!(!html.contains("<b>x</b>"));
+    }
+
+    #[test]
+    fn suggestion_extractor_returns_first_suggestion_body() {
+        let suggestion = extract_first_suggestion(
+            "```rust\nfn main() {}\n```\n\n```suggestion\nlet x = 1;\n```",
+        )
+        .unwrap();
+        assert_eq!(suggestion, "let x = 1;\n");
     }
 
     #[test]
