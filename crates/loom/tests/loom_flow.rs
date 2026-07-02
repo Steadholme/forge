@@ -1336,11 +1336,78 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
     let reviewed = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
     assert!(reviewed.body.contains("approved by alice"));
     assert!(reviewed.body.contains("file.txt:2"));
+    assert!(reviewed
+        .body
+        .contains("review-unresolved-count\">2 unresolved"));
+    assert!(reviewed.body.contains("btn-resolve"));
     assert!(
         reviewed.body.contains("/r/alice/proj/issues/1"),
         "#N autolink rendered"
     );
     let csrf = reviewed.csrf_cookie().unwrap();
+
+    let carol_view = send(&app, get("/r/alice/proj/pulls/1", Some("carol"))).await;
+    let carol_csrf = carol_view.csrf_cookie().unwrap();
+    let forbidden_resolve = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/thread/resolve",
+            &[("csrf_token", &carol_csrf), ("thread_key", "file.txt:2")],
+            &carol_csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden_resolve.status, StatusCode::FORBIDDEN);
+
+    let resolved = send(
+        &app,
+        post_form_accept(
+            "/r/alice/proj/pulls/1/thread/resolve",
+            &[("csrf_token", &csrf), ("thread_key", "file.txt:2")],
+            &csrf,
+            Some("alice"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(resolved.status, StatusCode::OK);
+    assert!(resolved.content_type().contains("application/json"));
+    assert!(resolved.body.contains(r#""thread_key":"file.txt:2""#));
+    assert!(resolved.body.contains(r#""resolved":true"#));
+    assert!(resolved.body.contains(r#""unresolved_count":1"#));
+
+    let after_resolved = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(after_resolved.body.contains("thread-resolved"));
+    assert!(after_resolved.body.contains("Resolved by alice"));
+    assert!(after_resolved.body.contains("btn-unresolve"));
+    assert!(after_resolved
+        .body
+        .contains("review-unresolved-count\">1 unresolved"));
+    assert!(after_resolved
+        .body
+        .contains("<details class=\"thread-resolved__details\">"));
+
+    let csrf = after_resolved.csrf_cookie().unwrap();
+    let reopened = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/thread/unresolve",
+            &[("csrf_token", &csrf), ("thread_key", "file.txt:2")],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(reopened.status, StatusCode::FOUND);
+
+    let after_reopen = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(after_reopen
+        .body
+        .contains("review-unresolved-count\">2 unresolved"));
+    assert!(after_reopen.body.contains("btn-resolve"));
+    let csrf = after_reopen.csrf_cookie().unwrap();
+
     let merged = send(
         &app,
         post_form(

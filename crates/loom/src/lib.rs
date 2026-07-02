@@ -195,6 +195,14 @@ pub fn app(state: AppState) -> Router {
             post(handlers::pulls::file_viewed),
         )
         .route(
+            "/r/{owner}/{name}/pulls/{number}/thread/resolve",
+            post(handlers::pulls::resolve_thread),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/thread/unresolve",
+            post(handlers::pulls::unresolve_thread),
+        )
+        .route(
             "/r/{owner}/{name}/pulls/{number}/metadata",
             post(handlers::pulls::metadata),
         )

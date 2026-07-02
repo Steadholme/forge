@@ -165,6 +165,21 @@ pub struct PrFileViewed {
     pub updated_at: i64,
 }
 
+/// Resolve state for one pull-request inline comment thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrThreadResolved {
+    /// Owning pull request id.
+    pub pr_id: String,
+    /// Stable thread key, currently the inline anchor as `path:line`.
+    pub thread_key: String,
+    /// Whether the thread is resolved.
+    pub resolved: bool,
+    /// Subject that last changed the resolved state.
+    pub resolved_by: String,
+    /// Last resolved-state change time, epoch seconds.
+    pub resolved_at: i64,
+}
+
 /// A repo-scoped label assignable to issues and pull requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Label {

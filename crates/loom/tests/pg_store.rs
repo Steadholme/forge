@@ -97,6 +97,7 @@ async fn pg_store_full_integration() {
         "issue_comments",
         "pr_review_comments",
         "pr_reviews",
+        "pr_thread_resolved",
         "pr_file_viewed",
         "commit_statuses",
         "releases",
@@ -585,6 +586,21 @@ async fn pg_store_full_integration() {
             .len(),
         1
     );
+    let resolved = store
+        .set_pr_thread_resolved("pl2", "file.txt:2", true, "alice", now + 36)
+        .await
+        .unwrap();
+    assert!(resolved.resolved);
+    assert_eq!(resolved.resolved_by, "alice");
+    let reopened = store
+        .set_pr_thread_resolved("pl2", "file.txt:2", false, "bob", now + 37)
+        .await
+        .unwrap();
+    assert!(!reopened.resolved);
+    assert_eq!(
+        store.list_pr_thread_resolved("pl2").await.unwrap(),
+        vec![reopened]
+    );
 
     // --- pats: hash lookup + ownership-scoped revoke -----------------------
     store
@@ -629,6 +645,7 @@ async fn pg_store_full_integration() {
         "issue_comments",
         "pr_review_comments",
         "pr_reviews",
+        "pr_thread_resolved",
         "pr_file_viewed",
         "issues",
         "pulls",

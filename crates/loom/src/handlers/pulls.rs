@@ -25,7 +25,8 @@ use crate::gitops::CommitInfo;
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
 use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect, short_oid};
 use crate::model::{
-    CommitStatus, Label, Milestone, PrFileViewed, Pull, PullReview, PullReviewComment, Repo,
+    CommitStatus, Label, Milestone, PrFileViewed, PrThreadResolved, Pull, PullReview,
+    PullReviewComment, Repo,
 };
 use crate::{now_secs, random_alnum, AppState};
 
@@ -434,6 +435,7 @@ pub async fn detail(
         .store
         .list_pull_review_comments_for_viewer(&pull.id, &who.subject)
         .await?;
+    let thread_resolutions = state.store.list_pr_thread_resolved(&pull.id).await?;
     let header = pr_header(&state, &repo, "pulls").await;
     let body = render_detail(
         &state,
@@ -444,6 +446,7 @@ pub async fn detail(
         &milestones,
         &reviews,
         &review_comments,
+        &thread_resolutions,
         &header,
         &who,
         &headers,
@@ -610,6 +613,7 @@ async fn render_detail_with_fresh_metadata(
         .store
         .list_pull_review_comments_for_viewer(&pull.id, &who.subject)
         .await?;
+    let thread_resolutions = state.store.list_pr_thread_resolved(&pull.id).await?;
     render_detail(
         state,
         repo,
@@ -619,6 +623,7 @@ async fn render_detail_with_fresh_metadata(
         &milestones,
         &reviews,
         &review_comments,
+        &thread_resolutions,
         header,
         who,
         headers,
@@ -1001,6 +1006,122 @@ fn accepts_json(headers: &HeaderMap) -> bool {
                 .any(|part| part.trim().starts_with("application/json"))
         })
         .unwrap_or(false)
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/thread/(un)resolve — conversation state
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ThreadResolveForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub thread_key: String,
+}
+
+pub async fn resolve_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<ThreadResolveForm>,
+) -> Result<Response, AppError> {
+    thread_resolution_response(&state, &headers, &owner, &name, number, &form, true).await
+}
+
+pub async fn unresolve_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<ThreadResolveForm>,
+) -> Result<Response, AppError> {
+    thread_resolution_response(&state, &headers, &owner, &name, number, &form, false).await
+}
+
+async fn thread_resolution_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    form: &ThreadResolveForm,
+    resolved: bool,
+) -> Result<Response, AppError> {
+    let (row, unresolved_count) =
+        apply_thread_resolution(state, headers, owner, name, number, form, resolved).await?;
+    if accepts_json(headers) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "thread_key": row.thread_key,
+            "resolved": row.resolved,
+            "resolved_by": row.resolved_by,
+            "resolved_at": row.resolved_at,
+            "unresolved_count": unresolved_count,
+        }))
+        .into_response());
+    }
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+async fn apply_thread_resolution(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    form: &ThreadResolveForm,
+    resolved: bool,
+) -> Result<(PrThreadResolved, usize), AppError> {
+    if !auth::verify_csrf(headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    if !can_review(&repo, &pull, &who, headers) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner, pull-request author, or an administrator can resolve conversations."
+                .to_string(),
+        ));
+    }
+
+    let thread_key = form.thread_key.trim().chars().take(700).collect::<String>();
+    if thread_key.is_empty() {
+        return Err(AppError::BadRequest(
+            "Choose an inline conversation to update.".to_string(),
+        ));
+    }
+    let published_comments = state.store.list_pull_review_comments(&pull.id).await?;
+    if !published_comments
+        .iter()
+        .any(|comment| inline_thread_key(comment) == thread_key)
+    {
+        return Err(AppError::BadRequest(
+            "Choose an existing inline conversation.".to_string(),
+        ));
+    }
+
+    let row = state
+        .store
+        .set_pr_thread_resolved(&pull.id, &thread_key, resolved, &who.subject, now_secs())
+        .await?;
+    let resolutions = state.store.list_pr_thread_resolved(&pull.id).await?;
+    let unresolved_count = unresolved_thread_count(&published_comments, &resolutions);
+    tracing::info!(
+        repo = repo.id,
+        number,
+        actor = who.subject,
+        thread_key = thread_key,
+        resolved,
+        "pull inline conversation resolution changed"
+    );
+    Ok((row, unresolved_count))
 }
 
 // ===========================================================================
@@ -1512,6 +1633,7 @@ async fn render_detail(
     milestones: &[Milestone],
     reviews: &[PullReview],
     review_comments: &[PullReviewComment],
+    thread_resolutions: &[PrThreadResolved],
     header: &str,
     who: &Identity,
     headers: &HeaderMap,
@@ -1592,8 +1714,16 @@ async fn render_detail(
     };
     let commits_card = render_commits_card(&commits);
     let diff_card = render_pr_diff_card(&diff, &viewed_files, repo, pull, csrf);
-    let reviews_card =
-        render_reviews_card(repo, reviews, review_comments, csrf, pull, who, headers);
+    let reviews_card = render_reviews_card(
+        repo,
+        reviews,
+        review_comments,
+        thread_resolutions,
+        csrf,
+        pull,
+        who,
+        headers,
+    );
     let metadata_form = if can_gate(repo, pull, who) || auth::is_admin(headers) {
         let fields = render_pull_metadata_fields(
             labels,
@@ -1834,12 +1964,14 @@ fn render_reviews_card(
     repo: &Repo,
     reviews: &[PullReview],
     comments: &[PullReviewComment],
+    thread_resolutions: &[PrThreadResolved],
     csrf: &str,
     pull: &Pull,
     who: &Identity,
     headers: &HeaderMap,
 ) -> String {
     let pending_count = comments.iter().filter(|comment| comment.pending).count();
+    let unresolved_count = unresolved_thread_count(comments, thread_resolutions);
     let review_rows = if reviews.is_empty() {
         "<li class=\"issue-item issue-item--empty\">No reviews yet.</li>".to_string()
     } else {
@@ -1871,8 +2003,10 @@ fn render_reviews_card(
             })
             .collect::<String>()
     };
-    let inline_rows = render_inline_threads(repo, comments);
-    let forms = if can_review(repo, pull, who, headers) {
+    let can_resolve = can_review(repo, pull, who, headers);
+    let inline_rows =
+        render_inline_threads(repo, comments, thread_resolutions, csrf, pull, can_resolve);
+    let forms = if can_resolve {
         let pending_review = if pending_count == 0 {
             String::new()
         } else {
@@ -1947,30 +2081,156 @@ fn render_reviews_card(
   <div class="card__head"><h2>Reviews <span class="tab__count">{nreviews}</span></h2></div>
   <div class="card__body">
     <ul class="issue-list">{review_rows}</ul>
-    <h3 class="section-subhead">Inline comments</h3>
+    <h3 class="section-subhead">Inline comments <span class="review-unresolved-count">{unresolved_count} unresolved</span></h3>
     <ul class="issue-list" id="pr-inline-thread">{inline_rows}</ul>
     {forms}
   </div>
 </section>"##,
         nreviews = reviews.len(),
+        unresolved_count = unresolved_count,
         review_rows = review_rows,
         inline_rows = inline_rows,
         forms = forms,
     )
 }
 
-fn render_inline_threads(repo: &Repo, comments: &[PullReviewComment]) -> String {
+struct InlineThreadGroup<'a> {
+    key: String,
+    path: String,
+    line: i64,
+    comments: Vec<&'a PullReviewComment>,
+}
+
+fn inline_thread_key(comment: &PullReviewComment) -> String {
+    inline_thread_key_for(&comment.path, comment.line)
+}
+
+fn inline_thread_key_for(path: &str, line: i64) -> String {
+    format!("{path}:{line}")
+}
+
+fn inline_thread_groups(comments: &[PullReviewComment]) -> Vec<InlineThreadGroup<'_>> {
+    let mut by_anchor: BTreeMap<(String, i64), Vec<&PullReviewComment>> = BTreeMap::new();
+    for comment in comments {
+        by_anchor
+            .entry((comment.path.clone(), comment.line))
+            .or_default()
+            .push(comment);
+    }
+    by_anchor
+        .into_iter()
+        .map(|((path, line), comments)| InlineThreadGroup {
+            key: inline_thread_key_for(&path, line),
+            path,
+            line,
+            comments,
+        })
+        .collect()
+}
+
+fn resolved_thread<'a>(
+    thread_key: &str,
+    resolutions: &'a [PrThreadResolved],
+) -> Option<&'a PrThreadResolved> {
+    resolutions
+        .iter()
+        .find(|row| row.thread_key == thread_key && row.resolved)
+}
+
+fn unresolved_thread_count(
+    comments: &[PullReviewComment],
+    resolutions: &[PrThreadResolved],
+) -> usize {
+    let mut thread_keys = BTreeSet::new();
+    for comment in comments.iter().filter(|comment| !comment.pending) {
+        thread_keys.insert(inline_thread_key(comment));
+    }
+    thread_keys
+        .iter()
+        .filter(|thread_key| resolved_thread(thread_key, resolutions).is_none())
+        .count()
+}
+
+fn render_inline_threads(
+    repo: &Repo,
+    comments: &[PullReviewComment],
+    thread_resolutions: &[PrThreadResolved],
+    csrf: &str,
+    pull: &Pull,
+    can_resolve: bool,
+) -> String {
     if comments.is_empty() {
         return "<li class=\"issue-item issue-item--empty\">No inline comments yet.</li>"
             .to_string();
     }
+    inline_thread_groups(comments)
+        .into_iter()
+        .map(|thread| {
+            let has_published = thread.comments.iter().any(|comment| !comment.pending);
+            let resolution = resolved_thread(&thread.key, thread_resolutions);
+            let comments_html = render_inline_thread_comments(repo, &thread.comments);
+            let count_label = comment_count_label(thread.comments.len());
+            let anchor = format!("{}:{}", esc(&thread.path), thread.line);
+            let form = if can_resolve && has_published {
+                render_thread_resolution_form(repo, pull, csrf, &thread.key, resolution.is_some())
+            } else {
+                String::new()
+            };
+
+            if let Some(resolution) = resolution {
+                let resolved_by = if resolution.resolved_by.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    esc(&resolution.resolved_by)
+                };
+                return format!(
+                    r##"<li class="issue-item thread-resolved" data-thread-key="{thread_key}">
+  <details class="thread-resolved__details">
+    <summary class="thread-summary"><span>{anchor}</span> · Resolved by {resolved_by} {resolved_at} · {count_label}</summary>
+    <div class="thread-comments">{comments_html}</div>
+    {form}
+  </details>
+</li>"##,
+                    thread_key = esc(&thread.key),
+                    anchor = anchor,
+                    resolved_by = resolved_by,
+                    resolved_at = esc(&fmt_ts(resolution.resolved_at)),
+                    count_label = count_label,
+                    comments_html = comments_html,
+                    form = form,
+                );
+            }
+
+            let item_class = if has_published {
+                "issue-item thread-unresolved"
+            } else {
+                "issue-item thread-unresolved pending-review"
+            };
+            format!(
+                r##"<li class="{item_class}" data-thread-key="{thread_key}">
+  <div class="issue-item__meta"><span>{anchor}</span> · {count_label}</div>
+  <div class="thread-comments">{comments_html}</div>
+  {form}
+</li>"##,
+                item_class = item_class,
+                thread_key = esc(&thread.key),
+                anchor = anchor,
+                count_label = count_label,
+                comments_html = comments_html,
+                form = form,
+            )
+        })
+        .collect::<String>()
+}
+
+fn render_inline_thread_comments(repo: &Repo, comments: &[&PullReviewComment]) -> String {
     comments
         .iter()
         .map(|comment| {
             let item_class = if comment.pending {
-                "issue-item pending-review"
+                "thread-comment pending-review"
             } else {
-                "issue-item"
+                "thread-comment"
             };
             let action = if comment.pending {
                 "pending"
@@ -1978,13 +2238,11 @@ fn render_inline_threads(repo: &Repo, comments: &[PullReviewComment]) -> String 
                 "commented"
             };
             format!(
-                r##"<li class="{item_class}">
-  <div class="issue-item__meta"><span>{path}:{line}</span> · {author} {action} {when}</div>
+                r##"<div class="{item_class}">
+  <div class="issue-item__meta">{author} {action} {when}</div>
   <div class="issue-item__body markdown-body">{body}</div>
-</li>"##,
+</div>"##,
                 item_class = item_class,
-                path = esc(&comment.path),
-                line = comment.line,
                 author = esc(&comment.author_sub),
                 action = action,
                 when = esc(&fmt_ts(comment.created_at)),
@@ -1996,6 +2254,47 @@ fn render_inline_threads(repo: &Repo, comments: &[PullReviewComment]) -> String 
             )
         })
         .collect::<String>()
+}
+
+fn comment_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 comment".to_string()
+    } else {
+        format!("{count} comments")
+    }
+}
+
+fn render_thread_resolution_form(
+    repo: &Repo,
+    pull: &Pull,
+    csrf: &str,
+    thread_key: &str,
+    resolved: bool,
+) -> String {
+    let (action, label, class) = if resolved {
+        (
+            "unresolve",
+            "Unresolve",
+            "btn btn-secondary btn-sm btn-unresolve",
+        )
+    } else {
+        ("resolve", "Resolve", "btn btn-secondary btn-sm btn-resolve")
+    };
+    format!(
+        r##"<form class="inline-form thread-resolution-form" method="post" action="/r/{owner}/{name}/pulls/{number}/thread/{action}">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="thread_key" value="{thread_key}">
+  <button class="{class}" type="submit">{label}</button>
+</form>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        number = pull.number,
+        action = action,
+        csrf = esc(csrf),
+        thread_key = esc(thread_key),
+        class = class,
+        label = label,
+    )
 }
 
 /// Card listing the commits a PR would add (newest first).

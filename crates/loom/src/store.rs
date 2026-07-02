@@ -20,8 +20,8 @@ use thiserror::Error;
 
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
-    CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, Pull, PullReview,
-    PullReviewComment, Release, Repo,
+    CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, PrThreadResolved, Pull,
+    PullReview, PullReviewComment, Release, Repo,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -269,6 +269,22 @@ pub trait Store: Send + Sync {
         user_sub: &str,
     ) -> Result<Vec<PrFileViewed>, StoreError>;
 
+    /// Upsert the resolve state for one PR inline-comment thread.
+    async fn set_pr_thread_resolved(
+        &self,
+        pr_id: &str,
+        thread_key: &str,
+        resolved: bool,
+        resolved_by: &str,
+        resolved_at: i64,
+    ) -> Result<PrThreadResolved, StoreError>;
+
+    /// Resolve-state rows for one PR, ordered by thread key.
+    async fn list_pr_thread_resolved(
+        &self,
+        pr_id: &str,
+    ) -> Result<Vec<PrThreadResolved>, StoreError>;
+
     // --- labels + milestones -------------------------------------------------
     /// Create a repo-scoped label. Returns `Ok(None)` when the label name already exists.
     async fn create_label(
@@ -432,6 +448,7 @@ pub struct InMemoryStore {
     pull_reviews: Mutex<Vec<PullReview>>,
     pull_review_comments: Mutex<Vec<PullReviewComment>>,
     pr_file_viewed: Mutex<Vec<PrFileViewed>>,
+    pr_thread_resolved: Mutex<Vec<PrThreadResolved>>,
     commit_statuses: Mutex<Vec<CommitStatus>>,
     pats: Mutex<Vec<Pat>>,
 }
@@ -1065,6 +1082,55 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
+    async fn set_pr_thread_resolved(
+        &self,
+        pr_id: &str,
+        thread_key: &str,
+        resolved: bool,
+        resolved_by: &str,
+        resolved_at: i64,
+    ) -> Result<PrThreadResolved, StoreError> {
+        let mut rows = self
+            .pr_thread_resolved
+            .lock()
+            .expect("pr_thread_resolved lock poisoned");
+        if let Some(existing) = rows
+            .iter_mut()
+            .find(|row| row.pr_id == pr_id && row.thread_key == thread_key)
+        {
+            existing.resolved = resolved;
+            existing.resolved_by = resolved_by.to_string();
+            existing.resolved_at = resolved_at;
+            return Ok(existing.clone());
+        }
+        let row = PrThreadResolved {
+            pr_id: pr_id.to_string(),
+            thread_key: thread_key.to_string(),
+            resolved,
+            resolved_by: resolved_by.to_string(),
+            resolved_at,
+        };
+        rows.push(row.clone());
+        Ok(row)
+    }
+
+    async fn list_pr_thread_resolved(
+        &self,
+        pr_id: &str,
+    ) -> Result<Vec<PrThreadResolved>, StoreError> {
+        let rows = self
+            .pr_thread_resolved
+            .lock()
+            .expect("pr_thread_resolved lock poisoned");
+        let mut out: Vec<PrThreadResolved> = rows
+            .iter()
+            .filter(|row| row.pr_id == pr_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.thread_key.cmp(&b.thread_key));
+        Ok(out)
+    }
+
     async fn create_label(
         &self,
         id: &str,
@@ -1487,6 +1553,7 @@ const REVIEW_COLS: &str = "id, pull_id, reviewer_sub, verdict, body, created_at"
 const REVIEW_COMMENT_COLS: &str =
     "id, pull_id, review_id, path, line, author_sub, body, pending, created_at";
 const PR_FILE_VIEWED_COLS: &str = "pr_id, user_sub, file_path, viewed, updated_at";
+const PR_THREAD_RESOLVED_COLS: &str = "pr_id, thread_key, resolved, resolved_by, resolved_at";
 const COMMIT_STATUS_COLS: &str =
     "id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at";
 
@@ -1812,6 +1879,23 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pr_thread_resolved (\
+                 pr_id TEXT NOT NULL, \
+                 thread_key TEXT NOT NULL, \
+                 resolved BOOLEAN NOT NULL DEFAULT FALSE, \
+                 resolved_by TEXT NOT NULL DEFAULT '', \
+                 resolved_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_thread_resolved_pr_key \
+             ON pr_thread_resolved (pr_id, thread_key)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS pr_file_viewed (\
                  pr_id TEXT NOT NULL, \
                  user_sub TEXT NOT NULL, \
@@ -2013,6 +2097,18 @@ impl PgStore {
             file_path: row.try_get("file_path")?,
             viewed: row.try_get("viewed")?,
             updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    fn pr_thread_resolved_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<PrThreadResolved, sqlx::Error> {
+        Ok(PrThreadResolved {
+            pr_id: row.try_get("pr_id")?,
+            thread_key: row.try_get("thread_key")?,
+            resolved: row.try_get("resolved")?,
+            resolved_by: row.try_get("resolved_by")?,
+            resolved_at: row.try_get("resolved_at")?,
         })
     }
 
@@ -2881,6 +2977,69 @@ impl Store for PgStore {
         .map_err(|e| StoreError::Backend(e.to_string()))?;
         rows.iter()
             .map(Self::pr_file_viewed_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_pr_thread_resolved(
+        &self,
+        pr_id: &str,
+        thread_key: &str,
+        resolved: bool,
+        resolved_by: &str,
+        resolved_at: i64,
+    ) -> Result<PrThreadResolved, StoreError> {
+        sqlx::query(
+            "INSERT INTO pr_thread_resolved \
+                 (pr_id, thread_key, resolved, resolved_by, resolved_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (pr_id, thread_key) DO UPDATE SET \
+                 resolved = EXCLUDED.resolved, \
+                 resolved_by = EXCLUDED.resolved_by, \
+                 resolved_at = EXCLUDED.resolved_at",
+        )
+        .bind(pr_id)
+        .bind(thread_key)
+        .bind(resolved)
+        .bind(resolved_by)
+        .bind(resolved_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {PR_THREAD_RESOLVED_COLS} FROM pr_thread_resolved \
+             WHERE pr_id = $1 AND thread_key = $2"
+        ))
+        .bind(pr_id)
+        .bind(thread_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::pr_thread_resolved_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .ok_or_else(|| {
+                StoreError::Backend("PR thread resolve upsert did not persist".to_string())
+            })
+    }
+
+    async fn list_pr_thread_resolved(
+        &self,
+        pr_id: &str,
+    ) -> Result<Vec<PrThreadResolved>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {PR_THREAD_RESOLVED_COLS} FROM pr_thread_resolved \
+             WHERE pr_id = $1 \
+             ORDER BY thread_key ASC"
+        ))
+        .bind(pr_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::pr_thread_resolved_from_row)
             .collect::<Result<_, _>>()
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -3868,6 +4027,45 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn pr_thread_resolved_upserts_and_lists() {
+        let s = InMemoryStore::new();
+
+        let first = s
+            .set_pr_thread_resolved("pl1", "file.txt:2", true, "alice", 10)
+            .await
+            .unwrap();
+        assert!(first.resolved);
+        assert_eq!(first.resolved_by, "alice");
+        assert_eq!(
+            s.list_pr_thread_resolved("pl1").await.unwrap(),
+            vec![first.clone()]
+        );
+
+        let updated = s
+            .set_pr_thread_resolved("pl1", "file.txt:2", false, "bob", 20)
+            .await
+            .unwrap();
+        assert!(!updated.resolved);
+        assert_eq!(updated.resolved_by, "bob");
+        assert_eq!(updated.resolved_at, 20);
+        assert_eq!(
+            s.list_pr_thread_resolved("pl1").await.unwrap(),
+            vec![updated]
+        );
+
+        s.set_pr_thread_resolved("pl1", "src/lib.rs:4", true, "alice", 30)
+            .await
+            .unwrap();
+        s.set_pr_thread_resolved("pl2", "file.txt:2", true, "carol", 40)
+            .await
+            .unwrap();
+        let rows = s.list_pr_thread_resolved("pl1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].thread_key, "file.txt:2");
+        assert_eq!(rows[1].thread_key, "src/lib.rs:4");
     }
 
     #[tokio::test]
