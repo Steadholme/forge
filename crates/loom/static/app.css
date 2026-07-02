@@ -1539,3 +1539,126 @@ mark.code-search-hit {
 @media (prefers-reduced-motion:reduce) {
   .blob-line__num a { transition:none; }
 }
+
+/* ============================================================================
+   Diff split / unified view toggle — visual layer only
+   ----------------------------------------------------------------------------
+   The backend already emits every hook (see render_diff_controls /
+   render_diff_file / render_split_diff_rows / render_split_diff_row in
+   handlers/pulls.rs). This section only paints them; the unified view
+   (.diff--unified) is deliberately left untouched. DOM shape styled here:
+
+     form.diff-toggle                          (lives in .card__head, GET form)
+       span.diff-toggle__views[role=radiogroup]
+         label.diff-toggle__option > input[type=radio name=diff]  (unified|split)
+       label.diff-toggle__option.diff-toggle__whitespace
+                                  > input[type=checkbox name=w]     (ignore ws)
+       button.btn.btn-ghost.btn-sm                                  (Apply)
+
+     table.diff.diff--split > tbody
+       tr.diff-row(.diff-row--change|--del|--add|--ctx)
+         td.diff-gutter.diff-gutter--split
+           span.diff-side.diff-side--old            (old line no.)
+           span.diff-side.diff-side--new            (new line no.)
+         td.diff-code.diff-code--split
+           span.diff-side.diff-side--old(.diff-side--del|.diff-side--empty)
+           span.diff-side.diff-side--new(.diff-side--add|.diff-side--empty)
+       tr.diff-row--hunk / tr.diff-row--meta        (full-width unified rows,
+                                                      reused verbatim from above)
+
+   Reuses Odyssey v2 tokens only — no new fonts, libraries or external links.
+   Colours resolve through the shared semantic tokens, so dark mode needs no
+   override; transitions ride the global prefers-reduced-motion kill-switch.
+   ========================================================================== */
+
+/* --- View toggle: a segmented old|new radio group + a whitespace chip ------
+   Sits at the far right of the .card__head (h2 + form, both flex children). */
+.diff-toggle { display:flex; align-items:center; flex-wrap:wrap; gap:10px;
+  margin:0 0 0 auto; }
+
+.diff-toggle__views { display:inline-flex; align-items:stretch;
+  border:1px solid var(--border); border-radius:var(--r-xs);
+  background:var(--surface-2); overflow:hidden; }
+.diff-toggle__views:focus-within { outline:2px solid var(--ring); outline-offset:2px; }
+
+.diff-toggle__option { margin:0; display:inline-flex; align-items:center; gap:6px;
+  font:550 12.5px/1 var(--mono); color:var(--ink-2); cursor:pointer;
+  user-select:none; -webkit-user-select:none; }
+
+/* Segments: the native radio drives the state; we hide it and paint the label. */
+.diff-toggle__views .diff-toggle__option { padding:6px 13px;
+  border-left:1px solid var(--border);
+  transition:background var(--dur) var(--ease), color var(--dur) var(--ease); }
+.diff-toggle__views .diff-toggle__option:first-child { border-left:0; }
+.diff-toggle__views .diff-toggle__option input { position:absolute;
+  width:1px; height:1px; margin:0; opacity:0; pointer-events:none; }
+.diff-toggle__views .diff-toggle__option:hover { background:var(--surface-3); }
+.diff-toggle__views .diff-toggle__option:has(input:checked) {
+  background:var(--accent); color:#fff; }
+
+/* Ignore-whitespace: an outlined chip that lights up when active. */
+.diff-toggle__whitespace { padding:5px 11px; border:1px solid var(--border);
+  border-radius:var(--r-xs); background:var(--surface);
+  transition:background var(--dur) var(--ease), color var(--dur) var(--ease),
+             border-color var(--dur) var(--ease); }
+.diff-toggle__whitespace input { accent-color:var(--accent); margin:0; }
+.diff-toggle__whitespace:hover { background:var(--surface-2); }
+.diff-toggle__whitespace:has(input:checked) { background:var(--accent-soft);
+  color:var(--accent-ink); border-color:var(--accent-border); }
+
+/* --- Split table: two aligned old|new columns -----------------------------
+   Fixed layout caps the code column to the card width; each source side then
+   scrolls on its own so a long line never bursts the diff open. The gutter
+   width is pinned on every row (not just --split rows) because table-layout
+   :fixed reads column widths from the first row, which is a unified meta row. */
+.diff--split { table-layout:fixed; }
+.diff--split .diff-gutter { width:96px; }
+
+/* Gutter cell: the two line numbers sit side by side, old | new. */
+.diff--split .diff-gutter--split { display:flex; padding:0; }
+.diff--split .diff-gutter--split .diff-side { flex:1 1 0; min-width:0;
+  padding:0 8px; text-align:right; color:var(--ink-3); }
+.diff--split .diff-gutter--split .diff-side--new { border-left:1px solid var(--border); }
+/* Number tint follows the change kind (old→removed, new→added). */
+.diff--split .diff-row--del .diff-gutter--split .diff-side--old,
+.diff--split .diff-row--change .diff-gutter--split .diff-side--old { color:var(--down-ink); }
+.diff--split .diff-row--add .diff-gutter--split .diff-side--new,
+.diff--split .diff-row--change .diff-gutter--split .diff-side--new { color:var(--ok-ink); }
+
+/* Code cell: the two source columns, old | new, each independently scrollable. */
+.diff--split .diff-code--split { display:flex; padding:0;
+  border-left:1px solid var(--border); }
+.diff--split .diff-code--split .diff-side { flex:1 1 0; min-width:0;
+  padding:0 12px; white-space:pre; overflow-x:auto; color:var(--ink); }
+.diff--split .diff-code--split .diff-side--new { border-left:1px solid var(--border); }
+
+/* Per-side tint: removals only on the left, additions only on the right, so
+   the whole-row --add/--del backgrounds are neutralised in split view. */
+.diff--split .diff-row--add,
+.diff--split .diff-row--del,
+.diff--split .diff-row--change { background:transparent; }
+.diff--split .diff-code--split .diff-side--del { background:var(--down-soft); }
+.diff--split .diff-code--split .diff-side--add { background:var(--ok-soft); }
+/* Absent counterpart: a faint hatch that reads as "no line here". */
+.diff--split .diff-code--split .diff-side--empty { background:var(--surface-3);
+  background-image:repeating-linear-gradient(135deg,
+    var(--hairline) 0 5px, transparent 5px 10px); }
+
+/* --- Narrow screens: degrade the two columns to a stack (never break out) -- */
+@media (max-width:640px) {
+  .diff--split .diff-gutter { width:64px; }
+  .diff--split .diff-gutter--split,
+  .diff--split .diff-code--split { display:block; }
+  .diff--split .diff-gutter--split .diff-side,
+  .diff--split .diff-code--split .diff-side { display:block; width:auto; }
+  .diff--split .diff-gutter--split .diff-side--new,
+  .diff--split .diff-code--split .diff-side--new { border-left:0;
+    border-top:1px solid var(--border); }
+}
+
+/* Explicit reduced-motion guard, mirroring the pattern used above; the global
+   kill-switch already zeroes these, but the intent stays visible here. */
+@media (prefers-reduced-motion:reduce) {
+  .diff-toggle__views .diff-toggle__option,
+  .diff-toggle__whitespace { transition:none; }
+}
