@@ -168,6 +168,17 @@ fn post_form_accept(
     b.body(Body::from(body)).unwrap()
 }
 
+fn first_action_with_prefix(body: &str, prefix: &str) -> String {
+    let start = body
+        .find(prefix)
+        .unwrap_or_else(|| panic!("missing action prefix {prefix} in body:\n{body}"));
+    let rest = &body[start..];
+    let end = rest
+        .find('"')
+        .unwrap_or_else(|| panic!("unterminated action for prefix {prefix}"));
+    rest[..end].to_string()
+}
+
 /// Like [`post_form`], but also injects an `X-Auth-Groups` header (for admin-gate tests).
 fn post_form_groups(
     path: &str,
@@ -514,6 +525,105 @@ async fn issue_detail_comments_filter_and_admin_gate() {
         StatusCode::FOUND,
         "git-admins operator may moderate a foreign issue"
     );
+}
+
+#[tokio::test]
+async fn issue_reactions_toggle_body_and_comments() {
+    let app = app(temp_state());
+    create_repo(&app, "alice", "proj", "").await;
+    open_issue(&app, "bob", "alice/proj", "Reactable", "body").await;
+
+    let detail = send(&app, get("/r/alice/proj/issues/1", Some("bob"))).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.body.contains("class=\"reactions\""));
+    assert!(detail.body.contains("/r/alice/proj/issues/1/reactions"));
+    let csrf = detail.csrf_cookie().unwrap();
+
+    let reacted = send(
+        &app,
+        post_form_accept(
+            "/r/alice/proj/issues/1/reactions",
+            &[("csrf_token", &csrf), ("emoji", "\u{1f44d}")],
+            &csrf,
+            Some("bob"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(reacted.status, StatusCode::OK);
+    assert!(reacted.content_type().contains("application/json"));
+    let parsed: serde_json::Value = serde_json::from_str(&reacted.body).unwrap();
+    assert_eq!(parsed["target_type"], "issue");
+    assert_eq!(parsed["selected"], true);
+    assert_eq!(parsed["reactions"][0]["count"], 1);
+    assert_eq!(parsed["reactions"][0]["viewer_selected"], true);
+
+    let active = send(&app, get("/r/alice/proj/issues/1", Some("bob"))).await;
+    assert!(active.body.contains("reaction--active"));
+    assert!(active.body.contains("reaction__count\">1</span>"));
+
+    let canceled = send(
+        &app,
+        post_form_accept(
+            "/r/alice/proj/issues/1/reactions",
+            &[("csrf_token", &csrf), ("emoji", "\u{1f44d}")],
+            &csrf,
+            Some("bob"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(canceled.status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&canceled.body).unwrap();
+    assert_eq!(parsed["selected"], false);
+    assert!(parsed["reactions"].as_array().unwrap().is_empty());
+
+    let comment_page = send(&app, get("/r/alice/proj/issues/1", Some("carol"))).await;
+    let csrf = comment_page.csrf_cookie().unwrap();
+    let commented = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/comment",
+            &[("csrf_token", &csrf), ("body", "comment body")],
+            &csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(commented.status, StatusCode::FOUND);
+    let with_comment = send(&app, get("/r/alice/proj/issues/1", Some("carol"))).await;
+    let csrf = with_comment.csrf_cookie().unwrap();
+    let comment_action =
+        first_action_with_prefix(&with_comment.body, "/r/alice/proj/issues/1/comments/");
+    assert!(comment_action.ends_with("/reactions"));
+
+    let comment_reacted = send(
+        &app,
+        post_form_accept(
+            &comment_action,
+            &[("csrf_token", &csrf), ("emoji", "\u{2764}\u{fe0f}")],
+            &csrf,
+            Some("carol"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(comment_reacted.status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&comment_reacted.body).unwrap();
+    assert_eq!(parsed["target_type"], "comment");
+    assert_eq!(parsed["reactions"][0]["count"], 1);
+
+    let invalid = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/reactions",
+            &[("csrf_token", &csrf), ("emoji", "\u{1f525}")],
+            &csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1918,6 +2028,106 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
         closed.body.contains("Tracked bug"),
         "fixes #1 closed the linked issue"
     );
+}
+
+#[tokio::test]
+async fn pull_reactions_toggle_body_and_inline_comments() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    seed_two_branches(&git_dir);
+
+    let cmp = send(
+        &app,
+        get("/r/alice/proj/compare?base=main&head=feature", Some("bob")),
+    )
+    .await;
+    let csrf = cmp.csrf_cookie().unwrap();
+    let created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls",
+            &[
+                ("csrf_token", &csrf),
+                ("base", "main"),
+                ("head", "feature"),
+                ("title", "Reactable PR"),
+                ("body", "body"),
+            ],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.body.contains("class=\"reactions\""));
+    assert!(detail.body.contains("/r/alice/proj/pulls/1/reactions"));
+    let csrf = detail.csrf_cookie().unwrap();
+
+    let reacted = send(
+        &app,
+        post_form_accept(
+            "/r/alice/proj/pulls/1/reactions",
+            &[("csrf_token", &csrf), ("emoji", "\u{1f680}")],
+            &csrf,
+            Some("bob"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(reacted.status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&reacted.body).unwrap();
+    assert_eq!(parsed["target_type"], "pull");
+    assert_eq!(parsed["selected"], true);
+    assert_eq!(parsed["reactions"][0]["count"], 1);
+
+    let inline = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/inline-comment",
+            &[
+                ("csrf_token", &csrf),
+                ("path", "file.txt"),
+                ("line", "2"),
+                ("body", "line note"),
+            ],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(inline.status, StatusCode::FOUND);
+
+    let with_inline = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    let csrf = with_inline.csrf_cookie().unwrap();
+    let comment_action =
+        first_action_with_prefix(&with_inline.body, "/r/alice/proj/pulls/1/comments/");
+    assert!(comment_action.ends_with("/reactions"));
+
+    let comment_reacted = send(
+        &app,
+        post_form_accept(
+            &comment_action,
+            &[("csrf_token", &csrf), ("emoji", "\u{1f440}")],
+            &csrf,
+            Some("bob"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(comment_reacted.status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&comment_reacted.body).unwrap();
+    assert_eq!(parsed["target_type"], "comment");
+    assert_eq!(parsed["reactions"][0]["viewer_selected"], true);
+
+    let active = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    assert!(active.body.contains("reaction--active"));
+    assert!(active.body.contains("reaction__count\">1</span>"));
 }
 
 // ===========================================================================

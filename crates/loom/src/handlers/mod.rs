@@ -29,11 +29,13 @@ pub mod repos;
 pub mod settings;
 pub mod smart_http;
 
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use serde::de::{SeqAccess, Visitor};
 use serde::Deserializer;
 use std::fmt;
+
+use crate::model::ReactionSummary;
 
 /// Embedded design system, inlined into each rendered page's `<style>`.
 pub const APP_CSS: &str = include_str!("../../static/app.css");
@@ -132,6 +134,143 @@ pub fn redirect(location: &str) -> Response {
         [(header::LOCATION, location.to_string())],
     )
         .into_response()
+}
+
+/// GitHub-compatible reaction glyphs accepted by Loom. Escapes keep this source ASCII-only.
+pub const REACTION_EMOJIS: [&str; 8] = [
+    "\u{1f44d}",
+    "\u{1f44e}",
+    "\u{1f604}",
+    "\u{1f389}",
+    "\u{1f615}",
+    "\u{2764}\u{fe0f}",
+    "\u{1f680}",
+    "\u{1f440}",
+];
+
+pub const REACTION_TARGET_ISSUE: &str = "issue";
+pub const REACTION_TARGET_PULL: &str = "pull";
+pub const REACTION_TARGET_COMMENT: &str = "comment";
+
+/// True when the request explicitly prefers a JSON response.
+pub fn accepts_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .any(|part| part.trim().starts_with("application/json"))
+        })
+        .unwrap_or(false)
+}
+
+/// Reject arbitrary client-supplied emoji; only the fixed reaction palette is accepted.
+pub fn is_valid_reaction_emoji(emoji: &str) -> bool {
+    REACTION_EMOJIS.contains(&emoji)
+}
+
+fn ordered_reaction_summaries(summaries: &[ReactionSummary]) -> Vec<&ReactionSummary> {
+    REACTION_EMOJIS
+        .iter()
+        .filter_map(|emoji| {
+            summaries
+                .iter()
+                .find(|summary| summary.emoji == *emoji && summary.count > 0)
+        })
+        .collect()
+}
+
+/// JSON aggregate for progressive enhancement callers.
+pub fn reaction_summaries_json(summaries: &[ReactionSummary]) -> serde_json::Value {
+    serde_json::Value::Array(
+        ordered_reaction_summaries(summaries)
+            .into_iter()
+            .map(|summary| {
+                serde_json::json!({
+                    "emoji": summary.emoji,
+                    "count": summary.count,
+                    "viewer_selected": summary.viewer_selected,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Render the reaction bar and add-reaction picker. When there are no reactions yet, only the
+/// picker is visible, keeping the empty state backward-compatible.
+pub fn render_reactions(
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    summaries: &[ReactionSummary],
+    csrf: &str,
+) -> String {
+    let reaction_buttons = ordered_reaction_summaries(summaries)
+        .into_iter()
+        .map(|summary| {
+            let active_class = if summary.viewer_selected {
+                " reaction--active"
+            } else {
+                ""
+            };
+            let pressed = if summary.viewer_selected { "true" } else { "false" };
+            format!(
+                r##"<form class="reaction-form" method="post" action="{action}">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="emoji" value="{emoji}">
+  <button class="reaction{active_class}" type="submit" aria-pressed="{pressed}"><span class="reaction__emoji">{emoji}</span> <span class="reaction__count">{count}</span></button>
+</form>"##,
+                action = esc(action),
+                csrf = esc(csrf),
+                emoji = esc(&summary.emoji),
+                active_class = active_class,
+                pressed = pressed,
+                count = summary.count,
+            )
+        })
+        .collect::<String>();
+    let reaction_list = if reaction_buttons.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"reactions__list\">{reaction_buttons}</div>")
+    };
+
+    let picker_buttons = REACTION_EMOJIS
+        .iter()
+        .map(|emoji| {
+            let selected = summaries
+                .iter()
+                .any(|summary| summary.emoji == *emoji && summary.viewer_selected);
+            let active_class = if selected { " reaction--active" } else { "" };
+            let pressed = if selected { "true" } else { "false" };
+            format!(
+                r##"<form class="reaction-picker__form" method="post" action="{action}">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="emoji" value="{emoji}">
+  <button class="reaction reaction-picker__emoji{active_class}" type="submit" aria-pressed="{pressed}">{emoji}</button>
+</form>"##,
+                action = esc(action),
+                csrf = esc(csrf),
+                emoji = esc(emoji),
+                active_class = active_class,
+                pressed = pressed,
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        r##"<div class="reactions" data-target-type="{target_type}" data-target-id="{target_id}">
+  {reaction_list}
+  <details class="reaction-picker">
+    <summary class="reaction-picker__button" aria-label="Add reaction">+</summary>
+    <div class="reaction-picker__menu">{picker_buttons}</div>
+  </details>
+</div>"##,
+        target_type = esc(target_type),
+        target_id = esc(target_id),
+        reaction_list = reaction_list,
+        picker_buttons = picker_buttons,
+    )
 }
 
 /// Two-letter avatar initials from the signed-in email (falls back to a neutral glyph).

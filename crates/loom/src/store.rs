@@ -13,6 +13,7 @@
 //! NOTE: the git BYTES (objects/refs) live on the filesystem as bare repos (see [`crate::gitops`]);
 //! this store keeps only the metadata. Repo BLOB content is never stored here.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ use thiserror::Error;
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
     CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, PrThreadResolved, Pull,
-    PullReview, PullReviewComment, Release, Repo, Webhook,
+    PullReview, PullReviewComment, Reaction, ReactionSummary, Release, Repo, Webhook,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -181,6 +182,27 @@ pub trait Store: Send + Sync {
 
     /// All comments on an issue, oldest first (chronological thread order).
     async fn list_comments(&self, issue_id: &str) -> Result<Vec<IssueComment>, StoreError>;
+
+    // --- reactions -----------------------------------------------------------
+    /// Toggle one user's reaction on a target. Returns `true` when inserted and `false` when an
+    /// existing reaction was removed.
+    async fn toggle_reaction(
+        &self,
+        id: &str,
+        target_type: &str,
+        target_id: &str,
+        user_sub: &str,
+        emoji: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Aggregated reaction counts for one target, including whether `viewer_sub` selected each.
+    async fn list_reactions_for_target(
+        &self,
+        target_type: &str,
+        target_id: &str,
+        viewer_sub: &str,
+    ) -> Result<Vec<ReactionSummary>, StoreError>;
 
     /// Replace issue assignee/milestone/label metadata in one operation.
     async fn set_issue_metadata(
@@ -469,6 +491,7 @@ pub struct InMemoryStore {
     releases: Mutex<Vec<Release>>,
     issues: Mutex<Vec<Issue>>,
     issue_comments: Mutex<Vec<IssueComment>>,
+    reactions: Mutex<Vec<Reaction>>,
     issue_labels: Mutex<Vec<(String, String)>>,
     pulls: Mutex<Vec<Pull>>,
     pull_labels: Mutex<Vec<(String, String)>>,
@@ -825,6 +848,63 @@ impl Store for InMemoryStore {
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(out)
+    }
+
+    async fn toggle_reaction(
+        &self,
+        id: &str,
+        target_type: &str,
+        target_id: &str,
+        user_sub: &str,
+        emoji: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
+        if let Some(pos) = reactions.iter().position(|row| {
+            row.target_type == target_type
+                && row.target_id == target_id
+                && row.user_sub == user_sub
+                && row.emoji == emoji
+        }) {
+            reactions.remove(pos);
+            return Ok(false);
+        }
+        reactions.push(Reaction {
+            id: id.to_string(),
+            target_type: target_type.to_string(),
+            target_id: target_id.to_string(),
+            user_sub: user_sub.to_string(),
+            emoji: emoji.to_string(),
+            created_at,
+        });
+        Ok(true)
+    }
+
+    async fn list_reactions_for_target(
+        &self,
+        target_type: &str,
+        target_id: &str,
+        viewer_sub: &str,
+    ) -> Result<Vec<ReactionSummary>, StoreError> {
+        let reactions = self.reactions.lock().expect("reactions lock poisoned");
+        let mut by_emoji: BTreeMap<String, ReactionSummary> = BTreeMap::new();
+        for row in reactions
+            .iter()
+            .filter(|row| row.target_type == target_type && row.target_id == target_id)
+        {
+            let summary = by_emoji
+                .entry(row.emoji.clone())
+                .or_insert_with(|| ReactionSummary {
+                    emoji: row.emoji.clone(),
+                    count: 0,
+                    viewer_selected: false,
+                });
+            summary.count += 1;
+            if row.user_sub == viewer_sub {
+                summary.viewer_selected = true;
+            }
+        }
+        Ok(by_emoji.into_values().collect())
     }
 
     async fn set_issue_metadata(
@@ -1836,6 +1916,30 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS reactions (\
+                 id TEXT PRIMARY KEY, \
+                 target_type TEXT NOT NULL, \
+                 target_id TEXT NOT NULL, \
+                 user_sub TEXT NOT NULL, \
+                 emoji TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reactions_target_user_emoji \
+             ON reactions (target_type, target_id, user_sub, emoji)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reactions_target \
+             ON reactions (target_type, target_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS pats (\
                  id TEXT PRIMARY KEY, \
                  owner_sub TEXT NOT NULL, \
@@ -2756,6 +2860,81 @@ impl Store for PgStore {
         rows.iter()
             .map(Self::comment_from_row)
             .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn toggle_reaction(
+        &self,
+        id: &str,
+        target_type: &str,
+        target_id: &str,
+        user_sub: &str,
+        emoji: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        let deleted = sqlx::query(
+            "DELETE FROM reactions \
+             WHERE target_type = $1 AND target_id = $2 AND user_sub = $3 AND emoji = $4",
+        )
+        .bind(target_type)
+        .bind(target_id)
+        .bind(user_sub)
+        .bind(emoji)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        if deleted.rows_affected() > 0 {
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "INSERT INTO reactions \
+                 (id, target_type, target_id, user_sub, emoji, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (target_type, target_id, user_sub, emoji) DO NOTHING",
+        )
+        .bind(id)
+        .bind(target_type)
+        .bind(target_id)
+        .bind(user_sub)
+        .bind(emoji)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    async fn list_reactions_for_target(
+        &self,
+        target_type: &str,
+        target_id: &str,
+        viewer_sub: &str,
+    ) -> Result<Vec<ReactionSummary>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT emoji, count(*) AS n, \
+                    CASE WHEN SUM(CASE WHEN user_sub = $3 THEN 1 ELSE 0 END) > 0 \
+                         THEN TRUE ELSE FALSE END AS viewer_selected \
+             FROM reactions \
+             WHERE target_type = $1 AND target_id = $2 \
+             GROUP BY emoji \
+             ORDER BY emoji ASC",
+        )
+        .bind(target_type)
+        .bind(target_id)
+        .bind(viewer_sub)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                Ok(ReactionSummary {
+                    emoji: row.try_get("emoji")?,
+                    count: row.try_get("n")?,
+                    viewer_selected: row.try_get("viewer_selected")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
@@ -4136,6 +4315,80 @@ mod tests {
         assert_eq!(s.get_issue("r", 1).await.unwrap().unwrap().updated_at, 210);
         // A comment on a foreign issue does not appear in this thread.
         assert!(s.list_comments("nope").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactions_toggle_and_aggregate_per_viewer() {
+        let s = InMemoryStore::new();
+        assert!(s
+            .toggle_reaction("rx1", "issue", "i1", "alice", "\u{1f44d}", 10)
+            .await
+            .unwrap());
+        assert!(s
+            .toggle_reaction("rx2", "issue", "i1", "bob", "\u{1f44d}", 11)
+            .await
+            .unwrap());
+        assert!(s
+            .toggle_reaction("rx3", "issue", "i1", "alice", "\u{1f680}", 12)
+            .await
+            .unwrap());
+
+        let alice = s
+            .list_reactions_for_target("issue", "i1", "alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            alice,
+            vec![
+                ReactionSummary {
+                    emoji: "\u{1f44d}".to_string(),
+                    count: 2,
+                    viewer_selected: true,
+                },
+                ReactionSummary {
+                    emoji: "\u{1f680}".to_string(),
+                    count: 1,
+                    viewer_selected: true,
+                },
+            ]
+        );
+
+        let bob = s
+            .list_reactions_for_target("issue", "i1", "bob")
+            .await
+            .unwrap();
+        assert!(bob
+            .iter()
+            .any(|row| row.emoji == "\u{1f680}" && !row.viewer_selected));
+
+        assert!(!s
+            .toggle_reaction("rx4", "issue", "i1", "alice", "\u{1f44d}", 13)
+            .await
+            .unwrap());
+        let after_cancel = s
+            .list_reactions_for_target("issue", "i1", "alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            after_cancel
+                .iter()
+                .find(|row| row.emoji == "\u{1f44d}")
+                .unwrap()
+                .count,
+            1
+        );
+        assert!(
+            !after_cancel
+                .iter()
+                .find(|row| row.emoji == "\u{1f44d}")
+                .unwrap()
+                .viewer_selected
+        );
+        assert!(s
+            .list_reactions_for_target("pull", "i1", "alice")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -7,6 +7,8 @@
 //! through the sanitising [`crate::markdown`] pipeline / HTML-escaped on render. State-changing POSTs
 //! carry the double-submit CSRF token, exactly like the rest of the web surface.
 
+use std::collections::BTreeMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -16,13 +18,18 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::handlers::repos::{load_visible_repo, render_repo_header};
-use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect};
-use crate::model::{Issue, IssueComment, Label, Milestone, Repo};
+use crate::handlers::{
+    accepts_json, esc, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
+    reaction_summaries_json, redirect, render_reactions, REACTION_TARGET_COMMENT,
+    REACTION_TARGET_ISSUE,
+};
+use crate::model::{Issue, IssueComment, Label, Milestone, ReactionSummary, Repo};
 use crate::webhooks;
 use crate::{now_secs, random_alnum, AppState};
 
 const ISSUE_ID_LEN: usize = 16;
 const COMMENT_ID_LEN: usize = 16;
+const REACTION_ID_LEN: usize = 16;
 /// Issues shown per list page (simple offset pagination).
 const ISSUES_PER_PAGE: i64 = 25;
 /// Hard caps on the stored text so a single request cannot store an unbounded blob.
@@ -109,6 +116,31 @@ async fn issue_header(state: &AppState, repo: &Repo) -> String {
         release_count,
         "issues",
     )
+}
+
+type ReactionMap = BTreeMap<String, Vec<ReactionSummary>>;
+
+async fn load_issue_reactions(
+    state: &AppState,
+    issue: &Issue,
+    comments: &[IssueComment],
+    viewer_sub: &str,
+) -> Result<(Vec<ReactionSummary>, ReactionMap), AppError> {
+    let issue_reactions = state
+        .store
+        .list_reactions_for_target(REACTION_TARGET_ISSUE, &issue.id, viewer_sub)
+        .await?;
+    let mut comment_reactions = ReactionMap::new();
+    for comment in comments {
+        comment_reactions.insert(
+            comment.id.clone(),
+            state
+                .store
+                .list_reactions_for_target(REACTION_TARGET_COMMENT, &comment.id, viewer_sub)
+                .await?,
+        );
+    }
+    Ok((issue_reactions, comment_reactions))
 }
 
 /// A danger alert block for an inline error message (or empty).
@@ -373,6 +405,8 @@ pub async fn detail(
     let labels = state.store.list_labels(&repo.id).await?;
     let issue_labels = state.store.issue_labels(&issue.id).await?;
     let milestones = state.store.list_milestones(&repo.id).await?;
+    let (issue_reactions, comment_reactions) =
+        load_issue_reactions(&state, &issue, &comments, &who.subject).await?;
     let csrf = auth::new_csrf_token();
 
     let can_toggle = can_moderate(&repo, &issue, &who, &headers);
@@ -384,6 +418,8 @@ pub async fn detail(
         &labels,
         &issue_labels,
         &milestones,
+        &issue_reactions,
+        &comment_reactions,
         &header,
         can_toggle,
         &csrf,
@@ -439,6 +475,8 @@ pub async fn comment(
         let labels = state.store.list_labels(&repo.id).await?;
         let issue_labels = state.store.issue_labels(&issue.id).await?;
         let milestones = state.store.list_milestones(&repo.id).await?;
+        let (issue_reactions, comment_reactions) =
+            load_issue_reactions(&state, &issue, &comments, &who.subject).await?;
         let can_toggle = can_moderate(&repo, &issue, &who, &headers);
         let header = issue_header(&state, &repo).await;
         let body = render_detail(
@@ -448,6 +486,8 @@ pub async fn comment(
             &labels,
             &issue_labels,
             &milestones,
+            &issue_reactions,
+            &comment_reactions,
             &header,
             can_toggle,
             &csrf,
@@ -482,6 +522,173 @@ pub async fn comment(
         "issue comment added"
     );
     Ok(redirect(&format!("/r/{owner}/{name}/issues/{number}")))
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/issues/{number}/reactions — toggle issue reaction
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ReactionForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub emoji: String,
+}
+
+pub async fn react_issue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<ReactionForm>,
+) -> Result<Response, AppError> {
+    let (target_id, emoji, selected, reactions) =
+        apply_issue_reaction(&state, &headers, &owner, &name, number, &form).await?;
+    if accepts_json(&headers) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "target_type": REACTION_TARGET_ISSUE,
+            "target_id": target_id,
+            "emoji": emoji,
+            "selected": selected,
+            "reactions": reaction_summaries_json(&reactions),
+        }))
+        .into_response());
+    }
+    Ok(redirect(&format!("/r/{owner}/{name}/issues/{number}")))
+}
+
+async fn apply_issue_reaction(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    form: &ReactionForm,
+) -> Result<(String, String, bool, Vec<ReactionSummary>), AppError> {
+    let emoji = clean_reaction_form(headers, form)?;
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
+    let issue = state
+        .store
+        .get_issue(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such issue.".to_string()))?;
+    let selected = state
+        .store
+        .toggle_reaction(
+            &format!("rx_{}", random_alnum(REACTION_ID_LEN)),
+            REACTION_TARGET_ISSUE,
+            &issue.id,
+            &who.subject,
+            &emoji,
+            now_secs(),
+        )
+        .await?;
+    let reactions = state
+        .store
+        .list_reactions_for_target(REACTION_TARGET_ISSUE, &issue.id, &who.subject)
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        target = issue.id,
+        emoji = emoji,
+        selected,
+        actor = who.subject,
+        "issue reaction toggled"
+    );
+    Ok((issue.id, emoji, selected, reactions))
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/issues/{number}/comments/{comment_id}/reactions
+// ===========================================================================
+
+pub async fn react_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number, comment_id)): Path<(String, String, i64, String)>,
+    Form(form): Form<ReactionForm>,
+) -> Result<Response, AppError> {
+    let (target_id, emoji, selected, reactions) =
+        apply_issue_comment_reaction(&state, &headers, &owner, &name, number, &comment_id, &form)
+            .await?;
+    if accepts_json(&headers) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "target_type": REACTION_TARGET_COMMENT,
+            "target_id": target_id,
+            "emoji": emoji,
+            "selected": selected,
+            "reactions": reaction_summaries_json(&reactions),
+        }))
+        .into_response());
+    }
+    Ok(redirect(&format!("/r/{owner}/{name}/issues/{number}")))
+}
+
+async fn apply_issue_comment_reaction(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    comment_id: &str,
+    form: &ReactionForm,
+) -> Result<(String, String, bool, Vec<ReactionSummary>), AppError> {
+    let emoji = clean_reaction_form(headers, form)?;
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
+    let issue = state
+        .store
+        .get_issue(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such issue.".to_string()))?;
+    let comments = state.store.list_comments(&issue.id).await?;
+    if !comments.iter().any(|comment| comment.id == comment_id) {
+        return Err(AppError::NotFound("No such comment.".to_string()));
+    }
+    let selected = state
+        .store
+        .toggle_reaction(
+            &format!("rx_{}", random_alnum(REACTION_ID_LEN)),
+            REACTION_TARGET_COMMENT,
+            comment_id,
+            &who.subject,
+            &emoji,
+            now_secs(),
+        )
+        .await?;
+    let reactions = state
+        .store
+        .list_reactions_for_target(REACTION_TARGET_COMMENT, comment_id, &who.subject)
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        target = comment_id,
+        emoji = emoji,
+        selected,
+        actor = who.subject,
+        "issue comment reaction toggled"
+    );
+    Ok((comment_id.to_string(), emoji, selected, reactions))
+}
+
+fn clean_reaction_form(headers: &HeaderMap, form: &ReactionForm) -> Result<String, AppError> {
+    if !auth::verify_csrf(headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let emoji = form.emoji.trim();
+    if !is_valid_reaction_emoji(emoji) {
+        return Err(AppError::BadRequest(
+            "Choose a supported reaction.".to_string(),
+        ));
+    }
+    Ok(emoji.to_string())
 }
 
 // ===========================================================================
@@ -1124,6 +1331,8 @@ fn render_detail(
     labels: &[Label],
     issue_labels: &[Label],
     milestones: &[Milestone],
+    issue_reactions: &[ReactionSummary],
+    comment_reactions: &ReactionMap,
     header: &str,
     can_toggle: bool,
     csrf: &str,
@@ -1163,9 +1372,25 @@ fn render_detail(
     } else {
         comments
             .iter()
-            .map(|c| render_comment(repo, c))
+            .map(|c| {
+                let reactions = comment_reactions
+                    .get(&c.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                render_comment(repo, issue, c, reactions, csrf)
+            })
             .collect::<String>()
     };
+    let issue_reactions = render_reactions(
+        &format!(
+            "/r/{}/{}/issues/{}/reactions",
+            repo.owner_sub, repo.name, issue.number
+        ),
+        REACTION_TARGET_ISSUE,
+        &issue.id,
+        issue_reactions,
+        csrf,
+    );
 
     // Moderator action: close (open issue) / reopen (closed issue). Its own <form> — NEVER nested
     // inside the comment form (nested forms are invalid HTML).
@@ -1222,7 +1447,7 @@ fn render_detail(
 </div>
 <section class="card">
   <div class="card__head"><h2>Description</h2></div>
-  <div class="card__body">{body_html}</div>
+  <div class="card__body">{body_html}{issue_reactions}</div>
 </section>
 <section class="card">
   <div class="card__head"><h2>Comments <span class="tab__count">{ncomments}</span></h2></div>
@@ -1257,6 +1482,7 @@ fn render_detail(
         milestone = milestone,
         label_chips = label_chips,
         body_html = body_html,
+        issue_reactions = issue_reactions,
         ncomments = comments.len(),
         comment_list = comment_list,
         error_block = error_block,
@@ -1268,7 +1494,13 @@ fn render_detail(
 }
 
 /// One comment in the thread (author + timestamp meta, then the sanitised markdown body).
-fn render_comment(repo: &Repo, comment: &IssueComment) -> String {
+fn render_comment(
+    repo: &Repo,
+    issue: &Issue,
+    comment: &IssueComment,
+    reactions: &[ReactionSummary],
+    csrf: &str,
+) -> String {
     let body_html = if comment.body.trim().is_empty() {
         String::new()
     } else {
@@ -1277,13 +1509,25 @@ fn render_comment(repo: &Repo, comment: &IssueComment) -> String {
             crate::markdown::render_for_repo(&comment.body, &repo.owner_sub, &repo.name)
         )
     };
+    let reactions = render_reactions(
+        &format!(
+            "/r/{}/{}/issues/{}/comments/{}/reactions",
+            repo.owner_sub, repo.name, issue.number, comment.id
+        ),
+        REACTION_TARGET_COMMENT,
+        &comment.id,
+        reactions,
+        csrf,
+    );
     format!(
         r##"<li class="issue-item">
   <div class="issue-item__meta"><span>{author}</span> commented {when}</div>
   {body_html}
+  {reactions}
 </li>"##,
         author = esc(&comment.author_sub),
         when = esc(&fmt_ts(comment.created_at)),
         body_html = body_html,
+        reactions = reactions,
     )
 }

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
 use serde::Deserialize;
@@ -24,10 +24,14 @@ use crate::config::{COMMIT_LIMIT, MAX_BLOB_RENDER_BYTES};
 use crate::error::AppError;
 use crate::gitops::{CommitInfo, MergeStrategy, Mergeability as GitMergeability};
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
-use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect, short_oid};
+use crate::handlers::{
+    accepts_json, esc, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
+    reaction_summaries_json, redirect, render_reactions, short_oid, REACTION_TARGET_COMMENT,
+    REACTION_TARGET_PULL,
+};
 use crate::model::{
     CommitStatus, Label, Milestone, PrFileViewed, PrThreadResolved, Pull, PullReview,
-    PullReviewComment, Repo,
+    PullReviewComment, ReactionSummary, Repo,
 };
 use crate::webhooks;
 use crate::{now_secs, random_alnum, AppState};
@@ -35,6 +39,7 @@ use crate::{now_secs, random_alnum, AppState};
 const PULL_ID_LEN: usize = 16;
 const REVIEW_ID_LEN: usize = 16;
 const REVIEW_COMMENT_ID_LEN: usize = 16;
+const REACTION_ID_LEN: usize = 16;
 const KLAXON_SOURCE: &str = "loom";
 const NOTIFY_TITLE_CHARS: usize = 96;
 const NOTIFY_BODY_CHARS: usize = 240;
@@ -208,6 +213,31 @@ async fn pr_header(state: &AppState, repo: &Repo, active: &str) -> String {
         release_count,
         active,
     )
+}
+
+type ReactionMap = BTreeMap<String, Vec<ReactionSummary>>;
+
+async fn load_pull_reactions(
+    state: &AppState,
+    pull: &Pull,
+    comments: &[PullReviewComment],
+    viewer_sub: &str,
+) -> Result<(Vec<ReactionSummary>, ReactionMap), AppError> {
+    let pull_reactions = state
+        .store
+        .list_reactions_for_target(REACTION_TARGET_PULL, &pull.id, viewer_sub)
+        .await?;
+    let mut comment_reactions = ReactionMap::new();
+    for comment in comments.iter().filter(|comment| !comment.pending) {
+        comment_reactions.insert(
+            comment.id.clone(),
+            state
+                .store
+                .list_reactions_for_target(REACTION_TARGET_COMMENT, &comment.id, viewer_sub)
+                .await?,
+        );
+    }
+    Ok((pull_reactions, comment_reactions))
 }
 
 /// True when `who` may merge/close a PR on `repo`: the repo owner (maintainer) or the PR author.
@@ -618,6 +648,8 @@ pub async fn detail(
         .store
         .list_pull_review_comments_for_viewer(&pull.id, &who.subject)
         .await?;
+    let (pull_reactions, comment_reactions) =
+        load_pull_reactions(&state, &pull, &review_comments, &who.subject).await?;
     let thread_resolutions = state.store.list_pr_thread_resolved(&pull.id).await?;
     let header = pr_header(&state, &repo, "pulls").await;
     let body = render_detail(
@@ -629,6 +661,8 @@ pub async fn detail(
         &milestones,
         &reviews,
         &review_comments,
+        &pull_reactions,
+        &comment_reactions,
         &thread_resolutions,
         &header,
         &who,
@@ -840,6 +874,8 @@ async fn render_detail_with_fresh_metadata(
         .store
         .list_pull_review_comments_for_viewer(&pull.id, &who.subject)
         .await?;
+    let (pull_reactions, comment_reactions) =
+        load_pull_reactions(state, pull, &review_comments, &who.subject).await?;
     let thread_resolutions = state.store.list_pr_thread_resolved(&pull.id).await?;
     render_detail(
         state,
@@ -850,6 +886,8 @@ async fn render_detail_with_fresh_metadata(
         &milestones,
         &reviews,
         &review_comments,
+        &pull_reactions,
+        &comment_reactions,
         &thread_resolutions,
         header,
         who,
@@ -1174,6 +1212,173 @@ async fn add_inline_comment(
 }
 
 // ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/reactions — toggle PR reaction
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ReactionForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub emoji: String,
+}
+
+pub async fn react_pull(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<ReactionForm>,
+) -> Result<Response, AppError> {
+    let (target_id, emoji, selected, reactions) =
+        apply_pull_reaction(&state, &headers, &owner, &name, number, &form).await?;
+    if accepts_json(&headers) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "target_type": REACTION_TARGET_PULL,
+            "target_id": target_id,
+            "emoji": emoji,
+            "selected": selected,
+            "reactions": reaction_summaries_json(&reactions),
+        }))
+        .into_response());
+    }
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+async fn apply_pull_reaction(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    form: &ReactionForm,
+) -> Result<(String, String, bool, Vec<ReactionSummary>), AppError> {
+    let emoji = clean_reaction_form(headers, form)?;
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    let selected = state
+        .store
+        .toggle_reaction(
+            &format!("rx_{}", random_alnum(REACTION_ID_LEN)),
+            REACTION_TARGET_PULL,
+            &pull.id,
+            &who.subject,
+            &emoji,
+            now_secs(),
+        )
+        .await?;
+    let reactions = state
+        .store
+        .list_reactions_for_target(REACTION_TARGET_PULL, &pull.id, &who.subject)
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        target = pull.id,
+        emoji = emoji,
+        selected,
+        actor = who.subject,
+        "pull reaction toggled"
+    );
+    Ok((pull.id, emoji, selected, reactions))
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/comments/{comment_id}/reactions
+// ===========================================================================
+
+pub async fn react_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number, comment_id)): Path<(String, String, i64, String)>,
+    Form(form): Form<ReactionForm>,
+) -> Result<Response, AppError> {
+    let (target_id, emoji, selected, reactions) =
+        apply_pull_comment_reaction(&state, &headers, &owner, &name, number, &comment_id, &form)
+            .await?;
+    if accepts_json(&headers) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "target_type": REACTION_TARGET_COMMENT,
+            "target_id": target_id,
+            "emoji": emoji,
+            "selected": selected,
+            "reactions": reaction_summaries_json(&reactions),
+        }))
+        .into_response());
+    }
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+async fn apply_pull_comment_reaction(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    comment_id: &str,
+    form: &ReactionForm,
+) -> Result<(String, String, bool, Vec<ReactionSummary>), AppError> {
+    let emoji = clean_reaction_form(headers, form)?;
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    let comments = state.store.list_pull_review_comments(&pull.id).await?;
+    if !comments.iter().any(|comment| comment.id == comment_id) {
+        return Err(AppError::NotFound("No such comment.".to_string()));
+    }
+    let selected = state
+        .store
+        .toggle_reaction(
+            &format!("rx_{}", random_alnum(REACTION_ID_LEN)),
+            REACTION_TARGET_COMMENT,
+            comment_id,
+            &who.subject,
+            &emoji,
+            now_secs(),
+        )
+        .await?;
+    let reactions = state
+        .store
+        .list_reactions_for_target(REACTION_TARGET_COMMENT, comment_id, &who.subject)
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        target = comment_id,
+        emoji = emoji,
+        selected,
+        actor = who.subject,
+        "pull comment reaction toggled"
+    );
+    Ok((comment_id.to_string(), emoji, selected, reactions))
+}
+
+fn clean_reaction_form(headers: &HeaderMap, form: &ReactionForm) -> Result<String, AppError> {
+    if !auth::verify_csrf(headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let emoji = form.emoji.trim();
+    if !is_valid_reaction_emoji(emoji) {
+        return Err(AppError::BadRequest(
+            "Choose a supported reaction.".to_string(),
+        ));
+    }
+    Ok(emoji.to_string())
+}
+
+// ===========================================================================
 // POST /r/{owner}/{name}/pulls/{number}/file-viewed — per-user file viewed state
 // ===========================================================================
 
@@ -1251,17 +1456,6 @@ async fn apply_file_viewed(
         "pull file viewed state changed"
     );
     Ok(row)
-}
-
-fn accepts_json(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .any(|part| part.trim().starts_with("application/json"))
-        })
-        .unwrap_or(false)
 }
 
 // ===========================================================================
@@ -2002,6 +2196,8 @@ async fn render_detail(
     milestones: &[Milestone],
     reviews: &[PullReview],
     review_comments: &[PullReviewComment],
+    pull_reactions: &[ReactionSummary],
+    comment_reactions: &ReactionMap,
     thread_resolutions: &[PrThreadResolved],
     header: &str,
     who: &Identity,
@@ -2040,6 +2236,16 @@ async fn render_detail(
             crate::markdown::render_for_repo(&pull.body, &repo.owner_sub, &repo.name)
         )
     };
+    let pull_reactions = render_reactions(
+        &format!(
+            "/r/{}/{}/pulls/{}/reactions",
+            repo.owner_sub, repo.name, pull.number
+        ),
+        REACTION_TARGET_PULL,
+        &pull.id,
+        pull_reactions,
+        csrf,
+    );
 
     // Commits + diff for the (still current) base..head range.
     let commits = state
@@ -2107,6 +2313,7 @@ async fn render_detail(
         repo,
         reviews,
         review_comments,
+        comment_reactions,
         thread_resolutions,
         &review_requirements_html,
         csrf,
@@ -2260,7 +2467,7 @@ async fn render_detail(
 </div>
 <section class="card">
   <div class="card__head"><h2>Description</h2></div>
-  <div class="card__body">{body_html}</div>
+  <div class="card__body">{body_html}{pull_reactions}</div>
 </section>
 {checks_card}
 {commits_card}
@@ -2289,6 +2496,7 @@ async fn render_detail(
         label_chips = label_chips,
         review_badges = review_badges,
         body_html = body_html,
+        pull_reactions = pull_reactions,
         checks_card = checks_card,
         reviews_card = reviews_card,
         metadata_form = metadata_form,
@@ -2824,6 +3032,7 @@ fn render_reviews_card(
     repo: &Repo,
     reviews: &[PullReview],
     comments: &[PullReviewComment],
+    comment_reactions: &ReactionMap,
     thread_resolutions: &[PrThreadResolved],
     requirements_html: &str,
     csrf: &str,
@@ -2861,8 +3070,15 @@ fn render_reviews_card(
             .collect::<String>()
     };
     let can_resolve = can_review(repo, pull, who, headers);
-    let inline_rows =
-        render_inline_threads(repo, comments, thread_resolutions, csrf, pull, can_resolve);
+    let inline_rows = render_inline_threads(
+        repo,
+        comments,
+        comment_reactions,
+        thread_resolutions,
+        csrf,
+        pull,
+        can_resolve,
+    );
     let forms = if can_resolve {
         let pending_review = if pending_count == 0 {
             String::new()
@@ -3013,6 +3229,7 @@ fn unresolved_thread_count(
 fn render_inline_threads(
     repo: &Repo,
     comments: &[PullReviewComment],
+    comment_reactions: &ReactionMap,
     thread_resolutions: &[PrThreadResolved],
     csrf: &str,
     pull: &Pull,
@@ -3027,7 +3244,8 @@ fn render_inline_threads(
         .map(|thread| {
             let has_published = thread.comments.iter().any(|comment| !comment.pending);
             let resolution = resolved_thread(&thread.key, thread_resolutions);
-            let comments_html = render_inline_thread_comments(repo, &thread.comments);
+            let comments_html =
+                render_inline_thread_comments(repo, pull, &thread.comments, comment_reactions, csrf);
             let count_label = comment_count_label(thread.comments.len());
             let anchor = format!("{}:{}", esc(&thread.path), thread.line);
             let form = if can_resolve && has_published {
@@ -3082,7 +3300,13 @@ fn render_inline_threads(
         .collect::<String>()
 }
 
-fn render_inline_thread_comments(repo: &Repo, comments: &[&PullReviewComment]) -> String {
+fn render_inline_thread_comments(
+    repo: &Repo,
+    pull: &Pull,
+    comments: &[&PullReviewComment],
+    comment_reactions: &ReactionMap,
+    csrf: &str,
+) -> String {
     comments
         .iter()
         .map(|comment| {
@@ -3096,16 +3320,36 @@ fn render_inline_thread_comments(repo: &Repo, comments: &[&PullReviewComment]) -
             } else {
                 "commented"
             };
+            let reactions = if comment.pending {
+                String::new()
+            } else {
+                let summaries = comment_reactions
+                    .get(&comment.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                render_reactions(
+                    &format!(
+                        "/r/{}/{}/pulls/{}/comments/{}/reactions",
+                        repo.owner_sub, repo.name, pull.number, comment.id
+                    ),
+                    REACTION_TARGET_COMMENT,
+                    &comment.id,
+                    summaries,
+                    csrf,
+                )
+            };
             format!(
                 r##"<div class="{item_class}">
   <div class="issue-item__meta">{author} {action} {when}</div>
   <div class="issue-item__body markdown-body">{body}</div>
+  {reactions}
 </div>"##,
                 item_class = item_class,
                 author = esc(&comment.author_sub),
                 action = action,
                 when = esc(&fmt_ts(comment.created_at)),
                 body = crate::markdown::render_for_repo(&comment.body, &repo.owner_sub, &repo.name),
+                reactions = reactions,
             )
         })
         .collect::<String>()

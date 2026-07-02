@@ -110,6 +110,31 @@ pub struct IssueComment {
     pub created_at: i64,
 }
 
+/// One emoji reaction on an issue, pull request, or comment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Target kind: `issue`, `pull`, or `comment`.
+    pub target_type: String,
+    /// Target row id from the matching table.
+    pub target_id: String,
+    /// Reacting user subject from `X-Auth-Subject`.
+    pub user_sub: String,
+    /// Whitelisted emoji glyph.
+    pub emoji: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+}
+
+/// Aggregated reaction count for one emoji plus whether the current viewer selected it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionSummary {
+    pub emoji: String,
+    pub count: i64,
+    pub viewer_selected: bool,
+}
+
 /// A pull request: a request to merge the `head` branch into the `base` branch of one repository.
 /// Field order/types mirror the `pulls` table exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
