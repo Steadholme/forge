@@ -21,7 +21,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::config::{COMMIT_LIMIT, MAX_BLOB_RENDER_BYTES};
 use crate::error::AppError;
-use crate::gitops::CommitInfo;
+use crate::gitops::{CommitInfo, MergeStrategy};
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
 use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect, short_oid};
 use crate::model::{
@@ -478,6 +478,8 @@ pub async fn detail(
 pub struct MergeForm {
     #[serde(default)]
     pub csrf_token: String,
+    #[serde(default)]
+    pub merge_method: String,
 }
 
 pub async fn merge(
@@ -491,6 +493,7 @@ pub async fn merge(
             "Your session token expired. Reload the page and try again.".to_string(),
         ));
     }
+    let strategy = parse_merge_strategy(&form.merge_method)?;
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
     let pull = state
@@ -563,15 +566,11 @@ pub async fn merge(
     let closing_commits = commits_for_closing(&state, &repo, &pull).await;
     let closing_issues = closing_issue_numbers(&pull.body, &closing_commits);
 
-    let message = format!(
-        "Merge pull request #{number} from {head}\n\n{title}",
-        head = pull.head,
-        title = pull.title,
-    );
+    let message = merge_message(&pull, strategy);
     // Perform the on-disk merge FIRST; only mark the PR merged once git has advanced the ref.
     match state
         .git
-        .merge(
+        .merge_with_strategy(
             &repo.owner_sub,
             &repo.name,
             &pull.base,
@@ -579,6 +578,7 @@ pub async fn merge(
             &message,
             &who.subject,
             &who.email,
+            strategy,
         )
         .await
     {
@@ -590,6 +590,7 @@ pub async fn merge(
                 number = pull.number,
                 base = pull.base,
                 head = pull.head,
+                strategy = ?strategy,
                 actor = who.subject,
                 outcome = ?outcome,
                 "pull request merged"
@@ -621,6 +622,36 @@ pub async fn merge(
                 &csrf,
             ))
         }
+    }
+}
+
+fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy, AppError> {
+    match raw.trim() {
+        "" | "merge" => Ok(MergeStrategy::Merge),
+        "squash" => Ok(MergeStrategy::Squash),
+        "rebase" => Ok(MergeStrategy::Rebase),
+        _ => Err(AppError::BadRequest(
+            "Choose a valid merge method.".to_string(),
+        )),
+    }
+}
+
+fn merge_message(pull: &Pull, strategy: MergeStrategy) -> String {
+    match strategy {
+        MergeStrategy::Merge => format!(
+            "Merge pull request #{} from {}\n\n{}",
+            pull.number, pull.head, pull.title,
+        ),
+        MergeStrategy::Squash => {
+            let title = pull.title.trim();
+            let body = pull.body.trim();
+            if body.is_empty() {
+                title.to_string()
+            } else {
+                format!("{title}\n\n{body}")
+            }
+        }
+        MergeStrategy::Rebase => String::new(),
     }
 }
 
@@ -1895,10 +1926,17 @@ async fn render_detail(
     } else if pull.is_open() && can_gate(repo, pull, who) {
         format!(
             r##"<div class="pr-actions">
-  <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/merge">
+  <form class="inline-form merge-strategy" method="post" action="/r/{owner}/{name}/pulls/{number}/merge">
     <input type="hidden" name="csrf_token" value="{csrf}">
+    <label class="merge-strategy__label" for="merge-method-{number}">Merge method</label>
+    <select id="merge-method-{number}" class="merge-method-select" name="merge_method">
+      <option value="merge" selected>Merge commit</option>
+      <option value="squash">Squash and merge</option>
+      <option value="rebase">Rebase and merge</option>
+    </select>
     <button class="btn btn-primary" type="submit">Merge pull request</button>
   </form>
+  <p class="muted merge-strategy__note">All merge methods are enabled for this repository.</p>
   <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/draft">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <button class="btn btn-secondary btn-convert-draft" type="submit">Convert to draft</button>

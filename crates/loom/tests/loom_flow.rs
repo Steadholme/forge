@@ -987,6 +987,66 @@ fn seed_two_branches(git_dir: &str) -> String {
     commit_b
 }
 
+fn commit_files(
+    git_dir: &str,
+    parent: Option<&str>,
+    message: &str,
+    files: &[(&str, &str)],
+) -> String {
+    let mut tree = String::new();
+    for (path, content) in files {
+        let blob = git_capture(git_dir, &["hash-object", "-w", "--stdin"], content);
+        tree.push_str(&format!("100644 blob {blob}\t{path}\n"));
+    }
+    let tree_oid = git_capture(git_dir, &["mktree"], &tree);
+    match parent {
+        Some(parent) => git_capture(
+            git_dir,
+            &["commit-tree", &tree_oid, "-p", parent, "-m", message],
+            "",
+        ),
+        None => git_capture(git_dir, &["commit-tree", &tree_oid, "-m", message], ""),
+    }
+}
+
+async fn open_pull(
+    app: &axum::Router,
+    repo: &str,
+    base: &str,
+    head: &str,
+    title: &str,
+    body: &str,
+    subject: &str,
+) {
+    let cmp = send(
+        app,
+        get(
+            &format!("/r/{repo}/compare?base={base}&head={head}"),
+            Some(subject),
+        ),
+    )
+    .await;
+    assert_eq!(cmp.status, StatusCode::OK);
+    let csrf = cmp.csrf_cookie().expect("csrf on compare");
+    let created = send(
+        app,
+        post_form(
+            &format!("/r/{repo}/pulls"),
+            &[
+                ("csrf_token", &csrf),
+                ("base", base),
+                ("head", head),
+                ("title", title),
+                ("body", body),
+            ],
+            &csrf,
+            Some(subject),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+}
+
 #[tokio::test]
 async fn pull_request_compare_create_and_merge() {
     let state = temp_state();
@@ -1059,7 +1119,7 @@ async fn pull_request_compare_create_and_merge() {
     assert!(!detail.body.contains("Merge pull request"));
     assert!(detail.body.contains("Draft pull requests cannot be merged"));
     assert!(detail.body.contains("btn-ready-review"));
-    assert!(!detail.body.contains("btn-convert-draft"));
+    assert!(!detail.body.contains(">Convert to draft</button>"));
     assert!(detail.body.contains("assignee bob"));
     assert!(detail.body.contains("reviewer carol"));
     assert!(detail.body.contains("class=\"pr-filetree\""));
@@ -1121,7 +1181,14 @@ async fn pull_request_compare_create_and_merge() {
 
     let ready_detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
     assert!(ready_detail.body.contains("Merge pull request"));
-    assert!(ready_detail.body.contains("btn-convert-draft"));
+    assert!(ready_detail.body.contains("merge-strategy"));
+    assert!(ready_detail.body.contains("merge-method-select"));
+    assert!(ready_detail.body.contains("name=\"merge_method\""));
+    assert!(ready_detail.body.contains("value=\"merge\" selected"));
+    assert!(ready_detail.body.contains("value=\"squash\""));
+    assert!(ready_detail.body.contains("value=\"rebase\""));
+    assert!(ready_detail.body.contains("All merge methods are enabled"));
+    assert!(ready_detail.body.contains(">Convert to draft</button>"));
     let csrf = ready_detail.csrf_cookie().expect("csrf on ready detail");
     let converted = send(
         &app,
@@ -1290,6 +1357,217 @@ async fn pull_request_compare_create_and_merge() {
         StatusCode::BAD_REQUEST,
         "merged PR is terminal"
     );
+}
+
+#[tokio::test]
+async fn pull_request_squash_merge_creates_single_commit() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+
+    let base = commit_files(&git_dir, None, "base", &[("file.txt", "base\n")]);
+    git_capture(&git_dir, &["update-ref", "refs/heads/main", &base], "");
+    let feature_one = commit_files(
+        &git_dir,
+        Some(&base),
+        "feature one",
+        &[("file.txt", "base\none\n")],
+    );
+    let feature_tip = commit_files(
+        &git_dir,
+        Some(&feature_one),
+        "feature two",
+        &[("file.txt", "base\none\ntwo\n")],
+    );
+    git_capture(
+        &git_dir,
+        &["update-ref", "refs/heads/feature", &feature_tip],
+        "",
+    );
+
+    open_pull(
+        &app,
+        "alice/proj",
+        "main",
+        "feature",
+        "Squash title",
+        "Squash body",
+        "alice",
+    )
+    .await;
+
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = detail.csrf_cookie().expect("csrf on detail");
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf), ("merge_method", "squash")],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(merged.status, StatusCode::FOUND);
+
+    let main_oid = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_ne!(main_oid, feature_tip, "squash writes a new commit");
+    let parents = git_capture(
+        &git_dir,
+        &["rev-list", "--parents", "-n", "1", "refs/heads/main"],
+        "",
+    );
+    let parts = parents.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(parts, vec![main_oid.as_str(), base.as_str()]);
+    let message = git_capture(
+        &git_dir,
+        &["log", "-1", "--pretty=%B", "refs/heads/main"],
+        "",
+    );
+    assert_eq!(message, "Squash title\n\nSquash body");
+    let file = git_capture(&git_dir, &["show", "refs/heads/main:file.txt"], "");
+    assert_eq!(file, "base\none\ntwo");
+    assert!(store
+        .get_pull(&repo.id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_merged());
+}
+
+#[tokio::test]
+async fn pull_request_rebase_merge_replays_commits() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+
+    let base = commit_files(&git_dir, None, "base", &[("base.txt", "base\n")]);
+    let main_tip = commit_files(
+        &git_dir,
+        Some(&base),
+        "main update",
+        &[("base.txt", "base\n"), ("main.txt", "main\n")],
+    );
+    git_capture(&git_dir, &["update-ref", "refs/heads/main", &main_tip], "");
+    let feature_one = commit_files(
+        &git_dir,
+        Some(&base),
+        "feature one",
+        &[("base.txt", "base\n"), ("feature.txt", "one\n")],
+    );
+    let feature_tip = commit_files(
+        &git_dir,
+        Some(&feature_one),
+        "feature two",
+        &[("base.txt", "base\n"), ("feature.txt", "one\ntwo\n")],
+    );
+    git_capture(
+        &git_dir,
+        &["update-ref", "refs/heads/feature", &feature_tip],
+        "",
+    );
+
+    open_pull(
+        &app,
+        "alice/proj",
+        "main",
+        "feature",
+        "Rebase title",
+        "",
+        "alice",
+    )
+    .await;
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = detail.csrf_cookie().expect("csrf on detail");
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf), ("merge_method", "rebase")],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(merged.status, StatusCode::FOUND);
+
+    let main_oid = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_ne!(main_oid, feature_tip, "rebase writes replayed commits");
+    let range = format!("{base}..refs/heads/main");
+    let subjects = git_capture(&git_dir, &["log", "--pretty=%s", "--reverse", &range], "");
+    assert_eq!(subjects, "main update\nfeature one\nfeature two");
+    let parent_subject = git_capture(&git_dir, &["log", "-1", "--pretty=%s", "HEAD^"], "");
+    assert_eq!(parent_subject, "feature one");
+    let author = git_capture(&git_dir, &["log", "-1", "--pretty=%an <%ae>", "HEAD"], "");
+    assert_eq!(author, "Seed <seed@w33d.xyz>");
+    let committer = git_capture(&git_dir, &["log", "-1", "--pretty=%cn <%ce>", "HEAD"], "");
+    assert_eq!(committer, "alice <alice@w33d.xyz>");
+    let feature_file = git_capture(&git_dir, &["show", "refs/heads/main:feature.txt"], "");
+    assert_eq!(feature_file, "one\ntwo");
+    let main_file = git_capture(&git_dir, &["show", "refs/heads/main:main.txt"], "");
+    assert_eq!(main_file, "main");
+}
+
+#[tokio::test]
+async fn pull_request_rebase_conflict_leaves_base_ref_unchanged() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+
+    let base = commit_files(&git_dir, None, "base", &[("file.txt", "base\n")]);
+    let main_tip = commit_files(
+        &git_dir,
+        Some(&base),
+        "main edit",
+        &[("file.txt", "main\n")],
+    );
+    git_capture(&git_dir, &["update-ref", "refs/heads/main", &main_tip], "");
+    let feature_tip = commit_files(
+        &git_dir,
+        Some(&base),
+        "feature edit",
+        &[("file.txt", "feature\n")],
+    );
+    git_capture(
+        &git_dir,
+        &["update-ref", "refs/heads/feature", &feature_tip],
+        "",
+    );
+
+    open_pull(
+        &app,
+        "alice/proj",
+        "main",
+        "feature",
+        "Conflict title",
+        "",
+        "alice",
+    )
+    .await;
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = detail.csrf_cookie().expect("csrf on detail");
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf), ("merge_method", "rebase")],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(merged.status, StatusCode::CONFLICT);
+    assert!(merged.body.contains("Could not merge automatically"));
+    let main_after = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_eq!(main_after, main_tip, "conflict did not move base ref");
 }
 
 #[tokio::test]

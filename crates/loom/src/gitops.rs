@@ -21,6 +21,8 @@ use tokio::process::Command;
 
 use crate::config::Config;
 
+const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /// A single entry in a tree listing (one row of `git ls-tree`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeEntry {
@@ -145,6 +147,18 @@ pub enum MergeOutcome {
     FastForward,
     /// A two-parent merge commit (its OID) was created and `base` advanced to it.
     MergeCommit(String),
+    /// A one-parent squash commit (its OID) was created and `base` advanced to it.
+    SquashCommit(String),
+    /// The final replayed commit OID was created and `base` advanced to it.
+    RebaseCommit(String),
+}
+
+/// Pull-request merge strategy selected by the web form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeStrategy {
+    Merge,
+    Squash,
+    Rebase,
 }
 
 /// Parsed CGI response from `git http-backend`.
@@ -701,6 +715,32 @@ impl GitOps {
         author_name: &str,
         author_email: &str,
     ) -> Result<MergeOutcome, String> {
+        self.merge_with_strategy(
+            owner,
+            name,
+            base,
+            head,
+            message,
+            author_name,
+            author_email,
+            MergeStrategy::Merge,
+        )
+        .await
+    }
+
+    /// Server-side pull-request integration using the selected strategy. All strategies resolve
+    /// refs first and move the base branch only through the final compare-and-swap `update-ref`.
+    pub async fn merge_with_strategy(
+        &self,
+        owner: &str,
+        name: &str,
+        base: &str,
+        head: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+        strategy: MergeStrategy,
+    ) -> Result<MergeOutcome, String> {
         let repo = self.repo_path(owner, name);
         let dir = repo.to_string_lossy().to_string();
         let base_ref = format!("refs/heads/{base}");
@@ -720,27 +760,139 @@ impl GitOps {
             return Ok(MergeOutcome::AlreadyUpToDate);
         }
 
+        match strategy {
+            MergeStrategy::Merge => {
+                self.merge_refs(
+                    &dir,
+                    &base_ref,
+                    &base_oid,
+                    &head_oid,
+                    message,
+                    author_name,
+                    author_email,
+                )
+                .await
+            }
+            MergeStrategy::Squash => {
+                self.squash_refs(
+                    &dir,
+                    &base_ref,
+                    &base_oid,
+                    &head_oid,
+                    message,
+                    author_name,
+                    author_email,
+                )
+                .await
+            }
+            MergeStrategy::Rebase => {
+                self.rebase_refs(
+                    &dir,
+                    &base_ref,
+                    &base_oid,
+                    &head_oid,
+                    author_name,
+                    author_email,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn merge_refs(
+        &self,
+        dir: &str,
+        base_ref: &str,
+        base_oid: &str,
+        head_oid: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<MergeOutcome, String> {
         // Base is an ancestor of head — a clean fast-forward.
-        if self.is_ancestor(&dir, &base_oid, &head_oid).await {
-            self.update_ref(&dir, &base_ref, &head_oid, &base_oid)
-                .await?;
+        if self.is_ancestor(dir, base_oid, head_oid).await {
+            self.update_ref(dir, base_ref, head_oid, base_oid).await?;
             return Ok(MergeOutcome::FastForward);
         }
 
         // Divergent histories — compute a merged tree and record a two-parent merge commit.
-        let tree = self.merge_tree(&dir, &base_oid, &head_oid).await?;
+        let tree = self.merge_tree(dir, base_oid, head_oid).await?;
         let commit = self
             .commit_tree(
-                &dir,
+                dir,
                 &tree,
-                &[&base_oid, &head_oid],
+                &[base_oid, head_oid],
                 message,
                 author_name,
                 author_email,
             )
             .await?;
-        self.update_ref(&dir, &base_ref, &commit, &base_oid).await?;
+        self.update_ref(dir, base_ref, &commit, base_oid).await?;
         Ok(MergeOutcome::MergeCommit(commit))
+    }
+
+    async fn squash_refs(
+        &self,
+        dir: &str,
+        base_ref: &str,
+        base_oid: &str,
+        head_oid: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<MergeOutcome, String> {
+        let tree = self.merge_tree(dir, base_oid, head_oid).await?;
+        let commit = self
+            .commit_tree(dir, &tree, &[base_oid], message, author_name, author_email)
+            .await?;
+        self.update_ref(dir, base_ref, &commit, base_oid).await?;
+        Ok(MergeOutcome::SquashCommit(commit))
+    }
+
+    async fn rebase_refs(
+        &self,
+        dir: &str,
+        base_ref: &str,
+        base_oid: &str,
+        head_oid: &str,
+        committer_name: &str,
+        committer_email: &str,
+    ) -> Result<MergeOutcome, String> {
+        let commits = self.rev_list_reverse(dir, base_oid, head_oid).await?;
+        if commits.is_empty() {
+            return Ok(MergeOutcome::AlreadyUpToDate);
+        }
+
+        let mut current = base_oid.to_string();
+        for commit in commits {
+            let parents = self.commit_parents(dir, &commit).await?;
+            if parents.len() > 1 {
+                return Err("rebase merge cannot replay merge commits".to_string());
+            }
+            let merge_base = parents
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or(EMPTY_TREE_OID);
+            let tree = self
+                .merge_tree_with_base(dir, merge_base, &current, &commit)
+                .await?;
+            let meta = self.commit_metadata(dir, &commit).await?;
+            current = self
+                .commit_tree_with_identities(
+                    dir,
+                    &tree,
+                    &[&current],
+                    &meta.message,
+                    &meta.author_name,
+                    &meta.author_email,
+                    committer_name,
+                    committer_email,
+                )
+                .await?;
+        }
+
+        self.update_ref(dir, base_ref, &current, base_oid).await?;
+        Ok(MergeOutcome::RebaseCommit(current))
     }
 
     /// `git rev-parse --verify --quiet <refspec>` → the resolved OID, or `None` if it does not
@@ -793,6 +945,41 @@ impl GitOps {
             .ok_or_else(|| "merge-tree produced no tree".to_string())
     }
 
+    async fn merge_tree_with_base(
+        &self,
+        dir: &str,
+        merge_base: &str,
+        current: &str,
+        commit: &str,
+    ) -> Result<String, String> {
+        let out = self
+            .run_git_in_capture(
+                dir,
+                &[
+                    "merge-tree",
+                    "--write-tree",
+                    "--merge-base",
+                    merge_base,
+                    current,
+                    commit,
+                ],
+            )
+            .await
+            .map_err(|e| format!("merge-tree failed: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !out.status {
+            return Err(
+                "the rebase has conflicting changes that must be resolved manually".to_string(),
+            );
+        }
+        stdout
+            .lines()
+            .next()
+            .map(|l| l.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "merge-tree produced no tree".to_string())
+    }
+
     /// `git commit-tree <tree> -p <parent>… -m <message>` with the merging user's identity as both
     /// author and committer → the new commit OID.
     async fn commit_tree(
@@ -804,6 +991,30 @@ impl GitOps {
         author_name: &str,
         author_email: &str,
     ) -> Result<String, String> {
+        self.commit_tree_with_identities(
+            dir,
+            tree,
+            parents,
+            message,
+            author_name,
+            author_email,
+            author_name,
+            author_email,
+        )
+        .await
+    }
+
+    async fn commit_tree_with_identities(
+        &self,
+        dir: &str,
+        tree: &str,
+        parents: &[&str],
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+        committer_name: &str,
+        committer_email: &str,
+    ) -> Result<String, String> {
         let mut args: Vec<&str> = vec!["commit-tree", tree];
         for p in parents {
             args.push("-p");
@@ -814,8 +1025,8 @@ impl GitOps {
         let env = [
             ("GIT_AUTHOR_NAME", author_name),
             ("GIT_AUTHOR_EMAIL", author_email),
-            ("GIT_COMMITTER_NAME", author_name),
-            ("GIT_COMMITTER_EMAIL", author_email),
+            ("GIT_COMMITTER_NAME", committer_name),
+            ("GIT_COMMITTER_EMAIL", committer_email),
         ];
         let out = self
             .run_git_capture_env(dir, &args, &env)
@@ -830,6 +1041,72 @@ impl GitOps {
         } else {
             Ok(oid)
         }
+    }
+
+    async fn rev_list_reverse(
+        &self,
+        dir: &str,
+        base_oid: &str,
+        head_oid: &str,
+    ) -> Result<Vec<String>, String> {
+        let range = format!("{base_oid}..{head_oid}");
+        let out = self
+            .run_git_in_capture(dir, &["rev-list", "--reverse", &range])
+            .await
+            .map_err(|e| format!("rev-list failed: {e}"))?;
+        if !out.status {
+            return Err("could not list commits to rebase".to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect())
+    }
+
+    async fn commit_parents(&self, dir: &str, commit: &str) -> Result<Vec<String>, String> {
+        let out = self
+            .run_git_in_capture(dir, &["rev-list", "--parents", "-n", "1", commit])
+            .await
+            .map_err(|e| format!("rev-list failed: {e}"))?;
+        if !out.status {
+            return Err("could not inspect commit parents".to_string());
+        }
+        let line = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some(oid) if oid == commit => Ok(parts.map(ToString::to_string).collect()),
+            _ => Err("could not inspect commit parents".to_string()),
+        }
+    }
+
+    async fn commit_metadata(&self, dir: &str, commit: &str) -> Result<ReplayCommit, String> {
+        let out = self
+            .run_git_in_capture(dir, &["show", "-s", "--format=%an%x00%ae%x00%B", commit])
+            .await
+            .map_err(|e| format!("show failed: {e}"))?;
+        if !out.status {
+            return Err("could not inspect commit metadata".to_string());
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let mut parts = raw.splitn(3, '\0');
+        let author_name = parts.next().unwrap_or("").trim_end_matches('\n');
+        let author_email = parts.next().unwrap_or("").trim_end_matches('\n');
+        let message = parts.next().unwrap_or("").trim_end_matches('\n');
+        if author_name.is_empty() || author_email.is_empty() || message.is_empty() {
+            return Err("could not inspect commit metadata".to_string());
+        }
+        Ok(ReplayCommit {
+            author_name: author_name.to_string(),
+            author_email: author_email.to_string(),
+            message: message.to_string(),
+        })
     }
 
     /// `git update-ref <ref> <new> <old>` — a compare-and-swap advance of a branch ref (fails if
@@ -981,6 +1258,12 @@ impl GitOps {
 struct CapturedOut {
     status: bool,
     stdout: Vec<u8>,
+}
+
+struct ReplayCommit {
+    author_name: String,
+    author_email: String,
+    message: String,
 }
 
 fn push_code_search_hit(files: &mut Vec<CodeSearchFile>, hit: CodeSearchHit) {
