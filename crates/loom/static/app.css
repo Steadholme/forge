@@ -1786,3 +1786,105 @@ mark.code-search-hit {
 /* Reduced motion: no transition/animation is introduced here, so the global
    guard needs no addition. Dark mode: every colour above resolves through the
    shared Odyssey tokens, so it follows the theme layer with no override. */
+
+/* ============================================================================
+   Repository outbound Webhooks — visual layer only
+   ----------------------------------------------------------------------------
+   The backend already emits every hook (see handlers/settings.rs ::
+   render_webhooks_card / render_webhook_item / render_webhook_event_checks).
+   This section only paints them; no markup is altered. DOM shape styled here:
+
+     section.card.webhook-settings > .card__head(h2) + .card__body
+       ul.webhook-list
+         li.webhook-item                              (one row per webhook)
+           .issue-item__head                          (reused issues idiom)
+             span.issue-item__title                   (payload URL — mono)
+             span.state-badge.state-badge--open|--closed   (Active | Paused)
+           .issue-item__meta                          ("Events: … · created …")
+           form.webhook-form.webhook-form--edit
+             .field > label + input[type=url]         (payload URL)
+             .field > label + input[type=password]    (secret, kept masked)
+             .field.webhook-events > span.field-label + label.check ×N
+             .field.field--check > label.check        (Active toggle)
+             .actions > button.btn.btn-secondary.btn-update-webhook
+           form.inline-form.webhook-delete-form
+             button.btn.btn-ghost.btn-sm.btn-delete-webhook
+         li.webhook-item.webhook-item--empty          (no webhooks configured)
+       form.webhook-form.webhook-form--new            (add-webhook composer)
+         … same field set … > button.btn.btn-secondary.btn-add-webhook
+
+   Reuses Odyssey v2 tokens + the .card / .issue-item / .state-badge / .field /
+   .check / .btn primitives only — no new fonts, libraries or external links.
+   Every colour resolves through the shared semantic tokens, so dark mode needs
+   no override; no motion is introduced, so the global prefers-reduced-motion
+   kill-switch at the top of this file already covers it.
+   ========================================================================== */
+
+/* 1. List — reset the bare <ul> (webhook-list is not in the shared list group)
+   and stack each hook as its own inset panel with breathing room between. */
+.webhook-list { list-style:none; margin:0; padding:0;
+  display:flex; flex-direction:column; gap:12px; }
+
+/* Each webhook = a soft inset panel with a status rail on the leading edge:
+   green (--ok) while Active, quiet (--ink-3) once Paused — state carried by hue
+   AND the .state-badge text, never colour alone. The rail flips via :has() off
+   the badge the SSR already stamps, degrading to the green default if unseen. */
+.webhook-item { display:flex; flex-direction:column; gap:10px;
+  padding:14px 16px 14px 13px;
+  background:var(--surface-2);
+  border:1px solid var(--border);
+  border-left:3px solid var(--ok);
+  border-radius:var(--r-sm); }
+.webhook-item:has(.state-badge--closed) { border-left-color:var(--ink-3); }
+
+/* Payload URL reads as an endpoint, so it takes the --mono face; the state
+   chip is pushed to the trailing edge of the head row. */
+.webhook-item .issue-item__head .state-badge { margin-left:auto; }
+.webhook-item .issue-item__title { font-family:var(--mono);
+  font-size:13px; font-weight:600; line-height:1.45; }
+
+/* Empty state — one neutral dashed placeholder, no rail. The full border
+   shorthand here overrides the panel's coloured left rail above. */
+.webhook-item--empty { display:block; text-align:center;
+  padding:18px 16px;
+  color:var(--ink-3); font-size:13px;
+  background:var(--surface-2);
+  border:1px dashed var(--border-2);
+  border-radius:var(--r-sm); }
+
+/* 2. Edit form — divided from the summary head inside the same panel. */
+.webhook-form--edit { margin-top:2px; padding-top:12px;
+  border-top:1px solid var(--border); }
+
+/* Add-webhook composer — sits after the list; a hairline sets it apart. */
+.webhook-form--new { margin-top:18px; padding-top:18px;
+  border-top:1px solid var(--hairline); }
+
+/* URL + secret carry the --mono face (technical values). The secret input is
+   tracked out so the masked bullets sit evenly; its placeholder ("Leave blank
+   to keep existing secret") drops back to the sans body face so it reads as
+   prose, not a masked value. */
+.webhook-form input[type=url],
+.webhook-form input[type=password] { font-family:var(--mono); font-size:13px; }
+.webhook-form input[type=password] { letter-spacing:.12em; }
+.webhook-form input[type=password]::placeholder { font-family:var(--font);
+  font-size:14px; letter-spacing:normal; color:var(--ink-4); }
+
+/* 3. Event picker — the "Events" label owns a full row (flex-basis:100%) as a
+   quiet uppercase caption, then the .check toggles wrap beneath it as chips. */
+.webhook-form .webhook-events { display:flex; flex-wrap:wrap; align-items:center;
+  gap:8px 16px; margin-bottom:14px; }
+.webhook-form .webhook-events .field-label { flex-basis:100%; margin:0 0 2px;
+  font-size:12px; font-weight:600; letter-spacing:.03em; text-transform:uppercase;
+  color:var(--ink-3); }
+
+/* 4. Delete — stays the ghost/sm button the SSR emits, but hover borrows the
+   shared --down destructive family (same tokens as .btn-danger) so the intent
+   reads without a second red stacking into the resting state. */
+.webhook-delete-form { margin-top:-2px; }
+.btn-delete-webhook:hover { color:var(--down-ink);
+  border-color:var(--down-border); background:var(--down-soft); }
+
+/* Reduced motion + dark mode: no transition/animation and no literal colours
+   are added above, so the global reduced-motion guard and the Odyssey token
+   theme layer both apply here with no extra rule. */
