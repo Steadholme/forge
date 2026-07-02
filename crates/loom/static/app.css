@@ -640,3 +640,64 @@ th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
 @media (prefers-reduced-motion:reduce){
   .toast,.diff-file__summary,.verdict-pill,.filter-chip,.diff-commentbtn,th.th-sort{transition:none}
 }
+
+/* ===========================================================================
+   Commit Status / Checks  —  CI status dots (GitHub-style)
+   Backend hooks (do not edit .rs): commits.rs emits
+     <span class="commit-status commit-status--{class}">
+       <span class="status-dot status-dot--{class}"></span></span>
+   pulls.rs reuses .card/.issue-list/.issue-item + adds .commit-status-row per
+   check row and a bare <span class="status-dot ..."> aggregate inside <h2>.
+   class ∈ success | pending | failure (error aliased to failure).
+   Pure visual layer: reuses Odyssey v2 semantic tokens only, static shadows,
+   no animation/font/library — inherits theming + reduced-motion automatically.
+   =========================================================================== */
+
+/* 1. Inline wrapper — keeps the dot on the sha/message/title baseline. */
+.commit-status{
+  display:inline-flex;
+  align-items:center;
+  vertical-align:middle;
+  margin-right:8px;
+}
+
+/* 2. Base dot — 8px, never shrinks, --unknown fallback color. */
+.status-dot{
+  display:inline-block;
+  flex:none;
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  vertical-align:middle;
+  background:var(--unknown);
+}
+
+/* 3. Semantic colors (GitHub-style). Inset -ink stroke locks WCAG 1.4.11
+   graphics contrast >=3:1; outer -soft ring is the soft halo glow. */
+.status-dot--success{
+  background:var(--ok);
+  box-shadow:inset 0 0 0 1px var(--ok-ink), 0 0 0 3px var(--ok-soft);
+}
+.status-dot--pending{
+  background:var(--warn);
+  box-shadow:inset 0 0 0 1px var(--warn-ink), 0 0 0 3px var(--warn-soft);
+}
+.status-dot--failure,
+.status-dot--error{
+  background:var(--down);
+  box-shadow:inset 0 0 0 1px var(--down-ink), 0 0 0 3px var(--down-soft);
+}
+
+/* 4. PR checks row — override .issue-item base so
+   "dot · context · state · details" reads as one tight line, and align the
+   description under the context name. */
+.commit-status-row .issue-item__meta{
+  justify-content:flex-start;
+  gap:8px;
+  font-size:13px;
+  line-height:1.5;
+  color:var(--ink-2);
+}
+.commit-status-row .issue-item__body{
+  padding-left:20px;
+}
