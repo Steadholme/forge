@@ -238,6 +238,8 @@ pub struct PullReviewComment {
     pub author_sub: String,
     /// Comment body.
     pub body: String,
+    /// Pending comments are visible only to their author until the review is finished.
+    pub pending: bool,
     /// Creation time, epoch seconds.
     pub created_at: i64,
 }

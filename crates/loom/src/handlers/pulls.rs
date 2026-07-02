@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
 use serde::Deserialize;
@@ -27,7 +27,7 @@ use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redire
 use crate::model::{
     CommitStatus, Label, Milestone, PrFileViewed, Pull, PullReview, PullReviewComment, Repo,
 };
-use crate::{AppState, now_secs, random_alnum};
+use crate::{now_secs, random_alnum, AppState};
 
 const PULL_ID_LEN: usize = 16;
 const REVIEW_ID_LEN: usize = 16;
@@ -430,7 +430,10 @@ pub async fn detail(
     let pull_labels = state.store.pull_labels(&pull.id).await?;
     let milestones = state.store.list_milestones(&repo.id).await?;
     let reviews = state.store.list_pull_reviews(&pull.id).await?;
-    let review_comments = state.store.list_pull_review_comments(&pull.id).await?;
+    let review_comments = state
+        .store
+        .list_pull_review_comments_for_viewer(&pull.id, &who.subject)
+        .await?;
     let header = pr_header(&state, &repo, "pulls").await;
     let body = render_detail(
         &state,
@@ -603,7 +606,10 @@ async fn render_detail_with_fresh_metadata(
     let pull_labels = state.store.pull_labels(&pull.id).await?;
     let milestones = state.store.list_milestones(&repo.id).await?;
     let reviews = state.store.list_pull_reviews(&pull.id).await?;
-    let review_comments = state.store.list_pull_review_comments(&pull.id).await?;
+    let review_comments = state
+        .store
+        .list_pull_review_comments_for_viewer(&pull.id, &who.subject)
+        .await?;
     render_detail(
         state,
         repo,
@@ -735,9 +741,9 @@ pub async fn review(
     }
     let verdict = normalize_verdict(&form.verdict)?;
     let review_body = form.body.trim().chars().take(20_000).collect::<String>();
-    state
+    let (_review, published_pending) = state
         .store
-        .create_pull_review(
+        .create_pull_review_with_pending_comments(
             &format!("rv_{}", random_alnum(REVIEW_ID_LEN)),
             &pull.id,
             &who.subject,
@@ -751,6 +757,7 @@ pub async fn review(
         number,
         reviewer = who.subject,
         verdict,
+        published_pending,
         "pull request reviewed"
     );
     let summary = if review_body.is_empty() {
@@ -787,6 +794,8 @@ pub struct InlineCommentForm {
     pub line: i64,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    pub mode: String,
 }
 
 pub async fn inline_comment(
@@ -811,16 +820,17 @@ pub async fn inline_comment_json(
     let comment = add_inline_comment(&state, &headers, &owner, &name, number, &form).await?;
     Ok(Json(serde_json::json!({
         "ok": true,
-        "path": comment.0,
-        "line": comment.1,
-        "author": comment.2,
-        "body": comment.3,
+        "path": comment.path,
+        "line": comment.line,
+        "author": comment.author_sub,
+        "body": comment.body,
+        "pending": comment.pending,
     }))
     .into_response())
 }
 
 /// Shared core for both inline-comment routes: CSRF-check, load + authorize, validate, persist, and
-/// audit. Returns `(path, line, author, body)` of the stored comment.
+/// audit. Returns the stored comment.
 async fn add_inline_comment(
     state: &AppState,
     headers: &HeaderMap,
@@ -828,7 +838,7 @@ async fn add_inline_comment(
     name: &str,
     number: i64,
     form: &InlineCommentForm,
-) -> Result<(String, i64, String, String), AppError> {
+) -> Result<PullReviewComment, AppError> {
     if !auth::verify_csrf(headers, &form.csrf_token) {
         return Err(AppError::BadRequest(
             "Your session token expired. Reload the page and try again.".to_string(),
@@ -855,32 +865,51 @@ async fn add_inline_comment(
         ));
     }
     let line = form.line.max(0);
-    state
-        .store
-        .create_pull_review_comment(
-            &format!("rc_{}", random_alnum(REVIEW_COMMENT_ID_LEN)),
-            &pull.id,
-            "",
-            &path,
-            line,
-            &who.subject,
-            &body,
-            now_secs(),
-        )
-        .await?;
+    let pending = form.mode.trim() == "pending";
+    let comment = if pending {
+        state
+            .store
+            .create_pending_pull_review_comment(
+                &format!("rc_{}", random_alnum(REVIEW_COMMENT_ID_LEN)),
+                &pull.id,
+                &path,
+                line,
+                &who.subject,
+                &body,
+                now_secs(),
+            )
+            .await?
+    } else {
+        state
+            .store
+            .create_pull_review_comment(
+                &format!("rc_{}", random_alnum(REVIEW_COMMENT_ID_LEN)),
+                &pull.id,
+                "",
+                &path,
+                line,
+                &who.subject,
+                &body,
+                now_secs(),
+            )
+            .await?
+    };
     tracing::info!(
         repo = repo.id,
         number,
         actor = who.subject,
+        pending,
         "pull inline comment added"
     );
-    let summary = if line > 0 {
-        format!("{path}:{line}: {body}")
-    } else {
-        format!("{path}: {body}")
-    };
-    notify_pull_author(state, &who.subject, &repo, &pull, &summary);
-    Ok((path, line, who.subject, body))
+    if !pending {
+        let summary = if line > 0 {
+            format!("{path}:{line}: {body}")
+        } else {
+            format!("{path}: {body}")
+        };
+        notify_pull_author(state, &who.subject, &repo, &pull, &summary);
+    }
+    Ok(comment)
 }
 
 // ===========================================================================
@@ -1810,6 +1839,7 @@ fn render_reviews_card(
     who: &Identity,
     headers: &HeaderMap,
 ) -> String {
+    let pending_count = comments.iter().filter(|comment| comment.pending).count();
     let review_rows = if reviews.is_empty() {
         "<li class=\"issue-item issue-item--empty\">No reviews yet.</li>".to_string()
     } else {
@@ -1843,10 +1873,30 @@ fn render_reviews_card(
     };
     let inline_rows = render_inline_threads(repo, comments);
     let forms = if can_review(repo, pull, who, headers) {
+        let pending_review = if pending_count == 0 {
+            String::new()
+        } else {
+            format!(
+                r##"<div class="pending-review">
+  <span class="review-pending-count">{pending_count} pending</span>
+</div>"##
+            )
+        };
+        let submit_label = if pending_count == 0 {
+            "Submit review"
+        } else {
+            "Finish your review"
+        };
+        let submit_class = if pending_count == 0 {
+            "btn btn-secondary"
+        } else {
+            "btn btn-primary btn-finish-review"
+        };
         format!(
             r##"<div class="layout layout--repo">
   <form method="post" action="/r/{owner}/{name}/pulls/{number}/review">
     <input type="hidden" name="csrf_token" value="{csrf}">
+    {pending_review}
     <div class="field">
       <label id="review-verdict-label">Verdict</label>
       <div class="verdict-picker" role="radiogroup" aria-labelledby="review-verdict-label">
@@ -1859,7 +1909,7 @@ fn render_reviews_card(
       <label for="review-body">Review comment</label>
       <textarea id="review-body" name="body" class="issue-input"></textarea>
     </div>
-    <div class="actions"><button class="btn btn-secondary" type="submit">Submit review</button></div>
+    <div class="actions"><button class="{submit_class}" type="submit">{submit_label}</button></div>
   </form>
   <form method="post" action="/r/{owner}/{name}/pulls/{number}/inline-comment">
     <input type="hidden" name="csrf_token" value="{csrf}">
@@ -1875,13 +1925,19 @@ fn render_reviews_card(
       <label for="inline-body">Comment</label>
       <textarea id="inline-body" name="body" class="issue-input" required></textarea>
     </div>
-    <div class="actions"><button class="btn btn-secondary" type="submit">Add inline comment</button></div>
+    <div class="actions">
+      <button class="btn btn-secondary" type="submit">Add inline comment</button>
+      <button class="btn btn-secondary" type="submit" name="mode" value="pending">Add pending comment</button>
+    </div>
   </form>
 </div>"##,
             owner = esc(&repo.owner_sub),
             name = esc(&repo.name),
             number = pull.number,
             csrf = esc(csrf),
+            pending_review = pending_review,
+            submit_class = submit_class,
+            submit_label = submit_label,
         )
     } else {
         String::new()
@@ -1911,14 +1967,26 @@ fn render_inline_threads(repo: &Repo, comments: &[PullReviewComment]) -> String 
     comments
         .iter()
         .map(|comment| {
+            let item_class = if comment.pending {
+                "issue-item pending-review"
+            } else {
+                "issue-item"
+            };
+            let action = if comment.pending {
+                "pending"
+            } else {
+                "commented"
+            };
             format!(
-                r##"<li class="issue-item">
-  <div class="issue-item__meta"><span>{path}:{line}</span> · {author} commented {when}</div>
+                r##"<li class="{item_class}">
+  <div class="issue-item__meta"><span>{path}:{line}</span> · {author} {action} {when}</div>
   <div class="issue-item__body markdown-body">{body}</div>
 </li>"##,
+                item_class = item_class,
                 path = esc(&comment.path),
                 line = comment.line,
                 author = esc(&comment.author_sub),
+                action = action,
                 when = esc(&fmt_ts(comment.created_at)),
                 body = link_issue_refs(
                     &crate::markdown::render(&comment.body),

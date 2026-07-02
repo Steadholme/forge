@@ -8,11 +8,11 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::http::{header, HeaderMap, Request, StatusCode};
 use loom::auth::{hash_token, new_pat_secret};
 use loom::model::Pat;
 use loom::store::Store;
-use loom::{AppState, app, build_dev_state_at, now_secs};
+use loom::{app, build_dev_state_at, now_secs, AppState};
 use tower::ServiceExt;
 
 fn temp_state() -> AppState {
@@ -737,10 +737,9 @@ async fn blame_view_renders_groups_and_graceful_notices() {
 
     let blob = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
     assert_eq!(blob.status, StatusCode::OK);
-    assert!(
-        blob.body
-            .contains(r#"href="/r/alice/docs/blame/HEAD/main.rs""#)
-    );
+    assert!(blob
+        .body
+        .contains(r#"href="/r/alice/docs/blame/HEAD/main.rs""#));
 
     let blame = send(&app, get("/r/alice/docs/blame/HEAD/main.rs", Some("alice"))).await;
     assert_eq!(blame.status, StatusCode::OK);
@@ -978,11 +977,9 @@ async fn pull_request_compare_create_and_merge() {
     assert!(detail.body.contains("class=\"pr-filetree\""));
     assert!(detail.body.contains("Viewed 0/1"));
     assert!(detail.body.contains("href=\"#diff-file-1\""));
-    assert!(
-        detail
-            .body
-            .contains("name=\"file_path\" value=\"file.txt\"")
-    );
+    assert!(detail
+        .body
+        .contains("name=\"file_path\" value=\"file.txt\""));
     assert!(detail.body.contains("data-viewed=\"false\""));
     let csrf = detail.csrf_cookie().expect("csrf on detail");
 
@@ -1188,6 +1185,34 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
     assert_eq!(blocked.status, StatusCode::BAD_REQUEST);
     assert!(blocked.body.contains("requires at least one approval"));
 
+    let pending = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/inline-comment",
+            &[
+                ("csrf_token", &csrf),
+                ("path", "file.txt"),
+                ("line", "3"),
+                ("body", "pending line note"),
+                ("mode", "pending"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(pending.status, StatusCode::FOUND);
+    let alice_pending = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(alice_pending.body.contains("1 pending"));
+    assert!(alice_pending.body.contains("Finish your review"));
+    assert!(alice_pending.body.contains("pending-review"));
+    assert!(alice_pending.body.contains("pending line note"));
+    let bob_pending = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    assert!(
+        !bob_pending.body.contains("pending line note"),
+        "pending comments are hidden from other users"
+    );
+    let csrf = alice_pending.csrf_cookie().unwrap();
     let approved = send(
         &app,
         post_form(
@@ -1203,6 +1228,14 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
     )
     .await;
     assert_eq!(approved.status, StatusCode::FOUND);
+    let bob_after_finish = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    assert!(
+        bob_after_finish.body.contains("pending line note"),
+        "finished review publishes pending comments"
+    );
+    assert!(bob_after_finish.body.contains("file.txt:3"));
+    let alice_after_finish = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = alice_after_finish.csrf_cookie().unwrap();
     let inline = send(
         &app,
         post_form(
@@ -1351,10 +1384,9 @@ async fn commit_history_keyset_pagination() {
         "Older link anchors at the last shown commit"
     );
     // Short shas link to the commit page.
-    assert!(
-        p1.body
-            .contains(&format!("/r/alice/hist/commit/{}", oids[54]))
-    );
+    assert!(p1
+        .body
+        .contains(&format!("/r/alice/hist/commit/{}", oids[54])));
 
     // Page 2 (keyset): the remaining 5, no further Older link, and a Newest rewind.
     let p2 = send(
@@ -1444,10 +1476,9 @@ async fn file_history_follows_renames_and_paginates() {
         !p1.body.contains("rename to new"),
         "page 1 stops at 50 file commits"
     );
-    assert!(
-        p1.body
-            .contains(&format!("/r/alice/files/commit/{}", oids[51]))
-    );
+    assert!(p1
+        .body
+        .contains(&format!("/r/alice/files/commit/{}", oids[51])));
     let anchor = &oids[2];
     assert!(
         p1.body.contains(&format!("after={anchor}")),
@@ -1760,10 +1791,9 @@ async fn branches_page_lists_branches_and_tags() {
         "compare link into the existing PR compare"
     );
     // Head sha links into the commit page.
-    assert!(
-        page.body
-            .contains(&format!("/r/alice/proj/commit/{feature_oid}"))
-    );
+    assert!(page
+        .body
+        .contains(&format!("/r/alice/proj/commit/{feature_oid}")));
     // Tags: the annotated message is shown (escaped); the lightweight tag has none.
     assert!(page.body.contains("v1.0"));
     assert!(page.body.contains("first release &lt;tag&gt;"));
@@ -1771,10 +1801,9 @@ async fn branches_page_lists_branches_and_tags() {
     assert!(page.body.contains("v0-light"));
 
     // The tab row is present with Branches active.
-    assert!(
-        page.body
-            .contains("tab--active\" href=\"/r/alice/proj/branches\"")
-    );
+    assert!(page
+        .body
+        .contains("tab--active\" href=\"/r/alice/proj/branches\""));
 }
 
 #[tokio::test]
@@ -1914,13 +1943,11 @@ async fn releases_flow_handles_notes_drafts_json_and_delete() {
     .await;
     assert_eq!(deleted.status, StatusCode::FOUND);
     assert_eq!(deleted.location(), "/r/alice/proj/releases");
-    assert!(
-        store
-            .get_release_by_tag(&repo.id, "v2.0.0")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .get_release_by_tag(&repo.id, "v2.0.0")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -2158,18 +2185,16 @@ async fn smart_http_blocks_direct_push_to_protected_default_branch() {
     let app = app(state);
     create_repo(&app, "alice", "proj", "").await;
     let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
-    assert!(
-        store
-            .update_repo_settings(
-                &repo.id,
-                &repo.description,
-                &repo.default_branch,
-                false,
-                true
-            )
-            .await
-            .unwrap()
-    );
+    assert!(store
+        .update_repo_settings(
+            &repo.id,
+            &repo.description,
+            &repo.default_branch,
+            false,
+            true
+        )
+        .await
+        .unwrap());
 
     let secret = new_pat_secret();
     store

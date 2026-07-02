@@ -318,6 +318,17 @@ pub trait Store: Send + Sync {
         created_at: i64,
     ) -> Result<PullReview, StoreError>;
 
+    /// Add a PR review verdict and publish this reviewer's pending inline comments on the PR.
+    async fn create_pull_review_with_pending_comments(
+        &self,
+        id: &str,
+        pull_id: &str,
+        reviewer_sub: &str,
+        verdict: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<(PullReview, i64), StoreError>;
+
     /// All reviews on a PR, oldest first.
     async fn list_pull_reviews(&self, pull_id: &str) -> Result<Vec<PullReview>, StoreError>;
 
@@ -335,16 +346,43 @@ pub trait Store: Send + Sync {
         created_at: i64,
     ) -> Result<PullReviewComment, StoreError>;
 
-    /// All inline comments on a PR, ordered by anchor then time.
+    /// Add a pending inline PR review comment for the current reviewer's draft.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_pending_pull_review_comment(
+        &self,
+        id: &str,
+        pull_id: &str,
+        path: &str,
+        line: i64,
+        author_sub: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<PullReviewComment, StoreError>;
+
+    /// Published inline comments on a PR, ordered by anchor then time.
     async fn list_pull_review_comments(
         &self,
         pull_id: &str,
     ) -> Result<Vec<PullReviewComment>, StoreError>;
 
+    /// Inline comments visible to a viewer: published comments plus their own pending comments.
+    async fn list_pull_review_comments_for_viewer(
+        &self,
+        pull_id: &str,
+        viewer_sub: &str,
+    ) -> Result<Vec<PullReviewComment>, StoreError>;
+
+    /// Count this reviewer's pending inline comments on a PR.
+    async fn pending_pull_review_comment_count(
+        &self,
+        pull_id: &str,
+        reviewer_sub: &str,
+    ) -> Result<i64, StoreError>;
+
     // --- commit statuses -------------------------------------------------------
     /// Insert or replace the latest status for `(repo_id, commit_sha, context)`.
     async fn upsert_commit_status(&self, status: &CommitStatus)
-    -> Result<CommitStatus, StoreError>;
+        -> Result<CommitStatus, StoreError>;
 
     /// Latest statuses for every context on one commit, ordered by context.
     async fn list_commit_statuses(
@@ -1169,6 +1207,42 @@ impl Store for InMemoryStore {
         Ok(review)
     }
 
+    async fn create_pull_review_with_pending_comments(
+        &self,
+        id: &str,
+        pull_id: &str,
+        reviewer_sub: &str,
+        verdict: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<(PullReview, i64), StoreError> {
+        let review = PullReview {
+            id: id.to_string(),
+            pull_id: pull_id.to_string(),
+            reviewer_sub: reviewer_sub.to_string(),
+            verdict: verdict.to_string(),
+            body: body.to_string(),
+            created_at,
+        };
+        self.pull_reviews
+            .lock()
+            .expect("pull_reviews lock poisoned")
+            .push(review.clone());
+        let mut comments = self
+            .pull_review_comments
+            .lock()
+            .expect("pull_review_comments lock poisoned");
+        let mut published = 0;
+        for comment in comments.iter_mut() {
+            if comment.pull_id == pull_id && comment.author_sub == reviewer_sub && comment.pending {
+                comment.pending = false;
+                comment.review_id = id.to_string();
+                published += 1;
+            }
+        }
+        Ok((review, published))
+    }
+
     async fn list_pull_reviews(&self, pull_id: &str) -> Result<Vec<PullReview>, StoreError> {
         let reviews = self
             .pull_reviews
@@ -1206,6 +1280,35 @@ impl Store for InMemoryStore {
             line,
             author_sub: author_sub.to_string(),
             body: body.to_string(),
+            pending: false,
+            created_at,
+        };
+        self.pull_review_comments
+            .lock()
+            .expect("pull_review_comments lock poisoned")
+            .push(comment.clone());
+        Ok(comment)
+    }
+
+    async fn create_pending_pull_review_comment(
+        &self,
+        id: &str,
+        pull_id: &str,
+        path: &str,
+        line: i64,
+        author_sub: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<PullReviewComment, StoreError> {
+        let comment = PullReviewComment {
+            id: id.to_string(),
+            pull_id: pull_id.to_string(),
+            review_id: String::new(),
+            path: path.to_string(),
+            line,
+            author_sub: author_sub.to_string(),
+            body: body.to_string(),
+            pending: true,
             created_at,
         };
         self.pull_review_comments
@@ -1225,7 +1328,7 @@ impl Store for InMemoryStore {
             .expect("pull_review_comments lock poisoned");
         let mut out: Vec<PullReviewComment> = comments
             .iter()
-            .filter(|c| c.pull_id == pull_id)
+            .filter(|c| c.pull_id == pull_id && !c.pending)
             .cloned()
             .collect();
         out.sort_by(|a, b| {
@@ -1236,6 +1339,45 @@ impl Store for InMemoryStore {
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(out)
+    }
+
+    async fn list_pull_review_comments_for_viewer(
+        &self,
+        pull_id: &str,
+        viewer_sub: &str,
+    ) -> Result<Vec<PullReviewComment>, StoreError> {
+        let comments = self
+            .pull_review_comments
+            .lock()
+            .expect("pull_review_comments lock poisoned");
+        let mut out: Vec<PullReviewComment> = comments
+            .iter()
+            .filter(|c| c.pull_id == pull_id && (!c.pending || c.author_sub == viewer_sub))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    async fn pending_pull_review_comment_count(
+        &self,
+        pull_id: &str,
+        reviewer_sub: &str,
+    ) -> Result<i64, StoreError> {
+        let comments = self
+            .pull_review_comments
+            .lock()
+            .expect("pull_review_comments lock poisoned");
+        Ok(comments
+            .iter()
+            .filter(|c| c.pull_id == pull_id && c.author_sub == reviewer_sub && c.pending)
+            .count() as i64)
     }
 
     async fn upsert_commit_status(
@@ -1330,8 +1472,8 @@ impl Store for InMemoryStore {
 // sqlx natively and the handlers `.await` it on the serving runtime — there is NO `block_in_place`
 // and NO sync-over-async, so a query never blocks a worker thread.
 
-use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::Row;
 
 const REPO_COLS: &str = "id, owner_sub, name, description, is_private, default_branch, require_approval, protect_default_branch, forked_from_id, created_at";
 const RELEASE_COLS: &str = "id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, created_by, created_at, published_at";
@@ -1343,7 +1485,7 @@ const LABEL_COLS: &str = "id, repo_id, name, color, created_at";
 const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
 const REVIEW_COLS: &str = "id, pull_id, reviewer_sub, verdict, body, created_at";
 const REVIEW_COMMENT_COLS: &str =
-    "id, pull_id, review_id, path, line, author_sub, body, created_at";
+    "id, pull_id, review_id, path, line, author_sub, body, pending, created_at";
 const PR_FILE_VIEWED_COLS: &str = "pr_id, user_sub, file_path, viewed, updated_at";
 const COMMIT_STATUS_COLS: &str =
     "id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at";
@@ -1646,14 +1788,26 @@ impl PgStore {
                  line BIGINT NOT NULL DEFAULT 0, \
                  author_sub TEXT NOT NULL, \
                  body TEXT NOT NULL DEFAULT '', \
+                 pending BOOLEAN NOT NULL DEFAULT FALSE, \
                  created_at BIGINT NOT NULL\
              )",
         )
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "ALTER TABLE pr_review_comments ADD COLUMN IF NOT EXISTS pending BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_pr_review_comments_pull \
              ON pr_review_comments (pull_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pr_review_comments_pending \
+             ON pr_review_comments (pull_id, author_sub, pending)",
         )
         .execute(&self.pool)
         .await?;
@@ -1847,6 +2001,7 @@ impl PgStore {
             line: row.try_get("line")?,
             author_sub: row.try_get("author_sub")?,
             body: row.try_get("body")?,
+            pending: row.try_get("pending")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -2917,6 +3072,60 @@ impl Store for PgStore {
         })
     }
 
+    async fn create_pull_review_with_pending_comments(
+        &self,
+        id: &str,
+        pull_id: &str,
+        reviewer_sub: &str,
+        verdict: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<(PullReview, i64), StoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO pr_reviews (id, pull_id, reviewer_sub, verdict, body, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(pull_id)
+        .bind(reviewer_sub)
+        .bind(verdict)
+        .bind(body)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let result = sqlx::query(
+            "UPDATE pr_review_comments \
+             SET pending = FALSE, review_id = $1 \
+             WHERE pull_id = $2 AND author_sub = $3 AND pending = TRUE",
+        )
+        .bind(id)
+        .bind(pull_id)
+        .bind(reviewer_sub)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok((
+            PullReview {
+                id: id.to_string(),
+                pull_id: pull_id.to_string(),
+                reviewer_sub: reviewer_sub.to_string(),
+                verdict: verdict.to_string(),
+                body: body.to_string(),
+                created_at,
+            },
+            result.rows_affected() as i64,
+        ))
+    }
+
     async fn list_pull_reviews(&self, pull_id: &str) -> Result<Vec<PullReview>, StoreError> {
         let rows = sqlx::query(&format!(
             "SELECT {REVIEW_COLS} FROM pr_reviews \
@@ -2967,6 +3176,45 @@ impl Store for PgStore {
             line,
             author_sub: author_sub.to_string(),
             body: body.to_string(),
+            pending: false,
+            created_at,
+        })
+    }
+
+    async fn create_pending_pull_review_comment(
+        &self,
+        id: &str,
+        pull_id: &str,
+        path: &str,
+        line: i64,
+        author_sub: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<PullReviewComment, StoreError> {
+        sqlx::query(
+            "INSERT INTO pr_review_comments \
+                 (id, pull_id, review_id, path, line, author_sub, body, pending, created_at) \
+             VALUES ($1, $2, '', $3, $4, $5, $6, TRUE, $7)",
+        )
+        .bind(id)
+        .bind(pull_id)
+        .bind(path)
+        .bind(line)
+        .bind(author_sub)
+        .bind(body)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(PullReviewComment {
+            id: id.to_string(),
+            pull_id: pull_id.to_string(),
+            review_id: String::new(),
+            path: path.to_string(),
+            line,
+            author_sub: author_sub.to_string(),
+            body: body.to_string(),
+            pending: true,
             created_at,
         })
     }
@@ -2977,7 +3225,8 @@ impl Store for PgStore {
     ) -> Result<Vec<PullReviewComment>, StoreError> {
         let rows = sqlx::query(&format!(
             "SELECT {REVIEW_COMMENT_COLS} FROM pr_review_comments \
-             WHERE pull_id = $1 ORDER BY path ASC, line ASC, created_at ASC, id ASC"
+             WHERE pull_id = $1 AND pending = FALSE \
+             ORDER BY path ASC, line ASC, created_at ASC, id ASC"
         ))
         .bind(pull_id)
         .fetch_all(&self.pool)
@@ -2987,6 +3236,46 @@ impl Store for PgStore {
             .map(Self::review_comment_from_row)
             .collect::<Result<_, _>>()
             .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_pull_review_comments_for_viewer(
+        &self,
+        pull_id: &str,
+        viewer_sub: &str,
+    ) -> Result<Vec<PullReviewComment>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {REVIEW_COMMENT_COLS} FROM pr_review_comments \
+             WHERE pull_id = $1 AND (pending = FALSE OR author_sub = $2) \
+             ORDER BY path ASC, line ASC, created_at ASC, id ASC"
+        ))
+        .bind(pull_id)
+        .bind(viewer_sub)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::review_comment_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn pending_pull_review_comment_count(
+        &self,
+        pull_id: &str,
+        reviewer_sub: &str,
+    ) -> Result<i64, StoreError> {
+        let n = sqlx::query(
+            "SELECT count(*) AS n FROM pr_review_comments \
+             WHERE pull_id = $1 AND author_sub = $2 AND pending = TRUE",
+        )
+        .bind(pull_id)
+        .bind(reviewer_sub)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?
+        .try_get("n")
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(n)
     }
 
     async fn upsert_commit_status(
@@ -3199,22 +3488,20 @@ mod tests {
     async fn repo_settings_update() {
         let s = InMemoryStore::new();
         s.create_repo(&repo("u", "a", false, 1)).await.unwrap();
-        assert!(
-            s.update_repo_settings("rp_u_a", "new words", "develop", true, true)
-                .await
-                .unwrap()
-        );
+        assert!(s
+            .update_repo_settings("rp_u_a", "new words", "develop", true, true)
+            .await
+            .unwrap());
         let updated = s.get_repo("u", "a").await.unwrap().unwrap();
         assert_eq!(updated.description, "new words");
         assert_eq!(updated.default_branch, "develop");
         assert!(updated.require_approval);
         assert!(updated.protect_default_branch);
         // Unknown id changes nothing.
-        assert!(
-            !s.update_repo_settings("nope", "x", "main", false, false)
-                .await
-                .unwrap()
-        );
+        assert!(!s
+            .update_repo_settings("nope", "x", "main", false, false)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -3225,12 +3512,11 @@ mod tests {
         let other = release("rl3", "other", "v1.0.0", 30, false);
 
         assert_eq!(s.create_release(&r1).await.unwrap(), Some(r1.clone()));
-        assert!(
-            s.create_release(&release("rl_dup", "r", "v1.0.0", 11, false))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(s
+            .create_release(&release("rl_dup", "r", "v1.0.0", 11, false))
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(s.create_release(&r2).await.unwrap(), Some(r2.clone()));
         assert_eq!(s.create_release(&other).await.unwrap(), Some(other));
 
@@ -3403,12 +3689,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            s.create_label("lb2", "r", "bug", "000000", 2)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(s
+            .create_label("lb2", "r", "bug", "000000", 2)
+            .await
+            .unwrap()
+            .is_none());
         let milestone = s
             .create_milestone("ms1", "r", "v1", "2026-08-01", 3)
             .await
@@ -3418,16 +3703,15 @@ mod tests {
             .create_issue("i1", "r", "first", "", "u", 4)
             .await
             .unwrap();
-        assert!(
-            s.set_issue_metadata(
+        assert!(s
+            .set_issue_metadata(
                 &issue.id,
                 "bob",
                 &milestone.id,
                 std::slice::from_ref(&label.id),
             )
             .await
-            .unwrap()
-        );
+            .unwrap());
         assert_eq!(
             s.issue_labels(&issue.id).await.unwrap(),
             vec![label.clone()]
@@ -3444,8 +3728,8 @@ mod tests {
             .create_pull("pl1", "r", "first", "", "main", "feat", "u", 5)
             .await
             .unwrap();
-        assert!(
-            s.set_pull_metadata(
+        assert!(s
+            .set_pull_metadata(
                 &pull.id,
                 "bob",
                 "carol",
@@ -3453,8 +3737,7 @@ mod tests {
                 std::slice::from_ref(&label.id),
             )
             .await
-            .unwrap()
-        );
+            .unwrap());
         let pull = s.get_pull("r", 1).await.unwrap().unwrap();
         assert_eq!(pull.assignee_sub, "bob");
         assert_eq!(pull.reviewer_sub, "carol");
@@ -3477,9 +3760,67 @@ mod tests {
         s.create_pull_review_comment("rc1", &pull.id, "rv1", "file.txt", 2, "alice", "note", 7)
             .await
             .unwrap();
+        s.create_pending_pull_review_comment("rc2", &pull.id, "src/lib.rs", 4, "alice", "draft", 8)
+            .await
+            .unwrap();
+        s.create_pending_pull_review_comment(
+            "rc3",
+            &pull.id,
+            "src/lib.rs",
+            6,
+            "bob",
+            "other draft",
+            9,
+        )
+        .await
+        .unwrap();
         assert_eq!(s.list_pull_reviews(&pull.id).await.unwrap().len(), 1);
         assert_eq!(
             s.list_pull_review_comments(&pull.id).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            s.list_pull_review_comments_for_viewer(&pull.id, "alice")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            s.list_pull_review_comments_for_viewer(&pull.id, "carol")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.pending_pull_review_comment_count(&pull.id, "alice")
+                .await
+                .unwrap(),
+            1
+        );
+        let (_review, published) = s
+            .create_pull_review_with_pending_comments(
+                "rv2",
+                &pull.id,
+                "alice",
+                "request_changes",
+                "finish",
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(published, 1);
+        assert_eq!(s.list_pull_reviews(&pull.id).await.unwrap().len(), 2);
+        let published_comments = s.list_pull_review_comments(&pull.id).await.unwrap();
+        assert_eq!(published_comments.len(), 2);
+        assert!(published_comments
+            .iter()
+            .any(|c| c.id == "rc2" && c.review_id == "rv2" && !c.pending));
+        assert_eq!(
+            s.pending_pull_review_comment_count(&pull.id, "bob")
+                .await
+                .unwrap(),
             1
         );
     }
@@ -3532,12 +3873,11 @@ mod tests {
     #[tokio::test]
     async fn commit_status_upsert_and_aggregate() {
         let s = InMemoryStore::new();
-        assert!(
-            s.aggregate_state_for_commit("r", "abc123")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(s
+            .aggregate_state_for_commit("r", "abc123")
+            .await
+            .unwrap()
+            .is_none());
 
         let build = s
             .upsert_commit_status(&commit_status("build", "pending", 10))
