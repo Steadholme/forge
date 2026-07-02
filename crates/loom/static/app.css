@@ -701,3 +701,87 @@ th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
 .commit-status-row .issue-item__body{
   padding-left:20px;
 }
+
+/* =========================================================
+   Releases — pure presentation for handlers/releases.rs + repos.rs
+   SSR hooks: .release-card / .release-card__{head,title,meta,summary,badges}
+              .release-tag · .release-assets/.release-asset
+              .release-badge--{prerelease,draft} (extend .state-badge)
+   Reuses Odyssey v2 semantic tokens only; no new fonts/libs/links.
+   Reduced-motion is covered by the global `* { transition:none }` rule.
+   ========================================================= */
+
+/* 1. List rows — .release-card is a bare <article> inside
+   .card__body.release-list, so read them as divider-separated items (like
+   .issue-item). When .release-card is ALSO .card (release detail + the repo
+   home "Latest release" card) it keeps the .card chrome, so the row treatment
+   is scoped to .release-list to avoid a double border/frame. */
+.release-list .release-card{ padding:18px 0; border-top:1px solid var(--border); }
+.release-list .release-card:first-child{ border-top:0; padding-top:0; }
+.release-list .release-card:last-child{ padding-bottom:0; }
+
+/* Head: title block on the left, status badges pinned right */
+.release-card__head{
+  display:flex; align-items:flex-start; justify-content:space-between;
+  gap:12px; flex-wrap:wrap;
+}
+
+/* Title — top-level hierarchy, hover to accent */
+.release-card__title{
+  display:inline-block; font-size:16px; font-weight:600; line-height:1.35;
+  color:var(--ink); text-decoration:none; word-break:break-word;
+}
+.release-card__title:hover{ color:var(--accent-ink); text-decoration:underline; }
+
+/* Meta: tag + commit oid + date, de-emphasised (date -> --ink-3) */
+.release-card__meta{
+  display:flex; align-items:center; flex-wrap:wrap; gap:8px;
+  margin-top:6px; font-size:13px; color:var(--ink-3);
+}
+.release-card__meta a{ text-decoration:none; }
+.release-card__meta a:hover .oid{ text-decoration:underline; }
+
+/* Notes — comfortable reading rhythm. The adjacent-sibling rule covers both
+   the real summary (.release-card__summary) and the "No release notes." muted
+   fallback that sit right after the head. */
+.release-card__head + p{
+  margin:12px 0 0; font-size:14px; line-height:1.65; word-break:break-word;
+}
+.release-card__summary{ color:var(--ink-2); }
+
+/* Badge cluster keeps its intrinsic width on the right */
+.release-card__badges{ display:flex; align-items:center; flex-wrap:wrap; gap:6px; flex-shrink:0; }
+
+/* 2. Tag badge — mono, code/tag feel on surface-2 (ink-2 => ~7.5:1, AA) */
+.release-tag{
+  display:inline-flex; align-items:center;
+  font-family:var(--mono); font-size:12px; font-weight:500; line-height:1.6;
+  padding:1px 8px; color:var(--ink-2);
+  background:var(--surface-2); border:1px solid var(--border);
+  border-radius:var(--r-xs);
+}
+
+/* 3. Status badges extend .state-badge (pill · 11px · 600) with colour only. */
+/* Pre-release — warn system, filled (warn-ink/warn-soft => 4.5:1, AA) */
+.release-badge--prerelease{
+  background:var(--warn-soft); color:var(--warn-ink); border:1px solid var(--warn-border);
+}
+/* Draft — deliberately weakened: ghost + dashed, no fill, so a draft never
+   reads like a shipped release. Text stays --ink-2 for AA (~8:1). */
+.release-badge--draft{
+  background:transparent; color:var(--ink-2); border:1px dashed var(--border-2);
+}
+
+/* 5. Assets — download list + the "No assets." empty state. Note the detail
+   page reuses .card__body on the same node, so restore its padding there. */
+.release-assets{ margin-top:14px; padding-top:12px; border-top:1px solid var(--hairline); }
+.card__body.release-assets{ margin-top:0; padding-top:18px; }
+.release-asset{
+  display:flex; align-items:center; gap:8px;
+  padding:7px 0; font-size:13px; color:var(--ink-2);
+  border-top:1px solid var(--hairline);
+}
+.release-asset:first-child{ border-top:0; }
+.release-asset.muted{ color:var(--ink-3); border-top:0; padding:2px 0; }
+.release-asset a{ color:var(--accent-ink); text-decoration:none; font-family:var(--mono); }
+.release-asset a:hover{ text-decoration:underline; }
