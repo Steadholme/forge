@@ -241,18 +241,12 @@ pub async fn blob(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let path = clean_subpath(&path)?;
-
-    let commit = state
-        .git
-        .head_commit(&repo.owner_sub, &repo.name)
-        .await
-        .ok_or_else(|| AppError::NotFound("This repository has no commits yet.".to_string()))?;
+    let (commit, path) = resolve_blob_target(&state, &repo, &path).await?;
     let bytes = state
         .git
         .read_blob(&repo.owner_sub, &repo.name, &commit, &path)
         .await
-        .ok_or_else(|| AppError::NotFound("No such file in the default branch.".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("No such file at this ref.".to_string()))?;
 
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
@@ -267,6 +261,7 @@ pub async fn blob(
         open_issues,
         open_pulls,
         release_count,
+        &commit,
         &path,
         &bytes,
     );
@@ -597,6 +592,32 @@ fn clean_blame_subpath(path: &str) -> Result<String, AppError> {
     clean_subpath(path)
 }
 
+async fn resolve_blob_target(
+    state: &AppState,
+    repo: &Repo,
+    raw_path: &str,
+) -> Result<(String, String), AppError> {
+    let clean = clean_subpath(raw_path)?;
+    if let Some((maybe_oid, rest)) = clean.split_once('/') {
+        if is_full_oid(maybe_oid) {
+            let path = clean_subpath(rest)?;
+            let commit = state
+                .git
+                .resolve_commit(&repo.owner_sub, &repo.name, maybe_oid)
+                .await
+                .ok_or_else(|| AppError::NotFound("No such commit.".to_string()))?;
+            return Ok((commit, path));
+        }
+    }
+
+    let commit = state
+        .git
+        .head_commit(&repo.owner_sub, &repo.name)
+        .await
+        .ok_or_else(|| AppError::NotFound("This repository has no commits yet.".to_string()))?;
+    Ok((commit, clean))
+}
+
 fn normalize_search_ref(ref_name: &str) -> String {
     let trimmed = ref_name.trim();
     if trimmed.is_empty() {
@@ -632,6 +653,10 @@ async fn resolve_blame_ref(state: &AppState, repo: &Repo, ref_name: &str) -> Opt
 
 fn is_hex_oid(s: &str) -> bool {
     (4..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_full_oid(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 // ===========================================================================
@@ -1339,6 +1364,7 @@ fn render_blob(
     open_issues: i64,
     open_pulls: i64,
     release_count: i64,
+    commit: &str,
     path: &str,
     bytes: &[u8],
 ) -> String {
@@ -1352,6 +1378,10 @@ fn render_blob(
     );
     let history_href = file_history_href(repo, "HEAD", path);
     let blame_href = format!("/r/{}/{}/blame/HEAD/{}", repo.owner_sub, repo.name, path);
+    let permalink_href = format!(
+        "/r/{}/{}/blob/{}/{}",
+        repo.owner_sub, repo.name, commit, path
+    );
     let search = render_code_search_form(repo, "", "HEAD", false);
     let content = if bytes.contains(&0) {
         "<div class=\"card__body\"><p class=\"muted\">Binary file not shown.</p></div>".to_string()
@@ -1379,7 +1409,7 @@ fn render_blob(
     format!(
         r##"{header}{search}
 <section class="card">
-  <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm" href="{history_href}">History</a><a class="btn btn-ghost btn-sm" href="{blame_href}">Blame</a><span class="muted">{size}</span></span></div>
+  <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm btn-permalink" href="{permalink_href}" data-permalink="{permalink_href}">Permalink</a><a class="btn btn-ghost btn-sm" href="{history_href}">History</a><a class="btn btn-ghost btn-sm" href="{blame_href}">Blame</a><span class="muted">{size}</span></span></div>
   {content}
 </section>"##,
         header = header,
@@ -1387,6 +1417,7 @@ fn render_blob(
         breadcrumb = render_breadcrumb(repo, path, true),
         history_href = esc(&history_href),
         blame_href = esc(&blame_href),
+        permalink_href = esc(&permalink_href),
         size = esc(&human_size(bytes.len() as i64)),
         content = content,
     )
@@ -1686,7 +1717,7 @@ fn render_text_blob(text: &str) -> String {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let n = i + 1;
         rows.push_str(&format!(
-            "<tr id=\"L{n}\" class=\"blob-line\">\
+            "<tr id=\"L{n}\" class=\"blob-line\" data-line=\"{n}\">\
                <td class=\"blob-line__num\"><a href=\"#L{n}\">{n}</a></td>\
                <td class=\"blob-line__code\">{code}</td>\
              </tr>",
@@ -1762,6 +1793,7 @@ mod tests {
         let html = render_text_blob("let x = 1;\n<b>two</b>\n");
         // Two lines, numbered 1 and 2 (the trailing newline does not add a third row).
         assert!(html.contains("id=\"L1\""));
+        assert!(html.contains("data-line=\"2\""));
         assert!(html.contains("href=\"#L2\">2</a>"));
         assert!(!html.contains("id=\"L3\""));
         // HTML metacharacters in the content are escaped, never live markup.

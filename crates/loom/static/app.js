@@ -96,6 +96,93 @@
     });
   }
 
+  // --- Blob line anchors + permalink copy ------------------------------------
+  function parseLineHash(hash) {
+    var m = String(hash || "").match(/^#L([1-9][0-9]*)(?:-L([1-9][0-9]*))?$/);
+    if (!m) return null;
+    var start = parseInt(m[1], 10);
+    var end = m[2] ? parseInt(m[2], 10) : start;
+    if (end < start) {
+      var tmp = start;
+      start = end;
+      end = tmp;
+    }
+    return { start: start, end: end };
+  }
+
+  function initBlobLineAnchors() {
+    var table = document.querySelector(".blob-code");
+    if (!table) return;
+    var maxLine = table.querySelectorAll(".blob-line").length;
+    var anchorLine = null;
+
+    function clearHighlights() {
+      table.querySelectorAll(".blob-line--highlight").forEach(function (row) {
+        row.classList.remove("blob-line--highlight");
+      });
+    }
+
+    function applyHashHighlight() {
+      var range = parseLineHash(window.location.hash);
+      clearHighlights();
+      if (!range) return;
+      var start = Math.max(1, range.start);
+      var end = Math.min(maxLine, range.end);
+      if (start > maxLine) return;
+      for (var n = start; n <= end; n += 1) {
+        var row = document.getElementById("L" + n);
+        if (row && row.classList) row.classList.add("blob-line--highlight");
+      }
+      anchorLine = range.start;
+    }
+
+    table.addEventListener("click", function (e) {
+      var link = e.target.closest ? e.target.closest(".blob-line__num a") : null;
+      if (!link || !table.contains(link)) return;
+      var range = parseLineHash(link.getAttribute("href"));
+      if (!range) return;
+      e.preventDefault();
+      var line = range.start;
+      var from = e.shiftKey && anchorLine ? anchorLine : line;
+      var start = Math.min(from, line);
+      var end = Math.max(from, line);
+      var hash = "#L" + start + (end === start ? "" : "-L" + end);
+      if (window.location.hash === hash) {
+        applyHashHighlight();
+      } else {
+        window.location.hash = hash;
+      }
+      anchorLine = line;
+    });
+
+    window.addEventListener("hashchange", applyHashHighlight);
+    applyHashHighlight();
+  }
+
+  function initBlobPermalinks() {
+    document.addEventListener("click", function (e) {
+      var link = e.target.closest ? e.target.closest(".btn-permalink[data-permalink]") : null;
+      if (!link) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      var href = link.getAttribute("data-permalink") || link.getAttribute("href");
+      if (!href) return;
+      e.preventDefault();
+      var url;
+      try {
+        url = new URL(href, window.location.href);
+      } catch (err) {
+        window.location.href = href;
+        return;
+      }
+      if (parseLineHash(window.location.hash)) url.hash = window.location.hash;
+      copyText(url.toString()).then(function () {
+        toast("Permalink copied", "ok");
+      }, function () {
+        window.location.href = url.toString();
+      });
+    });
+  }
+
   // --- Sortable data tables ------------------------------------------------
   function cellValue(row, idx, type) {
     var cell = row.cells[idx];
@@ -333,6 +420,8 @@
   function init() {
     initCopy();
     initSort();
+    initBlobLineAnchors();
+    initBlobPermalinks();
     initDiffToggleAll();
     initInlineComments();
     initToggleForms();

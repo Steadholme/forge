@@ -688,6 +688,7 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
             ("main.rs", "fn main() {\n    println!(\"hi\");\n}\n"),
         ],
     );
+    let head = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
 
     // Repo page renders the README as sanitised HTML (heading + emphasis are live markup).
     let view = send(&app, get("/r/alice/docs", Some("alice"))).await;
@@ -708,13 +709,46 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
         blob.body.contains("blob-line__num"),
         "line-number gutter present"
     );
+    assert!(blob.body.contains("id=\"L2\""));
+    assert!(blob.body.contains("data-line=\"2\""));
+    assert!(blob.body.contains("href=\"#L2\">2</a>"));
     assert!(blob.body.contains("println!"));
+    assert!(blob.body.contains("btn-permalink"));
+    assert!(blob
+        .body
+        .contains(&format!("href=\"/r/alice/docs/blob/{head}/main.rs\"")));
+
+    let pinned = send(
+        &app,
+        get(&format!("/r/alice/docs/blob/{head}/main.rs"), Some("alice")),
+    )
+    .await;
+    assert_eq!(pinned.status, StatusCode::OK);
+    assert!(pinned.body.contains("println!"));
 
     // A markdown blob view renders as sanitised HTML too.
     let md = send(&app, get("/r/alice/docs/blob/README.md", Some("alice"))).await;
     assert_eq!(md.status, StatusCode::OK);
     assert!(md.body.contains("<h1>Hello</h1>"));
     assert!(!md.body.contains("<script>alert(1)</script>"));
+
+    seed_repo(
+        &git_dir,
+        "main",
+        &[("main.rs", "fn main() {\n    changed();\n}\n")],
+    );
+    let moved = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
+    assert_eq!(moved.status, StatusCode::OK);
+    assert!(moved.body.contains("changed();"));
+
+    let still_pinned = send(
+        &app,
+        get(&format!("/r/alice/docs/blob/{head}/main.rs"), Some("alice")),
+    )
+    .await;
+    assert_eq!(still_pinned.status, StatusCode::OK);
+    assert!(still_pinned.body.contains("println!"));
+    assert!(!still_pinned.body.contains("changed();"));
 }
 
 #[tokio::test]
