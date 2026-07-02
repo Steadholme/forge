@@ -2174,3 +2174,101 @@ mark.code-search-hit {
 }
 .btn-delete-repo:disabled:hover,
 .btn-delete-repo[disabled]:hover { background:var(--bg-2); }
+
+/* ==========================================================================
+   SUGGESTED CHANGES — the ```suggestion fenced block a reviewer drops into a
+   PR line-level comment. The backend renders it (markdown fence -> markup) as:
+
+     .suggestion
+       .suggestion__diff
+         .suggestion__old        (original line being replaced -> remove/red)
+         .suggestion__new        (proposed replacement          -> add/green)
+       form.inline-form.suggestion__actions
+         button.btn.btn-secondary.btn-sm.btn-apply-suggestion
+
+   Mirrors GitHub's inline "Suggested change" diff card. Colour is reused
+   wholesale from the unified-diff palette: --down-soft/--down-ink for the
+   removed line (same pairing .diff-row--del ships) and --ok-soft/--ok-ink for
+   the added line (same as .diff-row--add / .pill-ok) so a proposed edit reads
+   with the exact red-remove / green-add semantics as the file diff above it,
+   and the whole site's diff look stays consistent. Meaning is never left to
+   colour alone: a +/- gutter glyph and the header label carry it too. No new
+   tokens, fonts, @import, or motion are introduced, so the global
+   reduced-motion guard and any future dark-theme token overrides both apply
+   automatically. .btn / .btn-sm / .btn-secondary / .inline-form are the
+   already-defined bases — only the suggestion-specific hooks are added here. */
+.suggestion {
+  margin:8px 0;
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+  overflow:hidden;                 /* clip the tinted rows to the rounded card */
+  background:var(--surface);
+  box-shadow:var(--sh-xs);
+}
+/* Header strip — labels the card like GitHub's "Suggested change" bar, on the
+   .diff-file__summary face (mono, --ink-2 on --surface-2 ~ 7:1, AA-clear). */
+.suggestion::before {
+  content:"Suggested change";
+  display:block;
+  padding:7px 12px;
+  background:var(--surface-2);
+  border-bottom:1px solid var(--border);
+  font:600 12px/1.2 var(--mono);
+  letter-spacing:.01em;
+  color:var(--ink-2);
+}
+/* Diff body — monospace, whole-row tint. Long lines wrap like the unified
+   .diff-code (pre-wrap + break-anywhere); overflow-x is a defensive fallback so
+   an unbreakable token can never burst the card sideways. */
+.suggestion__diff {
+  font:12.5px/1.55 var(--mono);
+  overflow-x:auto;
+}
+/* Shared row geometry — 26px left gutter reserves room for the sign glyph, and
+   wrapped continuation lines indent to align under the first line's text.
+   min-height keeps an empty old/new (a pure delete or pure add) a full-height
+   coloured line rather than a thin sliver — no :empty special-case needed. */
+.suggestion__old,
+.suggestion__new {
+  position:relative;
+  margin:0;
+  padding:2px 14px 2px 26px;
+  min-height:1.55em;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  color:var(--ink);
+}
+/* +/- gutter glyph — a non-colour cue for remove vs add; user-select:none so
+   copying the suggestion yields clean source without the sign. */
+.suggestion__old::before,
+.suggestion__new::before {
+  position:absolute;
+  left:10px;
+  font-weight:600;
+  user-select:none;
+}
+.suggestion__old { background:var(--down-soft); }
+.suggestion__old::before { content:"\2212"; color:var(--down-ink); }   /* minus */
+.suggestion__new { background:var(--ok-soft); }
+.suggestion__new::before { content:"+"; color:var(--ok-ink); }
+/* Action row — the Apply form, set apart from the diff by a top rule and the
+   --surface-2 foot tint (echoing .card__foot), button pushed to the right.
+   .inline-form already sets margin:0; this promotes it to a full-width flex
+   row so justify-content can right-align. */
+.suggestion__actions {
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  padding:10px 12px;
+  border-top:1px solid var(--border);
+  background:var(--surface-2);
+}
+/* Apply button — rests on the quiet .btn-secondary base so it never competes
+   with the diff; hover only picks up a restrained --ok tint to hint the
+   additive "apply this" intent (--ok-ink on --ok-soft = the AA-vetted pill-ok
+   pair). Intentionally understated. */
+.btn-apply-suggestion:hover {
+  background:var(--ok-soft);
+  border-color:var(--ok-border);
+  color:var(--ok-ink);
+}
