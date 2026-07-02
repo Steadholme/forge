@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::handlers::repos::{load_visible_repo, render_repo_header};
-use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect};
+use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect};
 use crate::model::{Issue, IssueComment, Label, Milestone, Repo};
 use crate::webhooks;
 use crate::{now_secs, random_alnum, AppState};
@@ -1137,11 +1137,7 @@ fn render_detail(
     } else {
         format!(
             "<div class=\"markdown-body\">{}</div>",
-            link_issue_refs(
-                &crate::markdown::render(&issue.body),
-                &repo.owner_sub,
-                &repo.name,
-            )
+            crate::markdown::render_for_repo(&issue.body, &repo.owner_sub, &repo.name)
         )
     };
 
@@ -1278,11 +1274,7 @@ fn render_comment(repo: &Repo, comment: &IssueComment) -> String {
     } else {
         format!(
             "<div class=\"issue-item__body markdown-body\">{}</div>",
-            link_issue_refs(
-                &crate::markdown::render(&comment.body),
-                &repo.owner_sub,
-                &repo.name,
-            )
+            crate::markdown::render_for_repo(&comment.body, &repo.owner_sub, &repo.name)
         )
     };
     format!(

@@ -1,4 +1,4 @@
-//! Sanitised CommonMark rendering for README files + issue bodies.
+//! Sanitised CommonMark/GFM rendering for README files + issue bodies.
 //!
 //! Reuses the estate's markdown/sanitise approach (agora/echo/inkwell): user-supplied markdown
 //! is rendered to HTML, but NEVER allowed to inject script or other active content. Two defenses
@@ -10,12 +10,40 @@
 //!    survive; anything else (e.g. `javascript:`, `data:`, `vbscript:`) is replaced with `#`, so a
 //!    crafted `[x](javascript:…)` can't smuggle an executable href.
 //!
-//! Everything else (text, code, emphasis, link titles) is escaped by `push_html` itself.
+//! Everything else (text, code, emphasis, link titles) is escaped by `push_html` itself. After
+//! serialisation, Loom adds safe GFM class hooks and links plain-text references outside tags/code.
 
 use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
 
+/// Repository context for GFM references that need to point back into the current repo.
+#[derive(Clone, Copy)]
+pub struct RenderContext<'a> {
+    pub repo_owner: &'a str,
+    pub repo_name: &'a str,
+}
+
 /// Render `md` to sanitised HTML safe to embed directly in a page.
 pub fn render(md: &str) -> String {
+    render_inner(md, None)
+}
+
+/// Render `md` with repository-scoped GFM reference links (`#123`, `@user`).
+pub fn render_with_context(md: &str, context: RenderContext<'_>) -> String {
+    render_inner(md, Some(context))
+}
+
+/// Convenience wrapper for repository-scoped markdown surfaces.
+pub fn render_for_repo(md: &str, repo_owner: &str, repo_name: &str) -> String {
+    render_with_context(
+        md,
+        RenderContext {
+            repo_owner,
+            repo_name,
+        },
+    )
+}
+
+fn render_inner(md: &str, context: Option<RenderContext<'_>>) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -24,7 +52,7 @@ pub fn render(md: &str) -> String {
     let events = Parser::new_ext(md, options).map(sanitize_event);
     let mut out = String::new();
     html::push_html(&mut out, events);
-    out
+    add_gfm_classes_and_links(&out, context)
 }
 
 /// Neutralise raw HTML and unsafe link/image schemes for a single event.
@@ -87,6 +115,258 @@ fn is_safe_url(url: &str) -> bool {
     }
 }
 
+fn add_gfm_classes_and_links(html: &str, context: Option<RenderContext<'_>>) -> String {
+    let html = html
+        .replace("<table>", "<table class=\"md-table\">")
+        .replace(
+            "<li><input disabled=\"\" type=\"checkbox\"",
+            "<li class=\"task-list-item\"><input disabled=\"\" type=\"checkbox\"",
+        );
+    link_plain_text_segments(&html, context)
+}
+
+fn link_plain_text_segments(html: &str, context: Option<RenderContext<'_>>) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut text = String::new();
+    let mut tag = String::new();
+    let mut skipped_tags: Vec<String> = Vec::new();
+    let mut in_tag = false;
+
+    for ch in html.chars() {
+        if in_tag {
+            tag.push(ch);
+            if ch == '>' {
+                update_skipped_tags(&tag, &mut skipped_tags);
+                out.push_str(&tag);
+                tag.clear();
+                in_tag = false;
+            }
+        } else if ch == '<' {
+            flush_text_segment(&mut out, &mut text, context, skipped_tags.is_empty());
+            in_tag = true;
+            tag.push(ch);
+        } else {
+            text.push(ch);
+        }
+    }
+
+    if in_tag {
+        text.push_str(&tag);
+    }
+    flush_text_segment(&mut out, &mut text, context, skipped_tags.is_empty());
+    out
+}
+
+fn flush_text_segment(
+    out: &mut String,
+    text: &mut String,
+    context: Option<RenderContext<'_>>,
+    can_link: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if can_link {
+        out.push_str(&link_plain_text(text, context));
+    } else {
+        out.push_str(text);
+    }
+    text.clear();
+}
+
+fn update_skipped_tags(tag: &str, skipped_tags: &mut Vec<String>) {
+    let Some((name, closing, self_closing)) = parse_tag_name(tag) else {
+        return;
+    };
+    if !suppresses_linking(&name) {
+        return;
+    }
+    if closing {
+        if let Some(pos) = skipped_tags.iter().rposition(|tag| tag == &name) {
+            skipped_tags.remove(pos);
+        }
+    } else if !self_closing {
+        skipped_tags.push(name);
+    }
+}
+
+fn parse_tag_name(tag: &str) -> Option<(String, bool, bool)> {
+    let body = tag.strip_prefix('<')?.strip_suffix('>')?.trim();
+    if body.is_empty() || body.starts_with('!') {
+        return None;
+    }
+    let closing = body.starts_with('/');
+    let body = if closing {
+        body[1..].trim_start()
+    } else {
+        body
+    };
+    let self_closing = body.ends_with('/');
+    let name = body
+        .split(|c: char| c.is_ascii_whitespace() || c == '/')
+        .next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some((name.to_ascii_lowercase(), closing, self_closing))
+    }
+}
+
+fn suppresses_linking(tag_name: &str) -> bool {
+    matches!(tag_name, "a" | "code" | "pre" | "script" | "style")
+}
+
+fn link_plain_text(text: &str, context: Option<RenderContext<'_>>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0;
+    while idx < text.len() {
+        if let Some((end, html)) = try_autolink(text, idx) {
+            out.push_str(&text[..idx]);
+            out.push_str(&html);
+            out.push_str(&link_plain_text(&text[end..], context));
+            return out;
+        }
+        if let Some(ctx) = context {
+            if let Some((end, html)) = try_issue_ref(text, idx, ctx) {
+                out.push_str(&text[..idx]);
+                out.push_str(&html);
+                out.push_str(&link_plain_text(&text[end..], context));
+                return out;
+            }
+        }
+        if let Some((end, html)) = try_mention(text, idx) {
+            out.push_str(&text[..idx]);
+            out.push_str(&html);
+            out.push_str(&link_plain_text(&text[end..], context));
+            return out;
+        }
+        idx += text[idx..].chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    text.to_string()
+}
+
+fn try_autolink(text: &str, idx: usize) -> Option<(usize, String)> {
+    let tail = &text[idx..];
+    if !(tail.starts_with("http://") || tail.starts_with("https://")) {
+        return None;
+    }
+    if !left_boundary(text, idx) {
+        return None;
+    }
+
+    let mut end = idx;
+    for (off, ch) in tail.char_indices() {
+        if ch.is_whitespace() || matches!(ch, '<' | '"' | '\'') {
+            break;
+        }
+        end = idx + off + ch.len_utf8();
+    }
+    end = trim_trailing_url_punctuation(text, idx, end);
+    if end == idx {
+        return None;
+    }
+
+    let url = &text[idx..end];
+    Some((end, format!("<a href=\"{url}\">{url}</a>", url = url)))
+}
+
+fn trim_trailing_url_punctuation(text: &str, start: usize, mut end: usize) -> usize {
+    while end > start {
+        let Some(ch) = text[..end].chars().next_back() else {
+            break;
+        };
+        if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}') {
+            end -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+fn try_issue_ref(text: &str, idx: usize, context: RenderContext<'_>) -> Option<(usize, String)> {
+    if !text[idx..].starts_with('#') || !left_boundary(text, idx) {
+        return None;
+    }
+    let start_digits = idx + 1;
+    let mut end = start_digits;
+    for (off, ch) in text[start_digits..].char_indices() {
+        if ch.is_ascii_digit() {
+            end = start_digits + off + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == start_digits {
+        return None;
+    }
+
+    let n = &text[start_digits..end];
+    Some((
+        end,
+        format!(
+            "<a class=\"gfm-ref\" href=\"/r/{}/{}/issues/{}\">#{}</a>",
+            escape_html(context.repo_owner),
+            escape_html(context.repo_name),
+            n,
+            n
+        ),
+    ))
+}
+
+fn try_mention(text: &str, idx: usize) -> Option<(usize, String)> {
+    if !text[idx..].starts_with('@') || !left_boundary(text, idx) {
+        return None;
+    }
+    let start_name = idx + 1;
+    let mut end = start_name;
+    for (off, ch) in text[start_name..].char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            end = start_name + off + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    while end > start_name && text[..end].ends_with('.') {
+        end -= '.'.len_utf8();
+    }
+    if end == start_name {
+        return None;
+    }
+
+    let name = &text[start_name..end];
+    Some((
+        end,
+        format!(
+            "<a class=\"gfm-mention\" href=\"/users/{name}\">@{name}</a>",
+            name = escape_html(name)
+        ),
+    ))
+}
+
+fn left_boundary(text: &str, idx: usize) -> bool {
+    idx == 0
+        || text[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +412,56 @@ mod tests {
         let html = render("[ok](https://w33d.xyz/x) and [rel](/c/general)");
         assert!(html.contains("href=\"https://w33d.xyz/x\""));
         assert!(html.contains("href=\"/c/general\""));
+    }
+
+    #[test]
+    fn renders_gfm_tables_task_lists_and_strikethrough() {
+        let html =
+            render("| item | state |\n| --- | --- |\n| ~~old~~ | <img src=x onerror=alert(1)> |\n\n- [ ] todo\n- [x] done");
+        assert!(html.contains("<table class=\"md-table\">"));
+        assert!(html.contains("<del>old</del>"));
+        assert!(html.contains("class=\"task-list-item\""));
+        assert!(html.contains("type=\"checkbox\" checked=\"\""));
+        assert!(!html.contains("<img src=x"));
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+    }
+
+    #[test]
+    fn autolinks_bare_http_urls_outside_code_and_links() {
+        let html = render(
+            "Visit https://example.test/a?x=1.\n\n`https://code.test`\n\n[ok](https://linked.test)\n\njavascript:alert(1)",
+        );
+        assert!(
+            html.contains("<a href=\"https://example.test/a?x=1\">https://example.test/a?x=1</a>.")
+        );
+        assert!(html.contains("<code>https://code.test</code>"));
+        assert!(html.contains("<a href=\"https://linked.test\">ok</a>"));
+        assert!(!html.contains("href=\"javascript:"));
+    }
+
+    #[test]
+    fn links_repo_refs_and_mentions_with_context() {
+        let html = render_for_repo("Fixes #123 by @alice. `#456 @bob`", "own&er", "rep\"o");
+        assert!(html.contains(
+            "<a class=\"gfm-ref\" href=\"/r/own&amp;er/rep&quot;o/issues/123\">#123</a>"
+        ));
+        assert!(html.contains("<a class=\"gfm-mention\" href=\"/users/alice\">@alice</a>"));
+        assert!(html.contains("<code>#456 @bob</code>"));
+    }
+
+    #[test]
+    fn gfm_xss_payloads_stay_escaped() {
+        let html = render_for_repo(
+            "~~<script>alert(1)</script>~~\n\n| a |\n| --- |\n| <img src=x onerror=alert(1)> |\n\n[x](javascript:alert(1))",
+            "owner",
+            "repo",
+        );
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<img src=x"));
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("<del>&lt;script&gt;alert(1)&lt;/script&gt;</del>"));
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(html.contains("href=\"#\""));
     }
 
     #[test]

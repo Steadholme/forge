@@ -952,7 +952,7 @@ async fn render_readme(
   <div class="card__body markdown-body">{html}</div>
 </section>"##,
         name = esc(&entry.name),
-        html = crate::markdown::render(&text),
+        html = crate::markdown::render_for_repo(&text, &repo.owner_sub, &repo.name),
     )
 }
 
@@ -1400,7 +1400,7 @@ fn render_blob(
             // A markdown file renders as sanitised HTML (raw HTML/unsafe links defused).
             format!(
                 "<div class=\"card__body markdown-body\">{}</div>",
-                crate::markdown::render(&text)
+                crate::markdown::render_for_repo(&text, &repo.owner_sub, &repo.name)
             )
         } else {
             // Any other text blob gets a monospace, line-numbered view.

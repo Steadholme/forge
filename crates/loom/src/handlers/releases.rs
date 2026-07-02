@@ -14,7 +14,7 @@ use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::gitops::TagInfo;
 use crate::handlers::repos::{header_with_counts_for, load_visible_repo};
-use crate::handlers::{esc, fmt_ts, html_ok, html_with_csrf, link_issue_refs, page, redirect};
+use crate::handlers::{esc, fmt_ts, html_ok, html_with_csrf, page, redirect};
 use crate::model::{Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
@@ -456,8 +456,7 @@ fn render_detail(repo: &Repo, release: &Release, writer: bool, csrf: &str) -> St
     let notes = if release.body_md.trim().is_empty() {
         "<p class=\"muted\">No release notes.</p>".to_string()
     } else {
-        let rendered = crate::markdown::render(&release.body_md);
-        link_issue_refs(&rendered, &repo.owner_sub, &repo.name)
+        crate::markdown::render_for_repo(&release.body_md, &repo.owner_sub, &repo.name)
     };
     let delete_form = if writer {
         format!(

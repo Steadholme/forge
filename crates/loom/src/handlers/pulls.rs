@@ -24,7 +24,7 @@ use crate::config::{COMMIT_LIMIT, MAX_BLOB_RENDER_BYTES};
 use crate::error::AppError;
 use crate::gitops::{CommitInfo, MergeStrategy, Mergeability as GitMergeability};
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
-use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect, short_oid};
+use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect, short_oid};
 use crate::model::{
     CommitStatus, Label, Milestone, PrFileViewed, PrThreadResolved, Pull, PullReview,
     PullReviewComment, Repo,
@@ -2037,11 +2037,7 @@ async fn render_detail(
     } else {
         format!(
             "<div class=\"markdown-body\">{}</div>",
-            link_issue_refs(
-                &crate::markdown::render(&pull.body),
-                &repo.owner_sub,
-                &repo.name,
-            )
+            crate::markdown::render_for_repo(&pull.body, &repo.owner_sub, &repo.name)
         )
     };
 
@@ -2848,11 +2844,7 @@ fn render_reviews_card(
                 } else {
                     format!(
                         "<div class=\"issue-item__body markdown-body\">{}</div>",
-                        link_issue_refs(
-                            &crate::markdown::render(&review.body),
-                            &repo.owner_sub,
-                            &repo.name,
-                        )
+                        crate::markdown::render_for_repo(&review.body, &repo.owner_sub, &repo.name)
                     )
                 };
                 format!(
@@ -3113,11 +3105,7 @@ fn render_inline_thread_comments(repo: &Repo, comments: &[&PullReviewComment]) -
                 author = esc(&comment.author_sub),
                 action = action,
                 when = esc(&fmt_ts(comment.created_at)),
-                body = link_issue_refs(
-                    &crate::markdown::render(&comment.body),
-                    &repo.owner_sub,
-                    &repo.name,
-                ),
+                body = crate::markdown::render_for_repo(&comment.body, &repo.owner_sub, &repo.name),
             )
         })
         .collect::<String>()
