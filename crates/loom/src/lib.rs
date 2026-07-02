@@ -3,7 +3,8 @@
 //! Loom serves TWO surfaces on one subdomain (`git.w33d.xyz`), split at the Sluice gateway:
 //!
 //! - The WEB UI at `/` is `auth=sso` (gateway-injected `X-Auth-*`): repo list + create, repo
-//!   browse (files of the default branch + commit history + branches), an Issues tab, and a
+//!   browse (files of the default branch + commit history/commit pages + branches/tags), Issues
+//!   and Pull-request tabs, per-repo settings (description + default branch), and a
 //!   personal-access-token management page. Loom is internal-only and trusts the injected
 //!   identity headers.
 //! - The git SMART-HTTP protocol under `/git/` is `auth=public` at the gateway — `git` cannot
@@ -69,6 +70,19 @@ pub fn app(state: AppState) -> Router {
         .route("/r/{owner}/{name}", get(handlers::repos::view))
         .route("/r/{owner}/{name}/tree/{*path}", get(handlers::repos::tree))
         .route("/r/{owner}/{name}/blob/{*path}", get(handlers::repos::blob))
+        .route("/r/{owner}/{name}/commits", get(handlers::commits::history))
+        .route(
+            "/r/{owner}/{name}/commit/{sha}",
+            get(handlers::commits::detail),
+        )
+        .route(
+            "/r/{owner}/{name}/branches",
+            get(handlers::branches::list),
+        )
+        .route(
+            "/r/{owner}/{name}/settings",
+            get(handlers::settings::show).post(handlers::settings::update),
+        )
         .route(
             "/r/{owner}/{name}/issues",
             get(handlers::issues::list).post(handlers::issues::create),

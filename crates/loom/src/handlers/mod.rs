@@ -1,8 +1,12 @@
 //! HTTP handlers + shared server-render helpers.
 //!
 //! - [`health`] — unauthenticated liveness probe (`/healthz`).
-//! - [`repos`] — the SSO web surface: repo list/create, browse (tree/blob), commit history.
+//! - [`repos`] — the SSO web surface: repo list/create, browse (tree/blob), the repo home.
+//! - [`commits`] — commit history (keyset-paginated) + the single-commit page (metadata + diff).
+//! - [`branches`] — the branches + tags listing.
 //! - [`issues`] — the per-repo issue tracker (list/filter, detail + comments, create/comment/toggle).
+//! - [`pulls`] — pull requests (compare, create, detail, gated merge).
+//! - [`settings`] — repo settings (description + default branch; owner/admin only).
 //! - [`pats`] — personal-access-token management (mint once / revoke).
 //! - [`smart_http`] — the git smart-HTTP protocol (`/git/...`) with PAT Basic auth.
 //!
@@ -13,11 +17,14 @@
 //! (raw HTML downgraded to text, unsafe link schemes defused) — Loom serves no executable file
 //! content from the browser-facing surface.
 
+pub mod branches;
+pub mod commits;
 pub mod health;
 pub mod issues;
 pub mod pats;
 pub mod pulls;
 pub mod repos;
+pub mod settings;
 pub mod smart_http;
 
 use axum::http::{header, StatusCode};
@@ -54,6 +61,30 @@ pub fn fmt_ts(secs: i64) -> String {
 /// First 8 hex characters of a commit OID, for compact display.
 pub fn short_oid(oid: &str) -> String {
     oid.chars().take(8).collect()
+}
+
+/// Compact relative age of an epoch-seconds timestamp against `now` ("3 days ago"). Future or
+/// zero timestamps fall back to the absolute [`fmt_ts`] form.
+pub fn fmt_rel(now: i64, then: i64) -> String {
+    let d = now - then;
+    if then <= 0 || d < 0 {
+        return fmt_ts(then);
+    }
+    let (n, unit) = if d < 60 {
+        return "just now".to_string();
+    } else if d < 3600 {
+        (d / 60, "minute")
+    } else if d < 86_400 {
+        (d / 3600, "hour")
+    } else if d < 30 * 86_400 {
+        (d / 86_400, "day")
+    } else if d < 365 * 86_400 {
+        (d / (30 * 86_400), "month")
+    } else {
+        (d / (365 * 86_400), "year")
+    };
+    let s = if n == 1 { "" } else { "s" };
+    format!("{n} {unit}{s} ago")
 }
 
 /// Render the shared HTML page shell with the app-bar. `title` is the app-bar page label, `email`
@@ -215,5 +246,19 @@ mod tests {
     fn short_oid_truncates() {
         assert_eq!(short_oid("deadbeefcafebabe"), "deadbeef");
         assert_eq!(short_oid("abc"), "abc");
+    }
+
+    #[test]
+    fn relative_age_buckets() {
+        let now = 1_700_000_000;
+        assert_eq!(fmt_rel(now, now - 5), "just now");
+        assert_eq!(fmt_rel(now, now - 60), "1 minute ago");
+        assert_eq!(fmt_rel(now, now - 5 * 3600), "5 hours ago");
+        assert_eq!(fmt_rel(now, now - 3 * 86_400), "3 days ago");
+        assert_eq!(fmt_rel(now, now - 70 * 86_400), "2 months ago");
+        assert_eq!(fmt_rel(now, now - 800 * 86_400), "2 years ago");
+        // Future / zero timestamps fall back to the absolute form.
+        assert_eq!(fmt_rel(now, now + 10), fmt_ts(now + 10));
+        assert_eq!(fmt_rel(now, 0), fmt_ts(0));
     }
 }

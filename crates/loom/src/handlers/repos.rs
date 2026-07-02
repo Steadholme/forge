@@ -207,6 +207,14 @@ pub async fn load_visible_repo(
     }
 }
 
+/// Render the repo header for the `active` tab, fetching the open issue/PR badge counts (the
+/// shared entry point for the commits/branches/settings pages).
+pub(crate) async fn header_with_counts(state: &AppState, repo: &Repo, active: &str) -> String {
+    let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
+    let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+    render_repo_header(repo, &state.config.public_base_url, open_issues, open_pulls, active)
+}
+
 /// Reject a browse subpath that could escape the tree, then normalize it (no leading/trailing `/`).
 fn clean_subpath(path: &str) -> Result<String, AppError> {
     let trimmed = path.trim_matches('/');
@@ -481,9 +489,7 @@ pub(crate) fn render_repo_header(
         repo.owner_sub,
         repo.name
     );
-    let code_active = if active == "code" { " tab--active" } else { "" };
-    let pulls_active = if active == "pulls" { " tab--active" } else { "" };
-    let issues_active = if active == "issues" { " tab--active" } else { "" };
+    let tab = |name: &str| if active == name { " tab--active" } else { "" };
     format!(
         r##"<div class="console__head">
   <div class="repo-title">
@@ -498,17 +504,23 @@ pub(crate) fn render_repo_header(
 </div>
 <nav class="tabs">
   <a class="tab{code_active}" href="/r/{owner}/{name}">Code</a>
-  <a class="tab{pulls_active}" href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span></a>
+  <a class="tab{commits_active}" href="/r/{owner}/{name}/commits">Commits</a>
+  <a class="tab{branches_active}" href="/r/{owner}/{name}/branches">Branches</a>
   <a class="tab{issues_active}" href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span></a>
+  <a class="tab{pulls_active}" href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span></a>
+  <a class="tab{settings_active}" href="/r/{owner}/{name}/settings">Settings</a>
 </nav>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         badge = badge,
         desc = desc,
         clone = esc(&clone_url),
-        code_active = code_active,
-        pulls_active = pulls_active,
-        issues_active = issues_active,
+        code_active = tab("code"),
+        commits_active = tab("commits"),
+        branches_active = tab("branches"),
+        pulls_active = tab("pulls"),
+        issues_active = tab("issues"),
+        settings_active = tab("settings"),
         open_issues = open_issues,
         open_pulls = open_pulls,
     )

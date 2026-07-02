@@ -50,6 +50,55 @@ pub struct CommitInfo {
     pub subject: String,
 }
 
+/// Full metadata for ONE commit (the commit page). Superset of [`CommitInfo`]: adds the parent
+/// OIDs and the complete message body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub oid: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Author time, epoch seconds.
+    pub time: i64,
+    /// Parent commit OIDs (empty for a root commit, two for a merge).
+    pub parents: Vec<String>,
+    /// The full commit message (`%B`), subject line included.
+    pub message: String,
+}
+
+impl CommitDetail {
+    /// The message's first line (the subject).
+    pub fn subject(&self) -> &str {
+        self.message.lines().next().unwrap_or("")
+    }
+}
+
+/// One branch row for the branches page: head OID + head-commit subject and time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchInfo {
+    pub name: String,
+    /// Head commit OID.
+    pub oid: String,
+    /// Head committer time, epoch seconds.
+    pub time: i64,
+    /// Head commit subject.
+    pub subject: String,
+}
+
+/// One tag row for the branches page. For an annotated tag `message` carries the tag message's
+/// subject line; for a lightweight tag it is empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagInfo {
+    pub name: String,
+    /// The COMMIT the tag ultimately points at (peeled for annotated tags).
+    pub oid: String,
+    /// Tag creation time (annotated) or target committer time (lightweight), epoch seconds.
+    pub time: i64,
+    /// Annotated tag message subject; empty for a lightweight tag.
+    pub message: String,
+    /// True when the ref points at a tag OBJECT (annotated) rather than directly at a commit.
+    pub annotated: bool,
+}
+
 /// Outcome of a server-side [`GitOps::merge`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -255,6 +304,122 @@ impl GitOps {
             _ => return Vec::new(),
         };
         parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    // -----------------------------------------------------------------------
+    // History browsing: commit resolve/detail/diff, branch + tag listings.
+    // -----------------------------------------------------------------------
+
+    /// Resolve a (caller-validated, HEX-ONLY) abbreviated or full commit id to its full OID, or
+    /// `None` when it does not name a commit in this repo. The `^{commit}` peel also rejects
+    /// non-commit objects (blobs/trees/tags addressed by hash).
+    pub async fn resolve_commit(&self, owner: &str, name: &str, hexspec: &str) -> Option<String> {
+        let repo = self.repo_path(owner, name);
+        self.rev(&repo.to_string_lossy(), &format!("{hexspec}^{{commit}}"))
+            .await
+    }
+
+    /// Full metadata for one commit (a resolved OID): author, time, parents, complete message.
+    pub async fn commit_detail(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+    ) -> Option<CommitDetail> {
+        let repo = self.repo_path(owner, name);
+        // %B (the raw body) goes LAST so a message containing the 0x1f separator stays intact
+        // (the parse splits at most 5 times).
+        let fmt = "--pretty=format:%H%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%B";
+        let out = self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["log", "--max-count=1", fmt, commit_oid],
+            )
+            .await
+            .ok()?;
+        if !out.status {
+            return None;
+        }
+        parse_commit_detail(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// One-line change summary for a commit (`git show --shortstat`), e.g.
+    /// `1 file changed, 2 insertions(+)`. Empty for a merge commit (no combined stat).
+    pub async fn commit_stat(&self, owner: &str, name: &str, commit_oid: &str) -> String {
+        let repo = self.repo_path(owner, name);
+        match self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["show", "--format=", "--shortstat", commit_oid],
+            )
+            .await
+        {
+            Ok(out) if out.status => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// The unified diff a commit introduced (`git show` against its first parent; a root commit
+    /// diffs against the empty tree). `None` when the git invocation fails. For a merge commit
+    /// git emits the combined diff, which is empty unless the merge itself changed files.
+    pub async fn commit_patch(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+    ) -> Option<String> {
+        let repo = self.repo_path(owner, name);
+        let out = self
+            .run_git_in_capture(&repo.to_string_lossy(), &["show", "--format=", commit_oid])
+            .await
+            .ok()?;
+        if out.status {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Branch rows (name + head OID/subject/time), most recently committed first.
+    pub async fn branch_infos(&self, owner: &str, name: &str) -> Vec<BranchInfo> {
+        let repo = self.repo_path(owner, name);
+        // One line per ref; the subject is a single line by definition, so line parsing is safe.
+        let fmt = "--format=%(refname:short)%1f%(objectname)%1f%(committerdate:unix)%1f%(subject)";
+        match self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["for-each-ref", "--sort=-committerdate", fmt, "refs/heads/"],
+            )
+            .await
+        {
+            Ok(out) if out.status => parse_branch_refs(&String::from_utf8_lossy(&out.stdout)),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Tag rows (annotated tags peeled to their target commit, message subject included),
+    /// newest first.
+    pub async fn tag_infos(&self, owner: &str, name: &str) -> Vec<TagInfo> {
+        let repo = self.repo_path(owner, name);
+        let fmt = "--format=%(refname:short)%1f%(objectname)%1f%(*objectname)%1f%(objecttype)%1f%(creatordate:unix)%1f%(contents:subject)";
+        match self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["for-each-ref", "--sort=-creatordate", fmt, "refs/tags/"],
+            )
+            .await
+        {
+            Ok(out) if out.status => parse_tag_refs(&String::from_utf8_lossy(&out.stdout)),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Point the bare repo's HEAD at `refs/heads/{branch}` (the default-branch setting). The
+    /// branch name is caller-validated, so the argument is never option-like.
+    pub async fn set_head(&self, owner: &str, name: &str, branch: &str) -> std::io::Result<()> {
+        let path = self.repo_path(owner, name).to_string_lossy().to_string();
+        self.run_git_in(&path, &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -662,6 +827,75 @@ fn parse_log(text: &str) -> Vec<CommitInfo> {
     out
 }
 
+/// Parse the single-record `git log -1` format into a [`CommitDetail`]. The message (`%B`) is the
+/// LAST field, so `splitn` keeps a message containing the 0x1f separator intact.
+fn parse_commit_detail(text: &str) -> Option<CommitDetail> {
+    let fields: Vec<&str> = text.splitn(6, '\u{1f}').collect();
+    if fields.len() < 6 || fields[0].trim().is_empty() {
+        return None;
+    }
+    Some(CommitDetail {
+        oid: fields[0].trim().to_string(),
+        author_name: fields[1].to_string(),
+        author_email: fields[2].to_string(),
+        time: fields[3].trim().parse::<i64>().unwrap_or(0),
+        parents: fields[4]
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        message: fields[5].trim_end_matches('\n').to_string(),
+    })
+}
+
+/// Parse `for-each-ref` branch lines (`name US oid US unixtime US subject`) into [`BranchInfo`]s.
+fn parse_branch_refs(text: &str) -> Vec<BranchInfo> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.splitn(4, '\u{1f}').collect();
+        if fields.len() < 4 || fields[0].is_empty() {
+            continue;
+        }
+        out.push(BranchInfo {
+            name: fields[0].to_string(),
+            oid: fields[1].to_string(),
+            time: fields[2].trim().parse::<i64>().unwrap_or(0),
+            subject: fields[3].to_string(),
+        });
+    }
+    out
+}
+
+/// Parse `for-each-ref` tag lines (`name US oid US peeled US objecttype US unixtime US subject`)
+/// into [`TagInfo`]s. An annotated tag ref points at a tag OBJECT (`objecttype == "tag"`); its
+/// peeled OID is the target commit and its subject is the tag message's first line.
+fn parse_tag_refs(text: &str) -> Vec<TagInfo> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.splitn(6, '\u{1f}').collect();
+        if fields.len() < 6 || fields[0].is_empty() {
+            continue;
+        }
+        let annotated = fields[3] == "tag";
+        let peeled = fields[2].trim();
+        out.push(TagInfo {
+            name: fields[0].to_string(),
+            oid: if annotated && !peeled.is_empty() {
+                peeled.to_string()
+            } else {
+                fields[1].to_string()
+            },
+            time: fields[4].trim().parse::<i64>().unwrap_or(0),
+            message: if annotated {
+                fields[5].to_string()
+            } else {
+                String::new()
+            },
+            annotated,
+        });
+    }
+    out
+}
+
 /// Split a CGI response (header block + body) produced by `git http-backend`. The header block
 /// ends at the first blank line (`\r\n\r\n` or `\n\n`). A `Status:` header sets the HTTP status
 /// (default 200); all other headers are forwarded verbatim.
@@ -746,6 +980,49 @@ mod tests {
         assert_eq!(commits[0].time, 1700000000);
         assert_eq!(commits[0].subject, "Initial commit");
         assert_eq!(commits[1].subject, "Second");
+    }
+
+    #[test]
+    fn commit_detail_parses_parents_and_full_message() {
+        let raw = "deadbeef\u{1f}Ada\u{1f}ada@x\u{1f}1700000000\u{1f}p1 p2\u{1f}Subject line\n\nBody paragraph.\n";
+        let d = parse_commit_detail(raw).unwrap();
+        assert_eq!(d.oid, "deadbeef");
+        assert_eq!(d.author_name, "Ada");
+        assert_eq!(d.time, 1700000000);
+        assert_eq!(d.parents, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(d.subject(), "Subject line");
+        assert!(d.message.contains("Body paragraph."));
+        // A root commit has no parents.
+        let root = parse_commit_detail("abc\u{1f}A\u{1f}a@x\u{1f}1\u{1f}\u{1f}init").unwrap();
+        assert!(root.parents.is_empty());
+        assert!(parse_commit_detail("").is_none());
+    }
+
+    #[test]
+    fn branch_refs_parse() {
+        let raw = "main\u{1f}aaa111\u{1f}1700000100\u{1f}Latest work\n\
+                   feature\u{1f}bbb222\u{1f}1700000000\u{1f}WIP <thing>\n";
+        let branches = parse_branch_refs(raw);
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert_eq!(branches[0].oid, "aaa111");
+        assert_eq!(branches[0].time, 1700000100);
+        assert_eq!(branches[1].subject, "WIP <thing>");
+    }
+
+    #[test]
+    fn tag_refs_parse_annotated_and_lightweight() {
+        // v1 is annotated (points at a tag object, peeled to ccc333); v0 is lightweight.
+        let raw = "v1\u{1f}tag999\u{1f}ccc333\u{1f}tag\u{1f}1700000200\u{1f}first release\n\
+                   v0\u{1f}ddd444\u{1f}\u{1f}commit\u{1f}1700000100\u{1f}some commit subject\n";
+        let tags = parse_tag_refs(raw);
+        assert_eq!(tags.len(), 2);
+        assert!(tags[0].annotated);
+        assert_eq!(tags[0].oid, "ccc333", "annotated tag peels to the target commit");
+        assert_eq!(tags[0].message, "first release");
+        assert!(!tags[1].annotated);
+        assert_eq!(tags[1].oid, "ddd444");
+        assert_eq!(tags[1].message, "", "lightweight tag has no tag message");
     }
 
     #[test]

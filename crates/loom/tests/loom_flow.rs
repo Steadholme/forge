@@ -698,6 +698,285 @@ async fn pull_request_compare_create_and_merge() {
 }
 
 // ===========================================================================
+// Commit history + commit page + branches/tags + settings
+// ===========================================================================
+
+/// Seed `n` linear commits (same tree, subjects `commit-001..commit-00n`) on `branch`; returns
+/// the commit OIDs OLDEST-first.
+fn seed_linear_commits(git_dir: &str, branch: &str, n: usize) -> Vec<String> {
+    let blob = git_capture(git_dir, &["hash-object", "-w", "--stdin"], "x\n");
+    let tree = git_capture(git_dir, &["mktree"], &format!("100644 blob {blob}\tfile.txt\n"));
+    let mut oids = Vec::with_capacity(n);
+    let mut parent: Option<String> = None;
+    for i in 1..=n {
+        let msg = format!("commit-{i:03}");
+        let commit = match &parent {
+            Some(p) => git_capture(git_dir, &["commit-tree", &tree, "-p", p, "-m", &msg], ""),
+            None => git_capture(git_dir, &["commit-tree", &tree, "-m", &msg], ""),
+        };
+        parent = Some(commit.clone());
+        oids.push(commit);
+    }
+    git_capture(
+        git_dir,
+        &["update-ref", &format!("refs/heads/{branch}"), oids.last().unwrap()],
+        "",
+    );
+    oids
+}
+
+#[tokio::test]
+async fn commit_history_keyset_pagination() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "hist", "").await;
+    let git_dir = git.repo_path("alice", "hist").to_string_lossy().to_string();
+    let oids = seed_linear_commits(&git_dir, "main", 55);
+
+    // Page 1: the newest 50 (commit-055 .. commit-006) and an "Older" keyset link anchored at the
+    // last shown commit (commit-006 = oids[5]).
+    let p1 = send(&app, get("/r/alice/hist/commits", Some("alice"))).await;
+    assert_eq!(p1.status, StatusCode::OK);
+    assert!(p1.body.contains("commit-055"));
+    assert!(p1.body.contains("commit-006"));
+    assert!(!p1.body.contains("commit-005"), "page 1 stops at 50 rows");
+    let anchor = &oids[5];
+    assert!(
+        p1.body.contains(&format!("after={anchor}")),
+        "Older link anchors at the last shown commit"
+    );
+    // Short shas link to the commit page.
+    assert!(p1.body.contains(&format!("/r/alice/hist/commit/{}", oids[54])));
+
+    // Page 2 (keyset): the remaining 5, no further Older link, and a Newest rewind.
+    let p2 = send(
+        &app,
+        get(&format!("/r/alice/hist/commits?ref=main&after={anchor}"), Some("alice")),
+    )
+    .await;
+    assert_eq!(p2.status, StatusCode::OK);
+    assert!(p2.body.contains("commit-005"));
+    assert!(p2.body.contains("commit-001"));
+    assert!(!p2.body.contains("commit-006"), "the anchor itself is not repeated");
+    assert!(!p2.body.contains("after="), "no next page after the last commit");
+    assert!(p2.body.contains("Newest"));
+
+    // An unknown branch is a 404; a malformed anchor is a 400.
+    let bad_ref = send(&app, get("/r/alice/hist/commits?ref=nope", Some("alice"))).await;
+    assert_eq!(bad_ref.status, StatusCode::NOT_FOUND);
+    let bad_after = send(
+        &app,
+        get("/r/alice/hist/commits?after=--not-hex", Some("alice")),
+    )
+    .await;
+    assert_eq!(bad_after.status, StatusCode::BAD_REQUEST);
+
+    // An empty repo shows the empty state, not an error.
+    create_repo(&app, "alice", "empty", "").await;
+    let empty = send(&app, get("/r/alice/empty/commits", Some("alice"))).await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(empty.body.contains("no commits yet"));
+}
+
+#[tokio::test]
+async fn commit_page_renders_diff_and_escapes_remote_input() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+
+    // The commit page: metadata + the diff of commit B (adds the line "two").
+    let page = send(
+        &app,
+        get(&format!("/r/alice/proj/commit/{feature_oid}"), Some("alice")),
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains(&feature_oid), "full sha shown");
+    assert!(page.body.contains("Seed"), "author shown");
+    assert!(page.body.contains("diff-row--add"), "diff rendered with the diff renderer");
+    assert!(page.body.contains("1 file changed"), "shortstat summary shown");
+    // Parent link points at commit A.
+    assert!(page.body.contains("/r/alice/proj/commit/"));
+
+    // An abbreviated sha resolves to the same commit.
+    let short = &feature_oid[..10];
+    let abbrev = send(&app, get(&format!("/r/alice/proj/commit/{short}"), Some("alice"))).await;
+    assert_eq!(abbrev.status, StatusCode::OK);
+    assert!(abbrev.body.contains(&feature_oid));
+
+    // A commit whose subject carries an XSS payload renders escaped on BOTH the history list and
+    // the commit page (commit messages are remote input).
+    let blob = git_capture(&git_dir, &["hash-object", "-w", "--stdin"], "one\ntwo\nthree\n");
+    let tree = git_capture(&git_dir, &["mktree"], &format!("100644 blob {blob}\tfile.txt\n"));
+    let evil = git_capture(
+        &git_dir,
+        &["commit-tree", &tree, "-p", &feature_oid, "-m", "evil <script>alert(1)</script>"],
+        "",
+    );
+    git_capture(&git_dir, &["update-ref", "refs/heads/feature", &evil], "");
+
+    let hist = send(&app, get("/r/alice/proj/commits?ref=feature", Some("alice"))).await;
+    assert_eq!(hist.status, StatusCode::OK);
+    assert!(!hist.body.contains("<script>alert(1)</script>"));
+    assert!(hist.body.contains("evil &lt;script&gt;"));
+
+    let evil_page = send(&app, get(&format!("/r/alice/proj/commit/{evil}"), Some("alice"))).await;
+    assert_eq!(evil_page.status, StatusCode::OK);
+    assert!(!evil_page.body.contains("<script>alert(1)</script>"));
+    assert!(evil_page.body.contains("evil &lt;script&gt;"));
+
+    // Malformed sha -> 400; well-formed but unknown -> 404.
+    let bad = send(&app, get("/r/alice/proj/commit/not-hex!", Some("alice"))).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    let missing = send(&app, get("/r/alice/proj/commit/deadbeefdead", Some("alice"))).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn branches_page_lists_branches_and_tags() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+
+    // One annotated tag (with a message that needs escaping) and one lightweight tag.
+    git_capture(
+        &git_dir,
+        &["tag", "-a", "v1.0", "-m", "first release <tag>", &feature_oid],
+        "",
+    );
+    git_capture(&git_dir, &["tag", "v0-light", &feature_oid], "");
+
+    let page = send(&app, get("/r/alice/proj/branches", Some("alice"))).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // Both branches, with the default pill on main and a compare link for the topic branch.
+    assert!(page.body.contains("main"));
+    assert!(page.body.contains("feature"));
+    assert!(page.body.contains(">default</span>"), "default-branch pill");
+    assert!(
+        page.body.contains("/r/alice/proj/compare?base=main&amp;head=feature"),
+        "compare link into the existing PR compare"
+    );
+    // Head sha links into the commit page.
+    assert!(page.body.contains(&format!("/r/alice/proj/commit/{feature_oid}")));
+    // Tags: the annotated message is shown (escaped); the lightweight tag has none.
+    assert!(page.body.contains("v1.0"));
+    assert!(page.body.contains("first release &lt;tag&gt;"));
+    assert!(!page.body.contains("first release <tag>"));
+    assert!(page.body.contains("v0-light"));
+
+    // The tab row is present with Branches active.
+    assert!(page.body.contains("tab--active\" href=\"/r/alice/proj/branches\""));
+}
+
+#[tokio::test]
+async fn settings_guarded_and_default_branch_validated() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    seed_two_branches(&git_dir);
+
+    // A non-owner (no admin groups) gets 403 on GET and POST.
+    let bob_get = send(&app, get("/r/alice/proj/settings", Some("bob"))).await;
+    assert_eq!(bob_get.status, StatusCode::FORBIDDEN);
+    let bob_post = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings",
+            &[("csrf_token", "tok"), ("description", "hax"), ("default_branch", "main")],
+            "tok",
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(bob_post.status, StatusCode::FORBIDDEN);
+
+    // The owner sees the form.
+    let form_page = send(&app, get("/r/alice/proj/settings", Some("alice"))).await;
+    assert_eq!(form_page.status, StatusCode::OK);
+    assert!(form_page.body.contains("Repository settings"));
+    let csrf = form_page.csrf_cookie().expect("csrf on settings");
+
+    // CSRF is required.
+    let no_csrf = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings",
+            &[("csrf_token", "wrong"), ("default_branch", "main")],
+            "the-cookie",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::BAD_REQUEST);
+
+    // A default branch that does not exist is rejected inline (400).
+    let bad_branch = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings",
+            &[("csrf_token", &csrf), ("description", "d"), ("default_branch", "nope")],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(bad_branch.status, StatusCode::BAD_REQUEST);
+    assert!(bad_branch.body.contains("existing branch"));
+
+    // A valid update: new description + default branch flipped to `feature`.
+    let saved = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings",
+            &[
+                ("csrf_token", &csrf),
+                ("description", "new words <b>"),
+                ("default_branch", "feature"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::FOUND);
+    assert_eq!(saved.location(), "/r/alice/proj/settings");
+
+    // The description shows (escaped) on the repo home and the bare repo's HEAD moved.
+    let home = send(&app, get("/r/alice/proj", Some("alice"))).await;
+    assert!(home.body.contains("new words &lt;b&gt;"));
+    assert!(!home.body.contains("new words <b>"));
+    let head = git_capture(&git_dir, &["symbolic-ref", "HEAD"], "");
+    assert_eq!(head, "refs/heads/feature", "bare-repo HEAD follows the default branch");
+
+    // An estate admin (X-Auth-Groups: admins) may edit a foreign repo's settings.
+    let admin_save = send(
+        &app,
+        post_form_groups(
+            "/r/alice/proj/settings",
+            &[
+                ("csrf_token", &csrf),
+                ("description", "admin edit"),
+                ("default_branch", "feature"),
+            ],
+            &csrf,
+            "carol",
+            "admins",
+        ),
+    )
+    .await;
+    assert_eq!(admin_save.status, StatusCode::FOUND, "admin may edit settings");
+}
+
+// ===========================================================================
 // git smart-HTTP: advertisement + PAT auth policy
 // ===========================================================================
 

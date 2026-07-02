@@ -72,6 +72,18 @@ async fn pg_store_full_integration() {
     assert!(!got.is_private);
     assert_eq!(got.default_branch, "main");
 
+    // Editable settings (description + default branch) via the portable UPDATE.
+    assert!(store
+        .update_repo_settings(&got.id, "edited words", "develop")
+        .await
+        .unwrap());
+    let edited = store.get_repo("alice", "pub").await.unwrap().unwrap();
+    assert_eq!(edited.description, "edited words");
+    assert_eq!(edited.default_branch, "develop");
+    assert!(!store.update_repo_settings("rp_missing", "x", "main").await.unwrap());
+    // Restore for the assertions below.
+    assert!(store.update_repo_settings(&got.id, "desc pub", "main").await.unwrap());
+
     let alice_view: Vec<String> = store
         .list_visible_repos("alice")
         .await

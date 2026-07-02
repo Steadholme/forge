@@ -46,6 +46,15 @@ pub trait Store: Send + Sync {
     /// Delete a repo row by id (used to roll back a half-created repo when `git init` fails).
     async fn delete_repo(&self, id: &str) -> Result<bool, StoreError>;
 
+    /// Update a repo's editable settings (description + default branch) by id. Returns whether a
+    /// row changed.
+    async fn update_repo_settings(
+        &self,
+        id: &str,
+        description: &str,
+        default_branch: &str,
+    ) -> Result<bool, StoreError>;
+
     // --- issues --------------------------------------------------------------
     /// Create an issue, atomically allocating the next per-repo `number`. Returns the stored
     /// issue (with its assigned number and `open` state).
@@ -212,6 +221,23 @@ impl Store for InMemoryStore {
         let before = repos.len();
         repos.retain(|r| r.id != id);
         Ok(repos.len() != before)
+    }
+
+    async fn update_repo_settings(
+        &self,
+        id: &str,
+        description: &str,
+        default_branch: &str,
+    ) -> Result<bool, StoreError> {
+        let mut repos = self.repos.lock().expect("repos lock poisoned");
+        for r in repos.iter_mut() {
+            if r.id == id {
+                r.description = description.to_string();
+                r.default_branch = default_branch.to_string();
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn create_issue(
@@ -542,6 +568,17 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Editable-settings columns, added idempotently for tables created before they existed.
+        sqlx::query(
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS default_branch TEXT NOT NULL DEFAULT 'main'",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS issues (\
                  id TEXT PRIMARY KEY, \
@@ -767,6 +804,24 @@ impl Store for PgStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_repo_settings(
+        &self,
+        id: &str,
+        description: &str,
+        default_branch: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE repos SET description = $1, default_branch = $2 WHERE id = $3",
+        )
+        .bind(description)
+        .bind(default_branch)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1208,6 +1263,21 @@ mod tests {
         assert!(seen.contains(&"pub".to_string()));
         assert!(seen.contains(&"sec".to_string()));
         assert!(!seen.contains(&"vsec".to_string()));
+    }
+
+    #[tokio::test]
+    async fn repo_settings_update() {
+        let s = InMemoryStore::new();
+        s.create_repo(&repo("u", "a", false, 1)).await.unwrap();
+        assert!(s
+            .update_repo_settings("rp_u_a", "new words", "develop")
+            .await
+            .unwrap());
+        let updated = s.get_repo("u", "a").await.unwrap().unwrap();
+        assert_eq!(updated.description, "new words");
+        assert_eq!(updated.default_branch, "develop");
+        // Unknown id changes nothing.
+        assert!(!s.update_repo_settings("nope", "x", "main").await.unwrap());
     }
 
     #[tokio::test]

@@ -717,7 +717,8 @@ fn render_commits_card(commits: &[CommitInfo]) -> String {
 }
 
 /// Card rendering the unified diff as a colored, escaped table. Large diffs show a size notice.
-fn render_diff_card(diff: &str) -> String {
+/// Shared with the commit page (`pub(crate)`) — the ONE diff renderer in the crate.
+pub(crate) fn render_diff_card(diff: &str) -> String {
     let inner = if diff.trim().is_empty() {
         "<div class=\"card__body\"><p class=\"muted\">No file changes.</p></div>".to_string()
     } else if diff.len() > MAX_BLOB_RENDER_BYTES {
