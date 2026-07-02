@@ -28,11 +28,11 @@ pub mod store;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use rand::RngCore;
+use axum::Router;
 use rand::rngs::OsRng;
+use rand::RngCore;
 
 use crate::config::Config;
 use crate::gitops::GitOps;
@@ -72,6 +72,10 @@ pub fn app(state: AppState) -> Router {
         .route("/new", post(handlers::repos::create))
         .route("/r/{owner}/{name}", get(handlers::repos::view))
         .route("/r/{owner}/{name}/fork", post(handlers::repos::fork))
+        .route(
+            "/r/{owner}/{name}/search",
+            get(handlers::repos::code_search),
+        )
         .route("/r/{owner}/{name}/tree/{*path}", get(handlers::repos::tree))
         .route("/r/{owner}/{name}/blob/{*path}", get(handlers::repos::blob))
         .route(

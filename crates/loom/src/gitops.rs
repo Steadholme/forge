@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::config::Config;
@@ -83,6 +83,30 @@ pub struct BlameLine {
     /// Final line number in the blamed file.
     pub lineno: usize,
     pub content: String,
+}
+
+/// One fixed-string `git grep` hit in a repository tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeSearchHit {
+    pub path: String,
+    pub line: usize,
+    pub content: String,
+}
+
+/// Hits grouped by file for repository code search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeSearchFile {
+    pub path: String,
+    pub hits: Vec<CodeSearchHit>,
+}
+
+/// Bounded repository code-search results.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeSearchResults {
+    pub files: Vec<CodeSearchFile>,
+    pub total_hits: usize,
+    pub limited: bool,
+    pub per_file_limited: bool,
 }
 
 /// One branch row for the branches page: head OID + head-commit subject and time.
@@ -388,6 +412,94 @@ impl GitOps {
             _ => return Vec::new(),
         };
         parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Fixed-string repository code search using `git grep`.
+    ///
+    /// The query is passed as an argv value after `-e`, never through a shell, and `-F` keeps user
+    /// input out of git's regex engine. `-m` caps matches per file; stdout is streamed and stopped
+    /// after `result_limit` stored hits so large repos do not require capturing all output.
+    pub async fn code_search(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+        query: &str,
+        ignore_case: bool,
+        result_limit: usize,
+        per_file_limit: usize,
+    ) -> std::io::Result<CodeSearchResults> {
+        let result_limit = result_limit.max(1);
+        let per_file_limit = per_file_limit.max(1);
+        let repo = self.repo_path(owner, name);
+        let repo_dir = repo.to_string_lossy();
+        let per_file_arg = format!("-m{per_file_limit}");
+
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.arg("--git-dir")
+            .arg(repo_dir.as_ref())
+            .arg("grep")
+            .arg("-n")
+            .arg("-F")
+            .arg("-I")
+            .arg(&per_file_arg);
+        if ignore_case {
+            cmd.arg("-i");
+        }
+        cmd.arg("-e")
+            .arg(query)
+            .arg(commit_oid)
+            .arg("--")
+            .arg(".")
+            // safe.directory=* so a uid-mismatched bind mount never trips "dubious ownership".
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "safe.directory")
+            .env("GIT_CONFIG_VALUE_0", "*")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("git grep stdout unavailable"))?;
+        let mut reader = BufReader::new(stdout);
+        let mut buf = Vec::new();
+        let mut files = Vec::new();
+        let mut total_hits = 0usize;
+        let mut limited = false;
+
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                buf.pop();
+            }
+            let line = String::from_utf8_lossy(&buf);
+            let Some(hit) = parse_git_grep_line(&line, commit_oid) else {
+                continue;
+            };
+            if total_hits >= result_limit {
+                limited = true;
+                let _ = child.start_kill();
+                break;
+            }
+            push_code_search_hit(&mut files, hit);
+            total_hits += 1;
+        }
+
+        let _status = child.wait().await?;
+        let per_file_limited = files.iter().any(|f| f.hits.len() >= per_file_limit);
+        Ok(CodeSearchResults {
+            files,
+            total_hits,
+            limited,
+            per_file_limited,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -871,6 +983,54 @@ struct CapturedOut {
     stdout: Vec<u8>,
 }
 
+fn push_code_search_hit(files: &mut Vec<CodeSearchFile>, hit: CodeSearchHit) {
+    if let Some(file) = files.iter_mut().find(|f| f.path == hit.path) {
+        file.hits.push(hit);
+    } else {
+        files.push(CodeSearchFile {
+            path: hit.path.clone(),
+            hits: vec![hit],
+        });
+    }
+}
+
+/// Parse one `git grep -n <tree>` output row.
+///
+/// With a tree-ish argument git prefixes each row with `<tree>:`; callers pass a resolved commit
+/// OID, so that prefix is deterministic and can be stripped before reading `path:line:content`.
+fn parse_git_grep_line(line: &str, commit_oid: &str) -> Option<CodeSearchHit> {
+    let body = line
+        .strip_prefix(commit_oid)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .unwrap_or(line);
+
+    for (idx, ch) in body.char_indices() {
+        if ch != ':' {
+            continue;
+        }
+        let rest = &body[idx + 1..];
+        let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits_len == 0 || !rest[digits_len..].starts_with(':') {
+            continue;
+        }
+        let line_no = rest[..digits_len].parse::<usize>().ok()?;
+        if line_no == 0 {
+            return None;
+        }
+        let path = &body[..idx];
+        if path.is_empty() {
+            return None;
+        }
+        return Some(CodeSearchHit {
+            path: path.to_string(),
+            line: line_no,
+            content: rest[digits_len + 1..].to_string(),
+        });
+    }
+
+    None
+}
+
 /// Parse `git ls-tree --long -z` output into [`TreeEntry`] rows.
 ///
 /// Each record (NUL-separated) is `<mode> SP <type> SP <oid> SP* <size> TAB <name>`. For a tree
@@ -1206,6 +1366,30 @@ filename src/main.rs\n\
         assert!(!is_safe_repo_path("/etc/passwd"));
         assert!(!is_safe_repo_path("src/../secret"));
         assert!(!is_safe_repo_path("src//main.rs"));
+    }
+
+    #[test]
+    fn git_grep_rows_parse_tree_prefix_colons_and_content() {
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hit = parse_git_grep_line(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:src/main.rs:42:println!(\"a:b\")",
+            oid,
+        )
+        .unwrap();
+        assert_eq!(hit.path, "src/main.rs");
+        assert_eq!(hit.line, 42);
+        assert_eq!(hit.content, "println!(\"a:b\")");
+
+        let path_with_colon = parse_git_grep_line(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:a:b.txt:7:needle",
+            oid,
+        )
+        .unwrap();
+        assert_eq!(path_with_colon.path, "a:b.txt");
+        assert_eq!(path_with_colon.line, 7);
+        assert_eq!(path_with_colon.content, "needle");
+
+        assert!(parse_git_grep_line("no-line-number", oid).is_none());
     }
 
     #[test]

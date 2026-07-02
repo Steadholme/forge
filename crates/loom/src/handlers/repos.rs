@@ -10,23 +10,26 @@
 //! sanitising [`crate::markdown`] pipeline: raw HTML is downgraded to text and unsafe link schemes
 //! are defused, so no producer-supplied markup ever executes.
 
-use axum::Form;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use axum::Form;
 use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::config::COMMIT_LIMIT;
 use crate::error::AppError;
-use crate::gitops::{BlameLine, CommitInfo, TreeEntry};
+use crate::gitops::{BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, TreeEntry};
 use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
-use crate::model::{Release, Repo, validate_owner_sub, validate_repo_name};
-use crate::{AppState, now_secs, random_alnum};
+use crate::model::{validate_owner_sub, validate_repo_name, Release, Repo};
+use crate::{now_secs, random_alnum, AppState};
 
 /// Length of a repo/issue/pat id (62-symbol alphabet).
 const ID_LEN: usize = 16;
 const FILE_HISTORY_PER_PAGE: usize = 50;
+const CODE_SEARCH_RESULT_LIMIT: usize = 200;
+const CODE_SEARCH_FILE_LIMIT: usize = 20;
+const CODE_SEARCH_QUERY_MAX_CHARS: usize = 128;
 
 // ===========================================================================
 // GET / — repo list + create form
@@ -275,6 +278,87 @@ pub async fn blob(
 }
 
 // ===========================================================================
+// GET /r/{owner}/{name}/search?q=<query>&ref=<ref> — repository code search
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct CodeSearchQuery {
+    #[serde(default)]
+    pub q: String,
+    #[serde(default, rename = "ref")]
+    pub ref_name: String,
+    #[serde(default)]
+    pub i: Option<String>,
+}
+
+impl CodeSearchQuery {
+    fn ignore_case(&self) -> bool {
+        matches!(self.i.as_deref(), Some("1" | "true" | "on" | "yes"))
+    }
+}
+
+pub async fn code_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<CodeSearchQuery>,
+) -> Result<Response, AppError> {
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let header = header_with_counts(&state, &repo, "code").await;
+    let query = q.q.trim().to_string();
+    let ref_name = normalize_search_ref(&q.ref_name);
+    let ignore_case = q.ignore_case();
+    let mut results = None;
+    let mut notice = None;
+
+    if query.is_empty() {
+        notice = Some("Enter a search term.".to_string());
+    } else if query.chars().count() > CODE_SEARCH_QUERY_MAX_CHARS {
+        notice = Some(format!(
+            "Search terms are limited to {CODE_SEARCH_QUERY_MAX_CHARS} characters."
+        ));
+    } else {
+        match resolve_blame_ref(&state, &repo, &ref_name).await {
+            Some(commit) => {
+                let found = state
+                    .git
+                    .code_search(
+                        &repo.owner_sub,
+                        &repo.name,
+                        &commit,
+                        &query,
+                        ignore_case,
+                        CODE_SEARCH_RESULT_LIMIT,
+                        CODE_SEARCH_FILE_LIMIT,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(format!("git grep failed: {e}")))?;
+                results = Some(found);
+            }
+            None => {
+                notice = Some("No such ref in this repository.".to_string());
+            }
+        }
+    }
+
+    let body = render_code_search_page(
+        &repo,
+        &header,
+        &query,
+        &ref_name,
+        ignore_case,
+        results.as_ref(),
+        notice.as_deref(),
+    );
+    Ok(html_ok(page(
+        &format!("{owner}/{name} · Code search"),
+        Some(&who.email),
+        &body,
+    )))
+}
+
+// ===========================================================================
 // GET /r/{owner}/{name}/blame/{ref}/{*path} — line-level blame for a file
 // ===========================================================================
 
@@ -513,6 +597,15 @@ fn clean_blame_subpath(path: &str) -> Result<String, AppError> {
     clean_subpath(path)
 }
 
+fn normalize_search_ref(ref_name: &str) -> String {
+    let trimmed = ref_name.trim();
+    if trimmed.is_empty() {
+        "HEAD".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 async fn resolve_blame_ref(state: &AppState, repo: &Repo, ref_name: &str) -> Option<String> {
     if ref_name == "HEAD" {
         return state.git.head_commit(&repo.owner_sub, &repo.name).await;
@@ -706,12 +799,13 @@ async fn render_code_page(
         "code",
         parent.as_ref(),
     );
+    let search = render_code_search_form(repo, "", "HEAD", false);
 
     let head = state.git.head_commit(&repo.owner_sub, &repo.name).await;
     let Some(commit) = head else {
         // Empty repo: show how to push the first commit.
         let push = render_empty_repo(repo, &state.config.public_base_url);
-        return Ok(format!("{header}{push}"));
+        return Ok(format!("{header}{search}{push}"));
     };
 
     let entries = state
@@ -795,7 +889,9 @@ async fn render_code_page(
         String::new()
     };
 
-    Ok(format!("{header}{files}{readme}{latest_release}{extras}"))
+    Ok(format!(
+        "{header}{search}{files}{readme}{latest_release}{extras}"
+    ))
 }
 
 /// Render a repo-root README as sanitised markdown HTML (GitHub-style), or nothing when there is
@@ -996,6 +1092,158 @@ pub(crate) fn render_repo_header_with_parent(
     )
 }
 
+fn render_code_search_form(repo: &Repo, query: &str, ref_name: &str, ignore_case: bool) -> String {
+    let checked = if ignore_case { " checked" } else { "" };
+    format!(
+        r##"<section class="card code-search">
+  <div class="card__body">
+    <form class="code-search__form" action="/r/{owner}/{name}/search" method="get" role="search">
+      <input class="code-search__input" type="search" name="q" value="{query}" placeholder="Search code">
+      <input class="code-search__ref" type="text" name="ref" value="{ref_name}" aria-label="Git ref">
+      <label class="code-search__case"><input type="checkbox" name="i" value="1"{checked}> Ignore case</label>
+      <button class="btn btn-sm" type="submit">Search</button>
+    </form>
+  </div>
+</section>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        query = esc(query),
+        ref_name = esc(ref_name),
+        checked = checked,
+    )
+}
+
+fn render_code_search_page(
+    repo: &Repo,
+    header: &str,
+    query: &str,
+    ref_name: &str,
+    ignore_case: bool,
+    results: Option<&CodeSearchResults>,
+    notice: Option<&str>,
+) -> String {
+    let form = render_code_search_form(repo, query, ref_name, ignore_case);
+    let body = if let Some(message) = notice {
+        format!("<p class=\"muted code-search__empty\">{}</p>", esc(message))
+    } else if let Some(results) = results {
+        render_code_search_results(repo, query, ignore_case, results)
+    } else {
+        String::new()
+    };
+
+    format!(
+        r##"{header}{form}
+<section class="card code-search__results">
+  <div class="card__head"><h2>Code search</h2><span class="muted">Ref {ref_name}</span></div>
+  <div class="card__body">{body}</div>
+</section>"##,
+        header = header,
+        form = form,
+        ref_name = esc(ref_name),
+        body = body,
+    )
+}
+
+fn render_code_search_results(
+    repo: &Repo,
+    query: &str,
+    ignore_case: bool,
+    results: &CodeSearchResults,
+) -> String {
+    if results.total_hits == 0 {
+        return "<p class=\"muted code-search__empty\">No code results found.</p>".to_string();
+    }
+
+    let mut html = format!(
+        "<p class=\"muted code-search__summary\">{} result{} in {} file{}.</p>",
+        results.total_hits,
+        if results.total_hits == 1 { "" } else { "s" },
+        results.files.len(),
+        if results.files.len() == 1 { "" } else { "s" },
+    );
+    if results.limited {
+        html.push_str(&format!(
+            "<p class=\"muted code-search__limit\">Showing the first {CODE_SEARCH_RESULT_LIMIT} results.</p>"
+        ));
+    }
+    if results.per_file_limited {
+        html.push_str(&format!(
+            "<p class=\"muted code-search__limit\">Showing up to {CODE_SEARCH_FILE_LIMIT} matches per file.</p>"
+        ));
+    }
+    for file in &results.files {
+        html.push_str(&render_code_search_file(repo, file, query, ignore_case));
+    }
+    html
+}
+
+fn render_code_search_file(
+    repo: &Repo,
+    file: &CodeSearchFile,
+    query: &str,
+    ignore_case: bool,
+) -> String {
+    let blob_href = format!("/r/{}/{}/blob/{}", repo.owner_sub, repo.name, file.path);
+    let hits = file
+        .hits
+        .iter()
+        .map(|hit| {
+            let line_href = format!("{blob_href}#L{}", hit.line);
+            format!(
+                "<li class=\"code-search__hit\">\
+                   <a class=\"code-search__line\" href=\"{href}\">L{line}</a>\
+                   <code class=\"code-search__code\">{code}</code>\
+                 </li>",
+                href = esc(&line_href),
+                line = hit.line,
+                code = highlight_code_search_hit(&hit.content, query, ignore_case),
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        "<div class=\"code-search__file\">\
+           <h3><a href=\"{href}\">{path}</a></h3>\
+           <ol class=\"code-search__hits\">{hits}</ol>\
+         </div>",
+        href = esc(&blob_href),
+        path = esc(&file.path),
+        hits = hits,
+    )
+}
+
+fn highlight_code_search_hit(content: &str, query: &str, ignore_case: bool) -> String {
+    let escaped_content = esc(content);
+    let escaped_query = esc(query);
+    if escaped_query.is_empty() {
+        return escaped_content;
+    }
+
+    let haystack = if ignore_case {
+        escaped_content.to_ascii_lowercase()
+    } else {
+        escaped_content.clone()
+    };
+    let needle = if ignore_case {
+        escaped_query.to_ascii_lowercase()
+    } else {
+        escaped_query
+    };
+    let mut out = String::with_capacity(escaped_content.len());
+    let mut tail = 0usize;
+    while let Some(rel) = haystack[tail..].find(&needle) {
+        let start = tail + rel;
+        let end = start + needle.len();
+        out.push_str(&escaped_content[tail..start]);
+        out.push_str("<mark class=\"code-search-hit\">");
+        out.push_str(&escaped_content[start..end]);
+        out.push_str("</mark>");
+        tail = end;
+    }
+    out.push_str(&escaped_content[tail..]);
+    out
+}
+
 /// Empty-repo helper: the exact commands to seed the first commit + push with a PAT.
 fn render_empty_repo(repo: &Repo, base_url: &str) -> String {
     let clone_url = format!(
@@ -1104,6 +1352,7 @@ fn render_blob(
     );
     let history_href = file_history_href(repo, "HEAD", path);
     let blame_href = format!("/r/{}/{}/blame/HEAD/{}", repo.owner_sub, repo.name, path);
+    let search = render_code_search_form(repo, "", "HEAD", false);
     let content = if bytes.contains(&0) {
         "<div class=\"card__body\"><p class=\"muted\">Binary file not shown.</p></div>".to_string()
     } else if bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
@@ -1128,12 +1377,13 @@ fn render_blob(
         }
     };
     format!(
-        r##"{header}
+        r##"{header}{search}
 <section class="card">
   <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm" href="{history_href}">History</a><a class="btn btn-ghost btn-sm" href="{blame_href}">Blame</a><span class="muted">{size}</span></span></div>
   {content}
 </section>"##,
         header = header,
+        search = search,
         breadcrumb = render_breadcrumb(repo, path, true),
         history_href = esc(&history_href),
         blame_href = esc(&blame_href),
@@ -1434,12 +1684,13 @@ fn render_text_blob(text: &str) -> String {
     let mut rows = String::new();
     for (i, raw_line) in body.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let n = i + 1;
         rows.push_str(&format!(
-            "<tr class=\"blob-line\">\
-               <td class=\"blob-line__num\">{n}</td>\
+            "<tr id=\"L{n}\" class=\"blob-line\">\
+               <td class=\"blob-line__num\"><a href=\"#L{n}\">{n}</a></td>\
                <td class=\"blob-line__code\">{code}</td>\
              </tr>",
-            n = i + 1,
+            n = n,
             code = esc(line),
         ));
     }
@@ -1470,6 +1721,8 @@ mod tests {
         assert_eq!(clean_subpath("").unwrap(), "");
         assert!(clean_blame_subpath("/src/main.rs").is_err());
         assert_eq!(clean_blame_subpath("src/main.rs").unwrap(), "src/main.rs");
+        assert_eq!(normalize_search_ref(""), "HEAD");
+        assert_eq!(normalize_search_ref(" feature/x "), "feature/x");
     }
 
     #[test]
@@ -1508,12 +1761,25 @@ mod tests {
     fn text_blob_is_line_numbered_and_escaped() {
         let html = render_text_blob("let x = 1;\n<b>two</b>\n");
         // Two lines, numbered 1 and 2 (the trailing newline does not add a third row).
-        assert!(html.contains(">1<"));
-        assert!(html.contains(">2<"));
-        assert!(!html.contains(">3<"));
+        assert!(html.contains("id=\"L1\""));
+        assert!(html.contains("href=\"#L2\">2</a>"));
+        assert!(!html.contains("id=\"L3\""));
         // HTML metacharacters in the content are escaped, never live markup.
         assert!(!html.contains("<b>two</b>"));
         assert!(html.contains("&lt;b&gt;two&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn code_search_highlight_escapes_before_marking() {
+        let html = highlight_code_search_hit("<script>Needle</script>", "<script>", false);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains(
+            "<mark class=\"code-search-hit\">&lt;script&gt;</mark>Needle&lt;/script&gt;"
+        ));
+
+        let insensitive = highlight_code_search_hit("Needle needle", "needle", true);
+        assert!(insensitive.contains("<mark class=\"code-search-hit\">Needle</mark>"));
+        assert!(insensitive.contains("<mark class=\"code-search-hit\">needle</mark>"));
     }
 
     #[test]

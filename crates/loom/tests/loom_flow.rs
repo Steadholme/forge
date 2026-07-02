@@ -718,6 +718,86 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
 }
 
 #[tokio::test]
+async fn code_search_groups_highlights_links_and_respects_visibility() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "docs", "").await;
+
+    let git_dir = git.repo_path("alice", "docs").to_string_lossy().to_string();
+    seed_repo(
+        &git_dir,
+        "main",
+        &[
+            ("main.rs", "fn main() {\n    println!(\"Needle <x>\");\n}\n"),
+            ("lib.rs", "pub const VALUE: &str = \"needle\";\n"),
+        ],
+    );
+
+    let repo_page = send(&app, get("/r/alice/docs", Some("alice"))).await;
+    assert_eq!(repo_page.status, StatusCode::OK);
+    assert!(repo_page.body.contains("class=\"card code-search\""));
+    assert!(repo_page.body.contains("action=\"/r/alice/docs/search\""));
+
+    let search = send(
+        &app,
+        get("/r/alice/docs/search?q=Needle&ref=HEAD", Some("alice")),
+    )
+    .await;
+    assert_eq!(search.status, StatusCode::OK);
+    assert!(search.body.contains("class=\"code-search__file\""));
+    assert!(search.body.contains(">main.rs</a>"));
+    assert!(search
+        .body
+        .contains("href=\"/r/alice/docs/blob/main.rs#L2\""));
+    assert!(search
+        .body
+        .contains("<mark class=\"code-search-hit\">Needle</mark>"));
+    assert!(!search.body.contains("Needle <x>"));
+    assert!(search.body.contains("&lt;x&gt;"));
+
+    let blob = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
+    assert_eq!(blob.status, StatusCode::OK);
+    assert!(blob.body.contains("id=\"L2\""));
+
+    let insensitive = send(
+        &app,
+        get("/r/alice/docs/search?q=needle&ref=HEAD&i=1", Some("alice")),
+    )
+    .await;
+    assert_eq!(insensitive.status, StatusCode::OK);
+    assert!(insensitive.body.contains(">main.rs</a>"));
+    assert!(insensitive.body.contains(">lib.rs</a>"));
+    assert!(insensitive
+        .body
+        .contains("<mark class=\"code-search-hit\">Needle</mark>"));
+
+    let empty = send(&app, get("/r/alice/docs/search?q=&ref=HEAD", Some("alice"))).await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(empty.body.contains("Enter a search term."));
+
+    let none = send(
+        &app,
+        get("/r/alice/docs/search?q=absent&ref=HEAD", Some("alice")),
+    )
+    .await;
+    assert_eq!(none.status, StatusCode::OK);
+    assert!(none.body.contains("No code results found."));
+
+    let bad_ref = send(
+        &app,
+        get("/r/alice/docs/search?q=Needle&ref=missing", Some("alice")),
+    )
+    .await;
+    assert_eq!(bad_ref.status, StatusCode::OK);
+    assert!(bad_ref.body.contains("No such ref in this repository."));
+
+    create_repo(&app, "alice", "secret", "private").await;
+    let hidden = send(&app, get("/r/alice/secret/search?q=Needle", Some("bob"))).await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn blame_view_renders_groups_and_graceful_notices() {
     let state = temp_state();
     let git = state.git.clone();
