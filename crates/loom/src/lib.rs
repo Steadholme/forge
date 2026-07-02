@@ -28,11 +28,11 @@ pub mod store;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use axum::Router;
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 
 use crate::config::Config;
 use crate::gitops::GitOps;
@@ -181,6 +181,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/r/{owner}/{name}/pulls/{number}/inline-comment.json",
             post(handlers::pulls::inline_comment_json),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/file-viewed",
+            post(handlers::pulls::file_viewed),
         )
         .route(
             "/r/{owner}/{name}/pulls/{number}/metadata",

@@ -8,11 +8,11 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use loom::auth::{hash_token, new_pat_secret};
 use loom::model::Pat;
 use loom::store::Store;
-use loom::{app, build_dev_state_at, now_secs, AppState};
+use loom::{AppState, app, build_dev_state_at, now_secs};
 use tower::ServiceExt;
 
 fn temp_state() -> AppState {
@@ -134,6 +134,32 @@ fn post_form(
         .uri(path)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={cookie}"));
+    if let Some(s) = subject {
+        b = b
+            .header("x-auth-subject", s)
+            .header("x-auth-email", format!("{s}@w33d.xyz"));
+    }
+    b.body(Body::from(body)).unwrap()
+}
+
+fn post_form_accept(
+    path: &str,
+    fields: &[(&str, &str)],
+    cookie: &str,
+    subject: Option<&str>,
+    accept: &str,
+) -> Request<Body> {
+    let body = fields
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, enc(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, format!("__Host-csrf={cookie}"))
+        .header(header::ACCEPT, accept);
     if let Some(s) = subject {
         b = b
             .header("x-auth-subject", s)
@@ -711,9 +737,10 @@ async fn blame_view_renders_groups_and_graceful_notices() {
 
     let blob = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
     assert_eq!(blob.status, StatusCode::OK);
-    assert!(blob
-        .body
-        .contains(r#"href="/r/alice/docs/blame/HEAD/main.rs""#));
+    assert!(
+        blob.body
+            .contains(r#"href="/r/alice/docs/blame/HEAD/main.rs""#)
+    );
 
     let blame = send(&app, get("/r/alice/docs/blame/HEAD/main.rs", Some("alice"))).await;
     assert_eq!(blame.status, StatusCode::OK);
@@ -948,7 +975,62 @@ async fn pull_request_compare_create_and_merge() {
     assert!(detail.body.contains("Merge pull request"));
     assert!(detail.body.contains("assignee bob"));
     assert!(detail.body.contains("reviewer carol"));
+    assert!(detail.body.contains("class=\"pr-filetree\""));
+    assert!(detail.body.contains("Viewed 0/1"));
+    assert!(detail.body.contains("href=\"#diff-file-1\""));
+    assert!(
+        detail
+            .body
+            .contains("name=\"file_path\" value=\"file.txt\"")
+    );
+    assert!(detail.body.contains("data-viewed=\"false\""));
     let csrf = detail.csrf_cookie().expect("csrf on detail");
+
+    let bob_detail = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    let bob_csrf = bob_detail.csrf_cookie().expect("csrf on bob detail");
+    let viewed_json = send(
+        &app,
+        post_form_accept(
+            "/r/alice/proj/pulls/1/file-viewed",
+            &[
+                ("csrf_token", &bob_csrf),
+                ("file_path", "file.txt"),
+                ("viewed", "true"),
+            ],
+            &bob_csrf,
+            Some("bob"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(viewed_json.status, StatusCode::OK);
+    assert!(viewed_json.content_type().contains("application/json"));
+    assert!(viewed_json.body.contains(r#""file_path":"file.txt""#));
+    assert!(viewed_json.body.contains(r#""viewed":true"#));
+
+    let bob_after = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    assert!(bob_after.body.contains("Viewed 1/1"));
+    assert!(bob_after.body.contains("data-viewed=\"true\""));
+    assert!(bob_after.body.contains("value=\"true\" checked"));
+
+    let alice_after_viewed = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(alice_after_viewed.body.contains("Viewed 0/1"));
+    assert!(alice_after_viewed.body.contains("data-viewed=\"false\""));
+
+    let bob_csrf = bob_after.csrf_cookie().expect("csrf after bob viewed");
+    let unviewed_json = send(
+        &app,
+        post_form_accept(
+            "/r/alice/proj/pulls/1/file-viewed",
+            &[("csrf_token", &bob_csrf), ("file_path", "file.txt")],
+            &bob_csrf,
+            Some("bob"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(unviewed_json.status, StatusCode::OK);
+    assert!(unviewed_json.body.contains(r#""viewed":false"#));
 
     let meta = send(
         &app,
@@ -1229,9 +1311,10 @@ async fn commit_history_keyset_pagination() {
         "Older link anchors at the last shown commit"
     );
     // Short shas link to the commit page.
-    assert!(p1
-        .body
-        .contains(&format!("/r/alice/hist/commit/{}", oids[54])));
+    assert!(
+        p1.body
+            .contains(&format!("/r/alice/hist/commit/{}", oids[54]))
+    );
 
     // Page 2 (keyset): the remaining 5, no further Older link, and a Newest rewind.
     let p2 = send(
@@ -1543,9 +1626,10 @@ async fn branches_page_lists_branches_and_tags() {
         "compare link into the existing PR compare"
     );
     // Head sha links into the commit page.
-    assert!(page
-        .body
-        .contains(&format!("/r/alice/proj/commit/{feature_oid}")));
+    assert!(
+        page.body
+            .contains(&format!("/r/alice/proj/commit/{feature_oid}"))
+    );
     // Tags: the annotated message is shown (escaped); the lightweight tag has none.
     assert!(page.body.contains("v1.0"));
     assert!(page.body.contains("first release &lt;tag&gt;"));
@@ -1553,9 +1637,10 @@ async fn branches_page_lists_branches_and_tags() {
     assert!(page.body.contains("v0-light"));
 
     // The tab row is present with Branches active.
-    assert!(page
-        .body
-        .contains("tab--active\" href=\"/r/alice/proj/branches\""));
+    assert!(
+        page.body
+            .contains("tab--active\" href=\"/r/alice/proj/branches\"")
+    );
 }
 
 #[tokio::test]
@@ -1695,11 +1780,13 @@ async fn releases_flow_handles_notes_drafts_json_and_delete() {
     .await;
     assert_eq!(deleted.status, StatusCode::FOUND);
     assert_eq!(deleted.location(), "/r/alice/proj/releases");
-    assert!(store
-        .get_release_by_tag(&repo.id, "v2.0.0")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .get_release_by_tag(&repo.id, "v2.0.0")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1937,16 +2024,18 @@ async fn smart_http_blocks_direct_push_to_protected_default_branch() {
     let app = app(state);
     create_repo(&app, "alice", "proj", "").await;
     let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
-    assert!(store
-        .update_repo_settings(
-            &repo.id,
-            &repo.description,
-            &repo.default_branch,
-            false,
-            true
-        )
-        .await
-        .unwrap());
+    assert!(
+        store
+            .update_repo_settings(
+                &repo.id,
+                &repo.description,
+                &repo.default_branch,
+                false,
+                true
+            )
+            .await
+            .unwrap()
+    );
 
     let secret = new_pat_secret();
     store

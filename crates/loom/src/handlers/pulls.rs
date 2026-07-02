@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
 use serde::Deserialize;
@@ -24,8 +24,10 @@ use crate::error::AppError;
 use crate::gitops::CommitInfo;
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
 use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect, short_oid};
-use crate::model::{CommitStatus, Label, Milestone, Pull, PullReview, PullReviewComment, Repo};
-use crate::{now_secs, random_alnum, AppState};
+use crate::model::{
+    CommitStatus, Label, Milestone, PrFileViewed, Pull, PullReview, PullReviewComment, Repo,
+};
+use crate::{AppState, now_secs, random_alnum};
 
 const PULL_ID_LEN: usize = 16;
 const REVIEW_ID_LEN: usize = 16;
@@ -882,6 +884,97 @@ async fn add_inline_comment(
 }
 
 // ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/file-viewed — per-user file viewed state
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct FileViewedForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub file_path: String,
+    #[serde(default)]
+    pub viewed: String,
+}
+
+pub async fn file_viewed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<FileViewedForm>,
+) -> Result<Response, AppError> {
+    let viewed = apply_file_viewed(&state, &headers, &owner, &name, number, &form).await?;
+    if accepts_json(&headers) {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "file_path": viewed.file_path,
+            "viewed": viewed.viewed,
+            "updated_at": viewed.updated_at,
+        }))
+        .into_response());
+    }
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+async fn apply_file_viewed(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    form: &FileViewedForm,
+) -> Result<PrFileViewed, AppError> {
+    if !auth::verify_csrf(headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    let file_path = form
+        .file_path
+        .trim()
+        .chars()
+        .take(1_000)
+        .collect::<String>();
+    if file_path.is_empty() {
+        return Err(AppError::BadRequest(
+            "Viewed state needs a file path.".to_string(),
+        ));
+    }
+    let viewed = matches!(form.viewed.as_str(), "true" | "on" | "1" | "yes");
+    let row = state
+        .store
+        .set_pr_file_viewed(&pull.id, &who.subject, &file_path, viewed, now_secs())
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        actor = who.subject,
+        file_path = file_path,
+        viewed = viewed,
+        "pull file viewed state changed"
+    );
+    Ok(row)
+}
+
+fn accepts_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .any(|part| part.trim().starts_with("application/json"))
+        })
+        .unwrap_or(false)
+}
+
+// ===========================================================================
 // POST /r/{owner}/{name}/pulls/{number}/metadata — labels/milestone
 // ===========================================================================
 
@@ -1446,6 +1539,10 @@ async fn render_detail(
         .diff(&repo.owner_sub, &repo.name, &pull.base, &pull.head)
         .await
         .unwrap_or_default();
+    let viewed_files = state
+        .store
+        .list_pr_file_viewed_for_pr(&pull.id, &who.subject)
+        .await?;
     let checks_card = match state
         .git
         .branch_oid(&repo.owner_sub, &repo.name, &pull.head)
@@ -1465,7 +1562,7 @@ async fn render_detail(
         None => String::new(),
     };
     let commits_card = render_commits_card(&commits);
-    let diff_card = render_diff_card(&diff);
+    let diff_card = render_pr_diff_card(&diff, &viewed_files, repo, pull, csrf);
     let reviews_card =
         render_reviews_card(repo, reviews, review_comments, csrf, pull, who, headers);
     let metadata_form = if can_gate(repo, pull, who) || auth::is_admin(headers) {
@@ -1891,10 +1988,51 @@ pub(crate) fn render_diff_card(diff: &str) -> String {
     )
 }
 
+fn render_pr_diff_card(
+    diff: &str,
+    viewed: &[PrFileViewed],
+    repo: &Repo,
+    pull: &Pull,
+    csrf: &str,
+) -> String {
+    let inner = if diff.trim().is_empty() {
+        "<div class=\"card__body\"><p class=\"muted\">No file changes.</p></div>".to_string()
+    } else if diff.len() > MAX_BLOB_RENDER_BYTES {
+        "<div class=\"card__body\"><p class=\"muted\">The diff is too large to display. \
+         Fetch the branches locally to review it.</p></div>"
+            .to_string()
+    } else {
+        format!(
+            "<div class=\"card__body card__body--code\">{}</div>",
+            render_pr_diff(diff, viewed, repo, pull, csrf)
+        )
+    };
+    format!(
+        r##"<section class="card">
+  <div class="card__head"><h2>Diff</h2></div>
+  {inner}
+</section>"##
+    )
+}
+
 /// One file's slice of a unified diff (its header line + body lines).
 struct DiffFile {
     path: String,
     lines: Vec<String>,
+}
+
+struct DiffFileMeta {
+    anchor: String,
+    display_path: String,
+    additions: i64,
+    deletions: i64,
+    viewed: bool,
+}
+
+struct FileViewedRenderContext<'a> {
+    repo: &'a Repo,
+    pull: &'a Pull,
+    csrf: &'a str,
 }
 
 /// Render a unified diff into per-file **collapsible** blocks, each a line-classified, HTML-escaped
@@ -1902,6 +2040,33 @@ struct DiffFile {
 /// headers) so the progressive-enhancement layer can anchor an inline comment to a line — with
 /// JavaScript off the standalone inline-comment form still works. Every byte is HTML-escaped.
 fn render_diff(diff: &str) -> String {
+    let files = parse_diff_files(diff);
+    let metas = diff_file_metas(&files, &BTreeMap::new());
+    render_diff_files(&files, &metas, None)
+}
+
+fn render_pr_diff(
+    diff: &str,
+    viewed: &[PrFileViewed],
+    repo: &Repo,
+    pull: &Pull,
+    csrf: &str,
+) -> String {
+    let files = parse_diff_files(diff);
+    let viewed_by_path: BTreeMap<String, bool> = viewed
+        .iter()
+        .map(|row| (row.file_path.clone(), row.viewed))
+        .collect();
+    let metas = diff_file_metas(&files, &viewed_by_path);
+    let ctx = FileViewedRenderContext { repo, pull, csrf };
+    format!(
+        "<div class=\"pr-diff\">{}<div class=\"pr-diff__files\">{}</div></div>",
+        render_pr_file_tree(&metas, &ctx),
+        render_diff_files(&files, &metas, Some(&ctx)),
+    )
+}
+
+fn parse_diff_files(diff: &str) -> Vec<DiffFile> {
     let text = diff.strip_suffix('\n').unwrap_or(diff);
 
     // Group into files. A new file starts at a `diff --git ` line; any preamble before the first
@@ -1930,31 +2095,122 @@ fn render_diff(diff: &str) -> String {
             f.lines.push(line);
         }
     }
+    files
+}
 
+fn diff_file_metas(
+    files: &[DiffFile],
+    viewed_by_path: &BTreeMap<String, bool>,
+) -> Vec<DiffFileMeta> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(idx, file)| {
+            let display_path = display_diff_path(file);
+            let (additions, deletions) = diff_file_counts(file);
+            DiffFileMeta {
+                anchor: format!("diff-file-{}", idx + 1),
+                viewed: viewed_by_path.get(&display_path).copied().unwrap_or(false),
+                display_path,
+                additions,
+                deletions,
+            }
+        })
+        .collect()
+}
+
+fn display_diff_path(file: &DiffFile) -> String {
+    if file.path.is_empty() {
+        "changed file".to_string()
+    } else {
+        file.path.clone()
+    }
+}
+
+fn diff_file_counts(file: &DiffFile) -> (i64, i64) {
+    let mut additions = 0i64;
+    let mut deletions = 0i64;
+    for line in &file.lines {
+        match classify_diff_line(line).0 {
+            "diff-row--add" => additions += 1,
+            "diff-row--del" => deletions += 1,
+            _ => {}
+        }
+    }
+    (additions, deletions)
+}
+
+fn render_diff_files(
+    files: &[DiffFile],
+    metas: &[DiffFileMeta],
+    ctx: Option<&FileViewedRenderContext<'_>>,
+) -> String {
     let mut out = String::from(
         "<div class=\"diff-toolbar\" data-diff-toolbar></div><div class=\"diff-files\">",
     );
-    for f in &files {
-        out.push_str(&render_diff_file(f));
+    for (file, meta) in files.iter().zip(metas.iter()) {
+        out.push_str(&render_diff_file(file, meta, ctx));
     }
     out.push_str("</div>");
     out
 }
 
+fn render_pr_file_tree(metas: &[DiffFileMeta], ctx: &FileViewedRenderContext<'_>) -> String {
+    let total = metas.len();
+    if total == 0 {
+        return String::new();
+    }
+    let viewed_count = metas.iter().filter(|meta| meta.viewed).count();
+    let mut items = String::new();
+    for meta in metas {
+        let viewed_cls = if meta.viewed {
+            " pr-filetree__item--viewed"
+        } else {
+            ""
+        };
+        items.push_str(&format!(
+            "<li class=\"pr-filetree__item{viewed_cls}\" data-path=\"{path}\" data-viewed=\"{viewed}\">\
+               {form}\
+               <a class=\"pr-filetree__link\" href=\"#{anchor}\">\
+                 <span class=\"pr-filetree__path\">{path}</span>\
+                 <span class=\"pr-filetree__stat\"><span class=\"diff-add\">+{adds}</span> <span class=\"diff-del\">-{dels}</span></span>\
+               </a>\
+             </li>",
+            viewed_cls = viewed_cls,
+            path = esc(&meta.display_path),
+            viewed = meta.viewed,
+            form = render_file_viewed_form(ctx, &meta.display_path, meta.viewed, "pr-file-viewed--tree"),
+            anchor = meta.anchor,
+            adds = meta.additions,
+            dels = meta.deletions,
+        ));
+    }
+    format!(
+        "<aside class=\"pr-filetree\" aria-label=\"Pull request files\">\
+           <div class=\"pr-filetree__summary\">Viewed {viewed_count}/{total}</div>\
+           <ol class=\"pr-filetree__list\">{items}</ol>\
+         </aside>",
+        viewed_count = viewed_count,
+        total = total,
+        items = items,
+    )
+}
+
 /// Render one file block: a `<details>` with the file path + add/del counts in its summary, then the
 /// line-classified table.
-fn render_diff_file(file: &DiffFile) -> String {
+fn render_diff_file(
+    file: &DiffFile,
+    meta: &DiffFileMeta,
+    ctx: Option<&FileViewedRenderContext<'_>>,
+) -> String {
     let mut rows = String::new();
     let mut new_line: Option<i64> = None; // current line number in the new file (inside a hunk)
-    let mut adds = 0i64;
-    let mut dels = 0i64;
     for line in &file.lines {
         let (row_cls, gutter) = classify_diff_line(line);
         let mut attr = String::new();
         if line.starts_with("@@") {
             new_line = parse_hunk_new_start(line);
         } else if row_cls == "diff-row--add" {
-            adds += 1;
             if let Some(n) = new_line {
                 attr = format!(" data-line=\"{n}\"");
                 new_line = Some(n + 1);
@@ -1964,8 +2220,6 @@ fn render_diff_file(file: &DiffFile) -> String {
                 attr = format!(" data-line=\"{n}\"");
                 new_line = Some(n + 1);
             }
-        } else if row_cls == "diff-row--del" {
-            dels += 1;
         }
         rows.push_str(&format!(
             "<tr class=\"diff-row {row_cls}\"{attr}>\
@@ -1978,23 +2232,67 @@ fn render_diff_file(file: &DiffFile) -> String {
             code = esc(line),
         ));
     }
-    let display = if file.path.is_empty() {
-        "changed file".to_string()
+    let viewed_cls = if meta.viewed {
+        " diff-file--viewed"
     } else {
-        file.path.clone()
+        ""
     };
+    let open_attr = if meta.viewed { "" } else { " open" };
+    let controls = ctx
+        .map(|ctx| {
+            format!(
+                "<div class=\"diff-file__controls\">{}</div>",
+                render_file_viewed_form(
+                    ctx,
+                    &meta.display_path,
+                    meta.viewed,
+                    "pr-file-viewed--diff"
+                )
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "<details class=\"diff-file\" data-path=\"{path}\" open>\
+        "<details id=\"{anchor}\" class=\"diff-file{viewed_cls}\" data-path=\"{path}\" data-viewed=\"{viewed}\"{open_attr}>\
            <summary class=\"diff-file__summary\">\
              <span class=\"diff-file__path\">{path}</span>\
              <span class=\"diff-file__stat\"><span class=\"diff-add\">+{adds}</span> <span class=\"diff-del\">-{dels}</span></span>\
            </summary>\
+           {controls}\
            <table class=\"diff\"><tbody>{rows}</tbody></table>\
          </details>",
-        path = esc(&display),
-        adds = adds,
-        dels = dels,
+        anchor = meta.anchor,
+        viewed_cls = viewed_cls,
+        path = esc(&meta.display_path),
+        viewed = meta.viewed,
+        open_attr = open_attr,
+        adds = meta.additions,
+        dels = meta.deletions,
+        controls = controls,
         rows = rows,
+    )
+}
+
+fn render_file_viewed_form(
+    ctx: &FileViewedRenderContext<'_>,
+    file_path: &str,
+    viewed: bool,
+    class: &str,
+) -> String {
+    let checked = if viewed { " checked" } else { "" };
+    format!(
+        r#"<form class="pr-file-viewed {class}" method="post" action="/r/{owner}/{name}/pulls/{number}/file-viewed">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="file_path" value="{path}">
+  <label class="pr-file-viewed__label"><input class="pr-file-viewed__checkbox" type="checkbox" name="viewed" value="true"{checked}> Viewed</label>
+  <button class="btn btn-ghost btn-sm pr-file-viewed__submit" type="submit">Save</button>
+</form>"#,
+        class = class,
+        owner = esc(&ctx.repo.owner_sub),
+        name = esc(&ctx.repo.name),
+        number = ctx.pull.number,
+        csrf = esc(ctx.csrf),
+        path = esc(file_path),
+        checked = checked,
     )
 }
 

@@ -20,8 +20,8 @@ use std::sync::Arc;
 use loom::model::{CommitStatus, Pat, Release, Repo};
 use loom::now_secs;
 use loom::store::{PgStore, Store};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use sqlx::postgres::PgPoolOptions;
 
 fn repo(owner: &str, name: &str, private: bool, created: i64) -> Repo {
     Repo {
@@ -97,6 +97,7 @@ async fn pg_store_full_integration() {
         "issue_comments",
         "pr_review_comments",
         "pr_reviews",
+        "pr_file_viewed",
         "commit_statuses",
         "releases",
         "issues",
@@ -116,15 +117,19 @@ async fn pg_store_full_integration() {
     let now = now_secs();
 
     // --- repos: create + uniqueness + visibility ---------------------------
-    assert!(store
-        .create_repo(&repo("alice", "pub", false, now))
-        .await
-        .unwrap());
+    assert!(
+        store
+            .create_repo(&repo("alice", "pub", false, now))
+            .await
+            .unwrap()
+    );
     // Duplicate (owner,name) rejected.
-    assert!(!store
-        .create_repo(&repo("alice", "pub", false, now + 1))
-        .await
-        .unwrap());
+    assert!(
+        !store
+            .create_repo(&repo("alice", "pub", false, now + 1))
+            .await
+            .unwrap()
+    );
     store
         .create_repo(&repo("alice", "sec", true, now + 2))
         .await
@@ -148,24 +153,30 @@ async fn pg_store_full_integration() {
     assert_eq!(got.default_branch, "main");
 
     // Editable settings (description + default branch) via the portable UPDATE.
-    assert!(store
-        .update_repo_settings(&got.id, "edited words", "develop", true, true)
-        .await
-        .unwrap());
+    assert!(
+        store
+            .update_repo_settings(&got.id, "edited words", "develop", true, true)
+            .await
+            .unwrap()
+    );
     let edited = store.get_repo("alice", "pub").await.unwrap().unwrap();
     assert_eq!(edited.description, "edited words");
     assert_eq!(edited.default_branch, "develop");
     assert!(edited.require_approval);
     assert!(edited.protect_default_branch);
-    assert!(!store
-        .update_repo_settings("rp_missing", "x", "main", false, false)
-        .await
-        .unwrap());
+    assert!(
+        !store
+            .update_repo_settings("rp_missing", "x", "main", false, false)
+            .await
+            .unwrap()
+    );
     // Restore for the assertions below.
-    assert!(store
-        .update_repo_settings(&got.id, "desc pub", "main", false, false)
-        .await
-        .unwrap());
+    assert!(
+        store
+            .update_repo_settings(&got.id, "desc pub", "main", false, false)
+            .await
+            .unwrap()
+    );
 
     let alice_view: Vec<String> = store
         .list_visible_repos("alice")
@@ -228,11 +239,13 @@ async fn pg_store_full_integration() {
     assert!(store.delete_release(&repo_id, "rl1").await.unwrap());
     assert!(store.get_release(&repo_id, "rl1").await.unwrap().is_none());
 
-    assert!(store
-        .aggregate_state_for_commit(&repo_id, "abc123")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .aggregate_state_for_commit(&repo_id, "abc123")
+            .await
+            .unwrap()
+            .is_none()
+    );
     store
         .upsert_commit_status(&commit_status(&repo_id, "ci/anvil", "pending", now + 10))
         .await
@@ -288,10 +301,12 @@ async fn pg_store_full_integration() {
     assert_eq!(fetched.author_sub, "alice");
     assert!(fetched.is_open());
 
-    assert!(store
-        .set_issue_state("is1", "closed", now + 9)
-        .await
-        .unwrap());
+    assert!(
+        store
+            .set_issue_state("is1", "closed", now + 9)
+            .await
+            .unwrap()
+    );
     assert_eq!(store.open_issue_count(&repo_id).await.unwrap(), 1);
     // Closing stamps updated_at.
     assert_eq!(
@@ -354,15 +369,17 @@ async fn pg_store_full_integration() {
         .await
         .unwrap()
         .unwrap();
-    assert!(store
-        .set_issue_metadata(
-            "is2",
-            "alice",
-            &milestone.id,
-            std::slice::from_ref(&label.id)
-        )
-        .await
-        .unwrap());
+    assert!(
+        store
+            .set_issue_metadata(
+                "is2",
+                "alice",
+                &milestone.id,
+                std::slice::from_ref(&label.id)
+            )
+            .await
+            .unwrap()
+    );
     assert_eq!(
         store.issue_labels("is2").await.unwrap(),
         vec![label.clone()]
@@ -439,16 +456,18 @@ async fn pg_store_full_integration() {
     assert!(!store.merge_pull("pl1", now + 6).await.unwrap());
     assert_eq!(store.open_pull_count(&repo_id).await.unwrap(), 0);
 
-    assert!(store
-        .set_pull_metadata(
-            "pl2",
-            "bob",
-            "carol",
-            &milestone.id,
-            std::slice::from_ref(&label.id),
-        )
-        .await
-        .unwrap());
+    assert!(
+        store
+            .set_pull_metadata(
+                "pl2",
+                "bob",
+                "carol",
+                &milestone.id,
+                std::slice::from_ref(&label.id),
+            )
+            .await
+            .unwrap()
+    );
     let assigned_pull = store.get_pull(&repo_id, 2).await.unwrap().unwrap();
     assert_eq!(assigned_pull.assignee_sub, "bob");
     assert_eq!(assigned_pull.reviewer_sub, "carol");
@@ -461,26 +480,60 @@ async fn pg_store_full_integration() {
             .len(),
         1
     );
-    assert!(store
-        .create_pull_review("rv1", "pl2", "alice", "approve", "ok", now + 30)
-        .await
-        .is_ok());
-    assert!(store
-        .create_pull_review_comment(
-            "rc1",
-            "pl2",
-            "rv1",
-            "file.txt",
-            2,
-            "alice",
-            "note",
-            now + 31
-        )
-        .await
-        .is_ok());
+    assert!(
+        store
+            .create_pull_review("rv1", "pl2", "alice", "approve", "ok", now + 30)
+            .await
+            .is_ok()
+    );
+    assert!(
+        store
+            .create_pull_review_comment(
+                "rc1",
+                "pl2",
+                "rv1",
+                "file.txt",
+                2,
+                "alice",
+                "note",
+                now + 31
+            )
+            .await
+            .is_ok()
+    );
     assert_eq!(store.list_pull_reviews("pl2").await.unwrap().len(), 1);
     assert_eq!(
         store.list_pull_review_comments("pl2").await.unwrap().len(),
+        1
+    );
+    let viewed = store
+        .set_pr_file_viewed("pl2", "alice", "file.txt", true, now + 32)
+        .await
+        .unwrap();
+    assert!(viewed.viewed);
+    assert_eq!(viewed.updated_at, now + 32);
+    let updated_viewed = store
+        .set_pr_file_viewed("pl2", "alice", "file.txt", false, now + 33)
+        .await
+        .unwrap();
+    assert!(!updated_viewed.viewed);
+    assert_eq!(
+        store
+            .list_pr_file_viewed_for_pr("pl2", "alice")
+            .await
+            .unwrap(),
+        vec![updated_viewed]
+    );
+    store
+        .set_pr_file_viewed("pl2", "bob", "file.txt", true, now + 34)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_pr_file_viewed_for_pr("pl2", "bob")
+            .await
+            .unwrap()
+            .len(),
         1
     );
 
@@ -507,11 +560,13 @@ async fn pg_store_full_integration() {
     assert!(store.find_pat_by_hash("missing").await.unwrap().is_none());
     assert!(!store.revoke_pat("pt1", "bob").await.unwrap()); // wrong owner
     assert!(store.revoke_pat("pt1", "alice").await.unwrap());
-    assert!(store
-        .find_pat_by_hash("abc123hash")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .find_pat_by_hash("abc123hash")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // --- raw count sanity (portable SQL path is live) ----------------------
     let row = sqlx::query("SELECT count(*) AS n FROM repos")
@@ -527,6 +582,7 @@ async fn pg_store_full_integration() {
         "issue_comments",
         "pr_review_comments",
         "pr_reviews",
+        "pr_file_viewed",
         "issues",
         "pulls",
         "labels",

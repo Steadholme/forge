@@ -20,8 +20,8 @@ use thiserror::Error;
 
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
-    CommitStatus, Issue, IssueComment, Label, Milestone, Pat, Pull, PullReview, PullReviewComment,
-    Release, Repo,
+    CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, Pull, PullReview,
+    PullReviewComment, Release, Repo,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -252,6 +252,23 @@ pub trait Store: Send + Sync {
     /// All pull-label assignments on a repo.
     async fn list_pull_labels(&self, repo_id: &str) -> Result<Vec<(String, Label)>, StoreError>;
 
+    /// Upsert one viewer's per-file viewed state for a PR.
+    async fn set_pr_file_viewed(
+        &self,
+        pr_id: &str,
+        user_sub: &str,
+        file_path: &str,
+        viewed: bool,
+        updated_at: i64,
+    ) -> Result<PrFileViewed, StoreError>;
+
+    /// Viewed rows for one PR and viewer.
+    async fn list_pr_file_viewed_for_pr(
+        &self,
+        pr_id: &str,
+        user_sub: &str,
+    ) -> Result<Vec<PrFileViewed>, StoreError>;
+
     // --- labels + milestones -------------------------------------------------
     /// Create a repo-scoped label. Returns `Ok(None)` when the label name already exists.
     async fn create_label(
@@ -327,7 +344,7 @@ pub trait Store: Send + Sync {
     // --- commit statuses -------------------------------------------------------
     /// Insert or replace the latest status for `(repo_id, commit_sha, context)`.
     async fn upsert_commit_status(&self, status: &CommitStatus)
-        -> Result<CommitStatus, StoreError>;
+    -> Result<CommitStatus, StoreError>;
 
     /// Latest statuses for every context on one commit, ordered by context.
     async fn list_commit_statuses(
@@ -376,6 +393,7 @@ pub struct InMemoryStore {
     milestones: Mutex<Vec<Milestone>>,
     pull_reviews: Mutex<Vec<PullReview>>,
     pull_review_comments: Mutex<Vec<PullReviewComment>>,
+    pr_file_viewed: Mutex<Vec<PrFileViewed>>,
     commit_statuses: Mutex<Vec<CommitStatus>>,
     pats: Mutex<Vec<Pat>>,
 }
@@ -961,6 +979,54 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
+    async fn set_pr_file_viewed(
+        &self,
+        pr_id: &str,
+        user_sub: &str,
+        file_path: &str,
+        viewed: bool,
+        updated_at: i64,
+    ) -> Result<PrFileViewed, StoreError> {
+        let mut rows = self
+            .pr_file_viewed
+            .lock()
+            .expect("pr_file_viewed lock poisoned");
+        if let Some(existing) = rows.iter_mut().find(|row| {
+            row.pr_id == pr_id && row.user_sub == user_sub && row.file_path == file_path
+        }) {
+            existing.viewed = viewed;
+            existing.updated_at = updated_at;
+            return Ok(existing.clone());
+        }
+        let row = PrFileViewed {
+            pr_id: pr_id.to_string(),
+            user_sub: user_sub.to_string(),
+            file_path: file_path.to_string(),
+            viewed,
+            updated_at,
+        };
+        rows.push(row.clone());
+        Ok(row)
+    }
+
+    async fn list_pr_file_viewed_for_pr(
+        &self,
+        pr_id: &str,
+        user_sub: &str,
+    ) -> Result<Vec<PrFileViewed>, StoreError> {
+        let rows = self
+            .pr_file_viewed
+            .lock()
+            .expect("pr_file_viewed lock poisoned");
+        let mut out: Vec<PrFileViewed> = rows
+            .iter()
+            .filter(|row| row.pr_id == pr_id && row.user_sub == user_sub)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        Ok(out)
+    }
+
     async fn create_label(
         &self,
         id: &str,
@@ -1264,24 +1330,21 @@ impl Store for InMemoryStore {
 // sqlx natively and the handlers `.await` it on the serving runtime — there is NO `block_in_place`
 // and NO sync-over-async, so a query never blocks a worker thread.
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
-const REPO_COLS: &str =
-    "id, owner_sub, name, description, is_private, default_branch, require_approval, protect_default_branch, forked_from_id, created_at";
-const RELEASE_COLS: &str =
-    "id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, created_by, created_at, published_at";
-const ISSUE_COLS: &str =
-    "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
+const REPO_COLS: &str = "id, owner_sub, name, description, is_private, default_branch, require_approval, protect_default_branch, forked_from_id, created_at";
+const RELEASE_COLS: &str = "id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, created_by, created_at, published_at";
+const ISSUE_COLS: &str = "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
 const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
-const PULL_COLS: &str =
-    "id, repo_id, number, title, body, base_branch, head_branch, author_sub, assignee_sub, reviewer_sub, milestone_id, state, created_at, merged_at";
+const PULL_COLS: &str = "id, repo_id, number, title, body, base_branch, head_branch, author_sub, assignee_sub, reviewer_sub, milestone_id, state, created_at, merged_at";
 const PAT_COLS: &str = "id, owner_sub, name, token_hash, created_at";
 const LABEL_COLS: &str = "id, repo_id, name, color, created_at";
 const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
 const REVIEW_COLS: &str = "id, pull_id, reviewer_sub, verdict, body, created_at";
 const REVIEW_COMMENT_COLS: &str =
     "id, pull_id, review_id, path, line, author_sub, body, created_at";
+const PR_FILE_VIEWED_COLS: &str = "pr_id, user_sub, file_path, viewed, updated_at";
 const COMMIT_STATUS_COLS: &str =
     "id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at";
 
@@ -1595,6 +1658,23 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pr_file_viewed (\
+                 pr_id TEXT NOT NULL, \
+                 user_sub TEXT NOT NULL, \
+                 file_path TEXT NOT NULL, \
+                 viewed BOOLEAN NOT NULL DEFAULT FALSE, \
+                 updated_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_file_viewed_pr_user_path \
+             ON pr_file_viewed (pr_id, user_sub, file_path)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS commit_statuses (\
                  id TEXT PRIMARY KEY, \
                  repo_id TEXT NOT NULL, \
@@ -1768,6 +1848,16 @@ impl PgStore {
             author_sub: row.try_get("author_sub")?,
             body: row.try_get("body")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn pr_file_viewed_from_row(row: &sqlx::postgres::PgRow) -> Result<PrFileViewed, sqlx::Error> {
+        Ok(PrFileViewed {
+            pr_id: row.try_get("pr_id")?,
+            user_sub: row.try_get("user_sub")?,
+            file_path: row.try_get("file_path")?,
+            viewed: row.try_get("viewed")?,
+            updated_at: row.try_get("updated_at")?,
         })
     }
 
@@ -2577,6 +2667,69 @@ impl Store for PgStore {
         Ok(out)
     }
 
+    async fn set_pr_file_viewed(
+        &self,
+        pr_id: &str,
+        user_sub: &str,
+        file_path: &str,
+        viewed: bool,
+        updated_at: i64,
+    ) -> Result<PrFileViewed, StoreError> {
+        sqlx::query(
+            "INSERT INTO pr_file_viewed \
+                 (pr_id, user_sub, file_path, viewed, updated_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (pr_id, user_sub, file_path) DO UPDATE SET \
+                 viewed = EXCLUDED.viewed, \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(pr_id)
+        .bind(user_sub)
+        .bind(file_path)
+        .bind(viewed)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {PR_FILE_VIEWED_COLS} FROM pr_file_viewed \
+             WHERE pr_id = $1 AND user_sub = $2 AND file_path = $3"
+        ))
+        .bind(pr_id)
+        .bind(user_sub)
+        .bind(file_path)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::pr_file_viewed_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .ok_or_else(|| StoreError::Backend("PR file viewed upsert did not persist".to_string()))
+    }
+
+    async fn list_pr_file_viewed_for_pr(
+        &self,
+        pr_id: &str,
+        user_sub: &str,
+    ) -> Result<Vec<PrFileViewed>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {PR_FILE_VIEWED_COLS} FROM pr_file_viewed \
+             WHERE pr_id = $1 AND user_sub = $2 \
+             ORDER BY file_path ASC"
+        ))
+        .bind(pr_id)
+        .bind(user_sub)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::pr_file_viewed_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn create_label(
         &self,
         id: &str,
@@ -3046,20 +3199,22 @@ mod tests {
     async fn repo_settings_update() {
         let s = InMemoryStore::new();
         s.create_repo(&repo("u", "a", false, 1)).await.unwrap();
-        assert!(s
-            .update_repo_settings("rp_u_a", "new words", "develop", true, true)
-            .await
-            .unwrap());
+        assert!(
+            s.update_repo_settings("rp_u_a", "new words", "develop", true, true)
+                .await
+                .unwrap()
+        );
         let updated = s.get_repo("u", "a").await.unwrap().unwrap();
         assert_eq!(updated.description, "new words");
         assert_eq!(updated.default_branch, "develop");
         assert!(updated.require_approval);
         assert!(updated.protect_default_branch);
         // Unknown id changes nothing.
-        assert!(!s
-            .update_repo_settings("nope", "x", "main", false, false)
-            .await
-            .unwrap());
+        assert!(
+            !s.update_repo_settings("nope", "x", "main", false, false)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3070,11 +3225,12 @@ mod tests {
         let other = release("rl3", "other", "v1.0.0", 30, false);
 
         assert_eq!(s.create_release(&r1).await.unwrap(), Some(r1.clone()));
-        assert!(s
-            .create_release(&release("rl_dup", "r", "v1.0.0", 11, false))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            s.create_release(&release("rl_dup", "r", "v1.0.0", 11, false))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(s.create_release(&r2).await.unwrap(), Some(r2.clone()));
         assert_eq!(s.create_release(&other).await.unwrap(), Some(other));
 
@@ -3247,11 +3403,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(s
-            .create_label("lb2", "r", "bug", "000000", 2)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            s.create_label("lb2", "r", "bug", "000000", 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let milestone = s
             .create_milestone("ms1", "r", "v1", "2026-08-01", 3)
             .await
@@ -3261,15 +3418,16 @@ mod tests {
             .create_issue("i1", "r", "first", "", "u", 4)
             .await
             .unwrap();
-        assert!(s
-            .set_issue_metadata(
+        assert!(
+            s.set_issue_metadata(
                 &issue.id,
                 "bob",
                 &milestone.id,
                 std::slice::from_ref(&label.id),
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             s.issue_labels(&issue.id).await.unwrap(),
             vec![label.clone()]
@@ -3286,8 +3444,8 @@ mod tests {
             .create_pull("pl1", "r", "first", "", "main", "feat", "u", 5)
             .await
             .unwrap();
-        assert!(s
-            .set_pull_metadata(
+        assert!(
+            s.set_pull_metadata(
                 &pull.id,
                 "bob",
                 "carol",
@@ -3295,7 +3453,8 @@ mod tests {
                 std::slice::from_ref(&label.id),
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let pull = s.get_pull("r", 1).await.unwrap().unwrap();
         assert_eq!(pull.assignee_sub, "bob");
         assert_eq!(pull.reviewer_sub, "carol");
@@ -3326,13 +3485,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pr_file_viewed_is_per_user_and_upserts() {
+        let s = InMemoryStore::new();
+
+        let first = s
+            .set_pr_file_viewed("pl1", "alice", "src/lib.rs", true, 10)
+            .await
+            .unwrap();
+        assert!(first.viewed);
+        assert_eq!(first.updated_at, 10);
+        assert_eq!(
+            s.list_pr_file_viewed_for_pr("pl1", "alice").await.unwrap(),
+            vec![first.clone()]
+        );
+
+        let updated = s
+            .set_pr_file_viewed("pl1", "alice", "src/lib.rs", false, 20)
+            .await
+            .unwrap();
+        assert!(!updated.viewed);
+        assert_eq!(updated.updated_at, 20);
+        assert_eq!(
+            s.list_pr_file_viewed_for_pr("pl1", "alice").await.unwrap(),
+            vec![updated]
+        );
+
+        s.set_pr_file_viewed("pl1", "bob", "src/lib.rs", true, 30)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.list_pr_file_viewed_for_pr("pl1", "bob")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.list_pr_file_viewed_for_pr("pl1", "alice")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn commit_status_upsert_and_aggregate() {
         let s = InMemoryStore::new();
-        assert!(s
-            .aggregate_state_for_commit("r", "abc123")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            s.aggregate_state_for_commit("r", "abc123")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let build = s
             .upsert_commit_status(&commit_status("build", "pending", 10))

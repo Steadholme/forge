@@ -150,6 +150,21 @@ impl Pull {
     }
 }
 
+/// Per-user viewed state for one file in a pull-request diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrFileViewed {
+    /// Owning pull request id.
+    pub pr_id: String,
+    /// Viewer subject from `X-Auth-Subject`.
+    pub user_sub: String,
+    /// File path in the diff.
+    pub file_path: String,
+    /// Whether this user has marked the file viewed.
+    pub viewed: bool,
+    /// Last update time, epoch seconds.
+    pub updated_at: i64,
+}
+
 /// A repo-scoped label assignable to issues and pull requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Label {
