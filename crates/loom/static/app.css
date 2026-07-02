@@ -785,3 +785,86 @@ th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
 .release-asset.muted{ color:var(--ink-3); border-top:0; padding:2px 0; }
 .release-asset a{ color:var(--accent-ink); text-decoration:none; font-family:var(--mono); }
 .release-asset a:hover{ text-decoration:underline; }
+
+/* ==========================================================================
+   Blame view — line-level authorship layered over the blob code view.
+   Pure-visual layer over the SSR markup produced by handlers/repos.rs
+   (render_blame / render_blame_table). Class hooks are fixed by the backend:
+
+     .card__body--code                 shared scroll body (blob + blame)
+       table.blame-table
+         tr.blame-row                  one source line
+           td.blame-commit[rowspan]    commit meta band (first row of a run)
+             a > code.oid              short sha (reuses the .oid chip style)
+             .blame-author             author name (weakened, --ink-3)
+             .blame-time               relative time (weakened, title=absolute)
+           td.blame-lineno             line number (right, unselectable)
+           td.blame-code > code        source line (mono · pre · no-wrap)
+
+   Consecutive lines from the same commit share one .blame-commit cell via
+   rowspan; a full-width hairline is drawn at each run boundary so adjacent
+   commit blocks read as distinct groups. Colours/geometry come only from
+   Odyssey v2 tokens, so this adapts to any future dark theme automatically,
+   and the global prefers-reduced-motion rule already neutralises the hover
+   transition below — no extra media query needed.
+   Note: true per-block alternating fill is not expressible in pure CSS over
+   variable-length rowspan runs, so blocks are separated with a left border on
+   the meta band + a hairline run boundary instead of stripes.
+   ========================================================================== */
+
+/* Shared code body: edge-to-edge, horizontally scrollable (blob + blame use
+   the same wrapper). Rounded bottom corners preserve the card silhouette. */
+.card__body--code {
+  padding:0; overflow-x:auto;
+  border-radius:0 0 var(--r) var(--r);
+}
+
+/* Table shell — mirrors .blob-code (mono · compact line-height · tab-size). */
+.blame-table {
+  width:100%; border-collapse:collapse; background:var(--surface-2);
+  font-family:var(--mono); font-size:13px; line-height:1.6; tab-size:4;
+}
+
+/* Commit meta band — one cell per consecutive-same-commit run (rowspan).
+   Shrinks to its content (sha · author · time on one line); top-aligned so the
+   sha lines up with the run's first source line. */
+.blame-commit {
+  width:1%; white-space:nowrap; vertical-align:top;
+  padding:0 14px; font-size:12px;
+  background:var(--surface-2);
+  border-left:2px solid var(--border-2);
+  border-right:1px solid var(--border);
+}
+.blame-commit .oid { font-size:11.5px; padding:0 5px; }
+.blame-author {
+  margin-left:8px; color:var(--ink-3); font-weight:550;
+  display:inline-block; max-width:150px; vertical-align:bottom;
+  overflow:hidden; text-overflow:ellipsis;
+}
+.blame-time { margin-left:8px; color:var(--ink-4); font-size:11px; }
+
+/* Run boundary — full-width hairline on the first row of every commit block
+   (the only rows carrying a .blame-commit cell). First run needs no top rule. */
+.blame-row:has(> .blame-commit) > td { border-top:1px solid var(--border); }
+.blame-table tbody tr:first-child > td { border-top:0; }
+
+/* Line numbers — weak, right-aligned, unselectable (matches the blob gutter). */
+.blame-lineno {
+  width:1%; white-space:nowrap; vertical-align:top;
+  padding:0 16px; text-align:right;
+  color:var(--ink-4); background:var(--bg-2);
+  border-right:1px solid var(--border);
+  user-select:none; -webkit-user-select:none;
+}
+
+/* Source column — fills remaining width, preserves whitespace, never wraps
+   (horizontal scroll lives on .card__body--code, as in the blob view). */
+.blame-code {
+  width:100%; padding:0 22px;
+  white-space:pre; color:var(--ink);
+}
+.blame-code code { font:inherit; background:none; border:0; padding:0; color:inherit; }
+.blame-row:hover > .blame-code {
+  background:var(--surface-3);
+  transition:background var(--dur) var(--ease);
+}
