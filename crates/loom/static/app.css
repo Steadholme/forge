@@ -1371,3 +1371,102 @@ mark.code-search-hit {
   flex-basis:100%; margin:2px 0 0; padding:0;
   font-size:12px; color:var(--ink-3);
 }
+
+/* =========================================================================
+   PR mergeability / conflict preflight
+   -------------------------------------------------------------------------
+   SSR emits a single status bar directly above the merge action:
+     <div class="pr-mergeability able-to-merge"   role="status"> <strong/> <span/> </div>
+     <div class="pr-mergeability has-conflicts pr-conflicts" role="status"> <strong/> <span/> </div>
+     <div class="pr-mergeability unknown"         role="status"> <strong/> <span/> </div>
+   <strong> is the verdict, <span> is the explanation. State is carried by
+   THREE independent channels — hue, icon SHAPE, and the words themselves — so
+   it never rests on colour alone. All colour is drawn from the Odyssey v2
+   semantic tokens: able-to-merge → --ok系, has-conflicts → --down系, unknown
+   → neutral --unknown/--ink. No new fonts, libraries or external assets.
+   ========================================================================= */
+.pr-mergeability {
+  /* Per-state knobs; base defaults keep the cascade flat (set once, themed
+     via custom props below). --mg-accent drives the left rail + icon, --mg-ink
+     the verdict text, --mg-soft the wash, --mg-edge the outer hairline. */
+  --mg-accent: var(--unknown);
+  --mg-ink: var(--ink-2);
+  --mg-soft: var(--surface-3);
+  --mg-edge: var(--border);
+  --mg-icon: none;
+
+  display:grid;
+  grid-template-columns:auto 1fr;
+  column-gap:11px; row-gap:2px;
+  align-items:start;
+  margin:0 0 14px;
+  padding:12px 14px;
+  border:1px solid var(--mg-edge);
+  border-left:3px solid var(--mg-accent);
+  border-radius:var(--r-sm);
+  background:var(--mg-soft);
+}
+
+/* Status glyph. Rendered by masking the accent colour through an inline SVG,
+   so the mark is a checkmark / warning triangle / question — the shape alone
+   distinguishes the states. Where CSS masking is unsupported it degrades to a
+   plain accent dot (border-radius:50%), which is still a meaningful cue. */
+.pr-mergeability::before {
+  content:"";
+  grid-row:1 / span 2;
+  align-self:start;
+  width:18px; height:18px;
+  margin-top:1px;
+  border-radius:50%;
+  background:var(--mg-accent);
+  -webkit-mask:var(--mg-icon) center / 18px 18px no-repeat;
+          mask:var(--mg-icon) center / 18px 18px no-repeat;
+}
+
+.pr-mergeability strong {
+  grid-column:2;
+  font-size:14px; font-weight:650; line-height:1.35;
+  color:var(--mg-ink);
+}
+.pr-mergeability span {
+  grid-column:2;
+  font-size:13px; line-height:1.45;
+  color:var(--ink-2);   /* ≥6.7:1 on every state wash — AA for body text */
+}
+
+/* Clean head — success family. Bright --ok rail/icon over the softest green
+   wash; verdict uses the darker --accent-ink so bold 14px still clears AA
+   (~4.9:1 on --ok-soft, where --ok-ink would land just under 4.5:1). */
+.pr-mergeability.able-to-merge {
+  --mg-accent: var(--ok);
+  --mg-ink: var(--accent-ink);
+  --mg-soft: var(--ok-soft);
+  --mg-edge: var(--ok-border);
+  --mg-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='m8.4 12.2 2.4 2.4 4.8-5.4'/></svg>");
+}
+
+/* Conflicting head — danger family. Warning triangle + --down wash reads as
+   "blocked", rhyming with the disabled/greyed merge button rendered just below
+   in the same card. Verdict uses --down-ink (~5.3:1 on --down-soft, AA). */
+.pr-mergeability.has-conflicts {
+  --mg-accent: var(--down);
+  --mg-ink: var(--down-ink);
+  --mg-soft: var(--down-soft);
+  --mg-edge: var(--down-border);
+  --mg-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3.6 2.9 20h18.2z'/><path d='M12 10v4.2'/><path d='M12 17.4h.01'/></svg>");
+}
+
+/* Indeterminate — neutral grey, no alarm. Question mark over a plain surface
+   wash; verdict uses --ink-2 (~7:1) so "unavailable" stays fully legible. */
+.pr-mergeability.unknown {
+  --mg-accent: var(--unknown);
+  --mg-ink: var(--ink-2);
+  --mg-soft: var(--surface-3);
+  --mg-edge: var(--border);
+  --mg-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M9.6 9.4a2.5 2.5 0 1 1 3.4 2.3c-.9.4-1.4 1-1.4 1.9v.3'/><path d='M11.7 16.7h.01'/></svg>");
+}
+
+/* Reduced motion is already honoured by the global transition/animation kill
+   switch; this bar adds no motion of its own. Dark mode needs no override —
+   every colour resolves through the shared semantic tokens, so it follows the
+   theme layer automatically. */
