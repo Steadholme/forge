@@ -1278,3 +1278,39 @@ mark.code-search-hit {
   .thread-summary,
   .thread-summary::after { transition:none; }
 }
+
+
+/* ==========================================================================
+   Draft pull requests
+   Pure-CSS visuals for the draft workflow (SSR hooks in handlers/pulls.rs):
+     .pr-draft-badge    — the "Draft" pill next to the state badge
+     .btn-ready-review  — draft → ready (positive CTA)
+     .btn-convert-draft — open → draft (neutral, reverse action)
+     .pr-status--draft  — "cannot be merged yet" explanation container
+   Colour comes only from Odyssey v2 tokens. Dark mode conforms automatically
+   because no literals are used; reduced-motion is neutralised by the global
+   guard at the top of this file — no extra media query needed here.
+   ========================================================================== */
+
+/* Draft badge — provisional, not a lifecycle state. Kept deliberately neutral
+   (--ink-3, dimmer than closed's --ink-2) and marked "unfinished" with a
+   dashed border, so it reads apart from the solid open/merged/closed pills. */
+.pr-draft-badge {
+  background:var(--surface-2); color:var(--ink-3);
+  border:1px dashed var(--border-2);
+}
+
+/* Ready for review — the affirmative "go" action. Overrides its own
+   .btn-primary base with the success/ok green so it is unmistakably the
+   forward CTA of the draft pair. */
+.btn-ready-review { background:var(--ok-ink); box-shadow:var(--sh-sm); }
+.btn-ready-review:hover { background:var(--accent-ink); box-shadow:var(--sh-md); }
+
+/* Convert to draft — the quiet reverse action. Inherits .btn-secondary and is
+   de-emphasised (dimmed label) so it never competes with the green CTA. */
+.btn-convert-draft { color:var(--ink-2); }
+.btn-convert-draft:hover { color:var(--ink); }
+
+/* Draft merge notice — an informational, disabled-merge hint, weakened to the
+   softest ink so it reads as guidance rather than an error. */
+.pr-status--draft { color:var(--ink-3); }
