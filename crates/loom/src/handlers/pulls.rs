@@ -11,6 +11,7 @@
 //! through the sanitising [`crate::markdown`] pipeline.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -21,7 +22,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::config::{COMMIT_LIMIT, MAX_BLOB_RENDER_BYTES};
 use crate::error::AppError;
-use crate::gitops::{CommitInfo, MergeStrategy};
+use crate::gitops::{CommitInfo, MergeStrategy, Mergeability as GitMergeability};
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
 use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect, short_oid};
 use crate::model::{
@@ -36,6 +37,14 @@ const REVIEW_COMMENT_ID_LEN: usize = 16;
 const KLAXON_SOURCE: &str = "loom";
 const NOTIFY_TITLE_CHARS: usize = 96;
 const NOTIFY_BODY_CHARS: usize = 240;
+const MERGEABILITY_TIMEOUT_SECS: u64 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrMergeability {
+    Clean,
+    Conflicting,
+    Unknown,
+}
 
 // ===========================================================================
 // Shared helpers
@@ -704,6 +713,34 @@ async fn commits_for_closing(state: &AppState, repo: &Repo, pull: &Pull) -> Vec<
             COMMIT_LIMIT,
         )
         .await
+}
+
+async fn preflight_mergeability(state: &AppState, repo: &Repo, pull: &Pull) -> PrMergeability {
+    match state
+        .git
+        .mergeability(
+            &repo.owner_sub,
+            &repo.name,
+            &pull.base,
+            &pull.head,
+            Duration::from_secs(MERGEABILITY_TIMEOUT_SECS),
+        )
+        .await
+    {
+        Ok(GitMergeability::Clean) => PrMergeability::Clean,
+        Ok(GitMergeability::Conflicting) => PrMergeability::Conflicting,
+        Err(reason) => {
+            tracing::warn!(
+                repo = repo.id.as_str(),
+                number = pull.number,
+                base = pull.base.as_str(),
+                head = pull.head.as_str(),
+                reason = reason.as_str(),
+                "pull request mergeability check unavailable"
+            );
+            PrMergeability::Unknown
+        }
+    }
 }
 
 fn closing_issue_numbers(body: &str, commits: &[CommitInfo]) -> Vec<i64> {
@@ -1872,6 +1909,14 @@ async fn render_detail(
         who,
         headers,
     );
+    let mergeability = if pull.is_open() {
+        Some(preflight_mergeability(state, repo, pull).await)
+    } else {
+        None
+    };
+    let mergeability_bar = mergeability
+        .map(render_mergeability_bar)
+        .unwrap_or_default();
     let metadata_form = if can_gate(repo, pull, who) || auth::is_admin(headers) {
         let fields = render_pull_metadata_fields(
             labels,
@@ -1924,6 +1969,13 @@ async fn render_detail(
             csrf = esc(csrf),
         )
     } else if pull.is_open() && can_gate(repo, pull, who) {
+        let has_conflicts = matches!(mergeability, Some(PrMergeability::Conflicting));
+        let merge_button = render_merge_button(has_conflicts);
+        let merge_note = if has_conflicts {
+            "Resolve the conflicts manually before merging this pull request."
+        } else {
+            "All merge methods are enabled for this repository."
+        };
         format!(
             r##"<div class="pr-actions">
   <form class="inline-form merge-strategy" method="post" action="/r/{owner}/{name}/pulls/{number}/merge">
@@ -1934,9 +1986,9 @@ async fn render_detail(
       <option value="squash">Squash and merge</option>
       <option value="rebase">Rebase and merge</option>
     </select>
-    <button class="btn btn-primary" type="submit">Merge pull request</button>
+    {merge_button}
   </form>
-  <p class="muted merge-strategy__note">All merge methods are enabled for this repository.</p>
+  <p class="muted merge-strategy__note">{merge_note}</p>
   <form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/draft">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <button class="btn btn-secondary btn-convert-draft" type="submit">Convert to draft</button>
@@ -1950,6 +2002,8 @@ async fn render_detail(
             name = esc(&repo.name),
             number = pull.number,
             csrf = esc(csrf),
+            merge_button = merge_button,
+            merge_note = merge_note,
         )
     } else if pull.is_merged() {
         format!(
@@ -2014,6 +2068,7 @@ async fn render_detail(
 <section class="card">
   <div class="card__body">
     {error_block}
+    {mergeability_bar}
     {actions}
   </div>
 </section>"##,
@@ -2036,9 +2091,44 @@ async fn render_detail(
         reviews_card = reviews_card,
         metadata_form = metadata_form,
         error_block = error_block,
+        mergeability_bar = mergeability_bar,
         actions = actions,
         pr_inline = pr_inline,
     ))
+}
+
+fn render_mergeability_bar(mergeability: PrMergeability) -> String {
+    match mergeability {
+        PrMergeability::Clean => {
+            r#"<div class="pr-mergeability able-to-merge" role="status">
+  <strong>Ready to merge</strong>
+  <span>These branches can be cleanly merged.</span>
+</div>"#
+                .to_string()
+        }
+        PrMergeability::Conflicting => {
+            r#"<div class="pr-mergeability has-conflicts pr-conflicts" role="status">
+  <strong>This branch has conflicts</strong>
+  <span>Resolve the conflicts manually before merging this pull request.</span>
+</div>"#
+                .to_string()
+        }
+        PrMergeability::Unknown => {
+            r#"<div class="pr-mergeability unknown" role="status">
+  <strong>Mergeability check unavailable</strong>
+  <span>Loom could not determine this right now; submitting a merge still runs the server-side check.</span>
+</div>"#
+                .to_string()
+        }
+    }
+}
+
+fn render_merge_button(disabled: bool) -> &'static str {
+    if disabled {
+        r#"<button class="btn btn-primary" type="submit" disabled aria-disabled="true">Merge pull request</button>"#
+    } else {
+        r#"<button class="btn btn-primary" type="submit">Merge pull request</button>"#
+    }
 }
 
 fn render_checks_card(

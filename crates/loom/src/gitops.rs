@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -159,6 +160,15 @@ pub enum MergeStrategy {
     Merge,
     Squash,
     Rebase,
+}
+
+/// Read-only mergeability preview for a pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mergeability {
+    /// The head can be integrated into the base without content conflicts.
+    Clean,
+    /// Git reported content conflicts for the current base/head pair.
+    Conflicting,
 }
 
 /// Parsed CGI response from `git http-backend`.
@@ -659,6 +669,49 @@ impl GitOps {
             .await
     }
 
+    /// Read-only mergeability preflight for a PR detail page. This resolves branch refs in the bare
+    /// repo and uses `git merge-tree --write-tree` for divergent histories, without creating commits
+    /// or advancing refs. Missing refs or an inconclusive git result are returned as errors so the UI
+    /// can degrade to "unknown" instead of failing the page.
+    pub async fn mergeability(
+        &self,
+        owner: &str,
+        name: &str,
+        base: &str,
+        head: &str,
+        timeout: Duration,
+    ) -> Result<Mergeability, String> {
+        let repo = self.repo_path(owner, name);
+        let dir = repo.to_string_lossy().to_string();
+        let base_ref = format!("refs/heads/{base}");
+        let head_ref = format!("refs/heads/{head}");
+
+        let base_oid = self
+            .rev(&dir, &base_ref)
+            .await
+            .ok_or_else(|| format!("base branch '{base}' no longer exists"))?;
+        let head_oid = self
+            .rev(&dir, &head_ref)
+            .await
+            .ok_or_else(|| format!("head branch '{head}' no longer exists"))?;
+
+        // Identical or already-contained heads are clean, even though there may be no diff left.
+        if base_oid == head_oid || self.is_ancestor(&dir, &head_oid, &base_oid).await {
+            return Ok(Mergeability::Clean);
+        }
+        if self.is_ancestor(&dir, &base_oid, &head_oid).await {
+            return Ok(Mergeability::Clean);
+        }
+
+        match self
+            .merge_tree_for_mergeability(&dir, &base_oid, &head_oid, timeout)
+            .await?
+        {
+            Some(_) => Ok(Mergeability::Clean),
+            None => Ok(Mergeability::Conflicting),
+        }
+    }
+
     /// Commits on `head` that are NOT on `base` (`git log base..head`), newest first, capped at
     /// `limit` — i.e. the commits a PR from `head` into `base` would add. Both branch names are
     /// resolved through `refs/heads/…`, so neither is ever option-like.
@@ -942,6 +995,43 @@ impl GitOps {
             .next()
             .map(|l| l.trim().to_string())
             .filter(|s| !s.is_empty())
+            .ok_or_else(|| "merge-tree produced no tree".to_string())
+    }
+
+    async fn merge_tree_for_mergeability(
+        &self,
+        dir: &str,
+        base: &str,
+        head: &str,
+        timeout: Duration,
+    ) -> Result<Option<String>, String> {
+        let full: Vec<&str> = vec!["--git-dir", dir, "merge-tree", "--write-tree", base, head];
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.args(&full)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "safe.directory")
+            .env("GIT_CONFIG_VALUE_0", "*")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        let child = cmd.spawn().map_err(|e| format!("merge-tree failed: {e}"))?;
+        let out = tokio::time::timeout(timeout, child.wait_with_output())
+            .await
+            .map_err(|_| "mergeability check timed out".to_string())?
+            .map_err(|e| format!("merge-tree failed: {e}"))?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .lines()
+            .next()
+            .map(|l| l.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(Some)
             .ok_or_else(|| "merge-tree produced no tree".to_string())
     }
 

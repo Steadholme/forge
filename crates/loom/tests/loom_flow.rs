@@ -1180,7 +1180,14 @@ async fn pull_request_compare_create_and_merge() {
     assert!(!store.get_pull(&repo.id, 1).await.unwrap().unwrap().is_draft);
 
     let ready_detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(ready_detail
+        .body
+        .contains("class=\"pr-mergeability able-to-merge\""));
+    assert!(ready_detail.body.contains("Ready to merge"));
     assert!(ready_detail.body.contains("Merge pull request"));
+    assert!(ready_detail
+        .body
+        .contains(r#"<button class="btn btn-primary" type="submit">Merge pull request</button>"#));
     assert!(ready_detail.body.contains("merge-strategy"));
     assert!(ready_detail.body.contains("merge-method-select"));
     assert!(ready_detail.body.contains("name=\"merge_method\""));
@@ -1553,6 +1560,15 @@ async fn pull_request_rebase_conflict_leaves_base_ref_unchanged() {
     )
     .await;
     let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(detail
+        .body
+        .contains("class=\"pr-mergeability has-conflicts pr-conflicts\""));
+    assert!(detail
+        .body
+        .contains("Resolve the conflicts manually before merging"));
+    assert!(detail.body.contains(
+        r#"<button class="btn btn-primary" type="submit" disabled aria-disabled="true">Merge pull request</button>"#
+    ));
     let csrf = detail.csrf_cookie().expect("csrf on detail");
     let merged = send(
         &app,
