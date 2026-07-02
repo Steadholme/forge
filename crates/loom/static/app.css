@@ -1945,3 +1945,94 @@ mark.code-search-hit {
 /* 4. Strikethrough — GFM `~~text~~`. Keep the browser line-through but recede
    the whole run to --ink-3 so removed/obsolete text reads as de-emphasised. */
 .markdown-body del { color:var(--ink-3); text-decoration-color:var(--ink-4); }
+
+
+/* ==========================================================================
+   Reactions — GitHub-style emoji reaction bar. SSR hooks (loom):
+     .reactions[data-target-type][data-target-id]         outer flex row
+       └ .reactions__list                                 applied-reaction pills
+           └ form.reaction-form
+               └ button.reaction[.reaction--active]
+                   ├ span.reaction__emoji
+                   └ span.reaction__count
+       └ details.reaction-picker                          the "+" add popover
+           ├ summary.reaction-picker__button              round "+" trigger
+           └ .reaction-picker__menu                       popup card
+               └ form.reaction-picker__form
+                   └ button.reaction.reaction-picker__emoji
+   Reuses the Odyssey v2 pill idiom (cf. .verdict-pill / .filter-chip): the
+   --accent-soft / --accent / --accent-ink family marks the selected state, the
+   --r-pill radius shapes the capsules and --sh-pop lifts the popover. No literal
+   colours or @keyframes are added, so the global reduced-motion guard (line 274)
+   and the token theme layer cover motion + theming with no extra rule. */
+
+/* 1. Layout — list + picker share one wrapping flex row; the forms collapse to
+   inline boxes with no default margin so the pills sit flush together. */
+.reactions { display:flex; flex-wrap:wrap; align-items:center; gap:6px;
+  margin-top:8px; }
+.reactions__list { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+.reaction-form, .reaction-picker__form { display:inline-flex; margin:0; }
+
+/* 2. Reaction pill — compact capsule, emoji + tabular count on one baseline;
+   the count takes the secondary ink (--ink-2, AA on --surface) so the glyph
+   leads. Equal height to the "+" trigger via a shared box (border-box global). */
+.reaction { display:inline-flex; align-items:center; justify-content:center;
+  gap:5px; min-height:26px; padding:0 10px;
+  border:1px solid var(--border); border-radius:var(--r-pill);
+  background:var(--surface); color:var(--ink-2);
+  font:600 12px/1 var(--font); cursor:pointer;
+  transition:background var(--dur) var(--ease),
+             border-color var(--dur) var(--ease),
+             color var(--dur) var(--ease); }
+.reaction:hover { background:var(--surface-2); border-color:var(--accent-border); }
+.reaction:active { transform:translateY(.5px); }
+.reaction:focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+.reaction__emoji { font-size:13px; line-height:1; }
+.reaction__count { color:var(--ink-2); font-variant-numeric:tabular-nums; }
+
+/* 3. Selected state — accent outline + soft accent fill, clearly apart from the
+   resting pill; the button's aria-pressed="true" carries this same class. */
+.reaction--active { background:var(--accent-soft); border-color:var(--accent);
+  color:var(--accent-ink); }
+.reaction--active .reaction__count { color:var(--accent-ink); }
+.reaction--active:hover { background:var(--accent-soft-2);
+  border-color:var(--accent); }
+
+/* 4. Add-reaction picker — the <details> anchors the popover; strip the native
+   disclosure marker and shape the summary as a round "+" the size of a pill. */
+.reaction-picker { position:relative; display:inline-flex; }
+.reaction-picker__button { list-style:none;
+  display:inline-flex; align-items:center; justify-content:center;
+  height:26px; min-width:26px; padding:0 8px;
+  border:1px solid var(--border); border-radius:var(--r-pill);
+  background:var(--surface); color:var(--ink-3);
+  font:600 15px/1 var(--font); cursor:pointer; user-select:none;
+  transition:background var(--dur) var(--ease),
+             border-color var(--dur) var(--ease),
+             color var(--dur) var(--ease); }
+.reaction-picker__button::-webkit-details-marker { display:none; }
+.reaction-picker__button:hover { background:var(--surface-2);
+  border-color:var(--accent-border); color:var(--ink-2); }
+.reaction-picker__button:focus-visible { outline:2px solid var(--ring);
+  outline-offset:2px; }
+.reaction-picker[open] .reaction-picker__button { background:var(--accent-soft);
+  border-color:var(--accent); color:var(--accent-ink); }
+
+/* 5. Popover menu — card floated under the trigger (details[open] reveals it),
+   emoji tiles wrap in a tight row with a larger tap area. The tiles also carry
+   .reaction, so these rules follow it in source order to override the pill box
+   (transparent, borderless, square) — equal specificity, later wins. */
+.reaction-picker__menu { position:absolute; top:calc(100% + 6px); left:0;
+  z-index:30; display:flex; flex-wrap:wrap; gap:2px;
+  width:max-content; max-width:min(320px, calc(100vw - 32px));
+  padding:5px; background:var(--surface);
+  border:1px solid var(--border); border-radius:var(--r-sm);
+  box-shadow:var(--sh-pop); }
+.reaction-picker__emoji { min-height:0; width:34px; height:34px;
+  padding:0; gap:0; border:0; border-radius:var(--r-xs);
+  background:transparent; font-size:18px; line-height:1; }
+.reaction-picker__emoji:hover { background:var(--accent-soft);
+  border-color:transparent; }
+.reaction-picker__emoji:active { transform:none; }
+.reaction-picker__emoji:focus-visible { outline:2px solid var(--ring);
+  outline-offset:-2px; }
