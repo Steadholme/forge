@@ -162,9 +162,12 @@ pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
     };
     let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).
@@ -219,13 +222,39 @@ pub fn hash_token(secret: &str) -> String {
 pub fn parse_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
     use base64::Engine;
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let b64 = raw.strip_prefix("Basic ").or_else(|| raw.strip_prefix("basic "))?;
+    let b64 = raw
+        .strip_prefix("Basic ")
+        .or_else(|| raw.strip_prefix("basic "))?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .ok()?;
     let text = String::from_utf8(decoded).ok()?;
     let (user, pass) = text.split_once(':')?;
     Some((user.to_string(), pass.to_string()))
+}
+
+/// Parse `Authorization: Bearer <token>` into the bare token.
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let tok = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?;
+    let tok = tok.trim();
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
+
+/// Constant-time check for a configured Bearer token. Empty expected tokens are never accepted.
+pub fn bearer_token_ok(headers: &HeaderMap, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    bearer_token(headers)
+        .map(|token| ct_eq(token.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +403,10 @@ mod tests {
         let token = "loom_pat_abc123";
         let raw = base64::engine::general_purpose::STANDARD.encode(format!("git:{token}"));
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, format!("Basic {raw}").parse().unwrap());
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Basic {raw}").parse().unwrap(),
+        );
         let (user, pass) = parse_basic_auth(&h).unwrap();
         assert_eq!(user, "git");
         assert_eq!(pass, token);
@@ -382,10 +414,27 @@ mod tests {
     }
 
     #[test]
+    fn bearer_auth_parses_and_checks_token() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer status-secret"),
+        );
+        assert_eq!(bearer_token(&h).as_deref(), Some("status-secret"));
+        assert!(bearer_token_ok(&h, "status-secret"));
+        assert!(!bearer_token_ok(&h, "wrong"));
+        assert!(!bearer_token_ok(&h, ""));
+        assert!(bearer_token(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
     fn csrf_double_submit() {
         let token = new_csrf_token();
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, format!("{CSRF_COOKIE}={token}").parse().unwrap());
+        h.insert(
+            header::COOKIE,
+            format!("{CSRF_COOKIE}={token}").parse().unwrap(),
+        );
         assert!(verify_csrf(&h, &token));
         assert!(!verify_csrf(&h, "not-the-token"));
         assert!(!verify_csrf(&HeaderMap::new(), &token));

@@ -24,7 +24,7 @@ use crate::error::AppError;
 use crate::gitops::CommitInfo;
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
 use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect, short_oid};
-use crate::model::{Label, Milestone, Pull, PullReview, PullReviewComment, Repo};
+use crate::model::{CommitStatus, Label, Milestone, Pull, PullReview, PullReviewComment, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
 const PULL_ID_LEN: usize = 16;
@@ -78,13 +78,7 @@ fn pull_notify_url(state: &AppState, repo: &Repo, number: i64) -> String {
     )
 }
 
-fn notify_pull_author(
-    state: &AppState,
-    actor_sub: &str,
-    repo: &Repo,
-    pull: &Pull,
-    summary: &str,
-) {
+fn notify_pull_author(state: &AppState, actor_sub: &str, repo: &Repo, pull: &Pull, summary: &str) {
     if pull.author_sub == actor_sub {
         return;
     }
@@ -445,7 +439,7 @@ pub async fn detail(
         &csrf,
         None,
     )
-    .await;
+    .await?;
     Ok(html_with_csrf(
         StatusCode::OK,
         page(
@@ -602,7 +596,7 @@ async fn render_detail_with_fresh_metadata(
     let milestones = state.store.list_milestones(&repo.id).await?;
     let reviews = state.store.list_pull_reviews(&pull.id).await?;
     let review_comments = state.store.list_pull_review_comments(&pull.id).await?;
-    Ok(render_detail(
+    render_detail(
         state,
         repo,
         pull,
@@ -617,7 +611,7 @@ async fn render_detail_with_fresh_metadata(
         csrf,
         error,
     )
-    .await)
+    .await
 }
 
 async fn commits_for_closing(state: &AppState, repo: &Repo, pull: &Pull) -> Vec<CommitInfo> {
@@ -1395,7 +1389,7 @@ async fn render_detail(
     headers: &HeaderMap,
     csrf: &str,
     error: Option<&str>,
-) -> String {
+) -> Result<String, AppError> {
     let (cls, label) = state_badge(pull);
     let error_block = error_block(error);
     let summary = review_summary(reviews);
@@ -1446,6 +1440,24 @@ async fn render_detail(
         .diff(&repo.owner_sub, &repo.name, &pull.base, &pull.head)
         .await
         .unwrap_or_default();
+    let checks_card = match state
+        .git
+        .branch_oid(&repo.owner_sub, &repo.name, &pull.head)
+        .await
+    {
+        Some(head_oid) => {
+            let statuses = state
+                .store
+                .list_commit_statuses(&repo.id, &head_oid)
+                .await?;
+            let aggregate = state
+                .store
+                .aggregate_state_for_commit(&repo.id, &head_oid)
+                .await?;
+            render_checks_card(&head_oid, aggregate.as_deref(), &statuses)
+        }
+        None => String::new(),
+    };
     let commits_card = render_commits_card(&commits);
     let diff_card = render_diff_card(&diff);
     let reviews_card =
@@ -1536,7 +1548,7 @@ async fn render_detail(
         number = pull.number,
     );
 
-    format!(
+    Ok(format!(
         r##"{header}
 {pr_inline}
 <div class="console__head">
@@ -1551,6 +1563,7 @@ async fn render_detail(
   <div class="card__head"><h2>Description</h2></div>
   <div class="card__body">{body_html}</div>
 </section>
+{checks_card}
 {commits_card}
 {diff_card}
 {reviews_card}
@@ -1575,11 +1588,71 @@ async fn render_detail(
         label_chips = label_chips,
         review_badges = review_badges,
         body_html = body_html,
+        checks_card = checks_card,
         reviews_card = reviews_card,
         metadata_form = metadata_form,
         error_block = error_block,
         actions = actions,
         pr_inline = pr_inline,
+    ))
+}
+
+fn render_checks_card(
+    head_oid: &str,
+    aggregate: Option<&str>,
+    statuses: &[CommitStatus],
+) -> String {
+    if statuses.is_empty() {
+        return String::new();
+    }
+    let aggregate_dot = crate::handlers::commits::render_status_dot(aggregate);
+    let rows = statuses
+        .iter()
+        .map(|status| {
+            let dot = crate::handlers::commits::render_status_dot(Some(&status.state));
+            let label = crate::handlers::commits::status_label(&status.state);
+            let target = if !status.target_url.trim().is_empty()
+                && crate::handlers::commits::safe_status_url(&status.target_url)
+            {
+                format!(
+                    " · <a href=\"{url}\" rel=\"noopener noreferrer\">details</a>",
+                    url = esc(&status.target_url)
+                )
+            } else {
+                String::new()
+            };
+            let description = if status.description.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<div class=\"issue-item__body\">{}</div>",
+                    esc(&status.description)
+                )
+            };
+            format!(
+                r##"<li class="issue-item commit-status-row">
+  <div class="issue-item__meta">{dot}<span class="strong">{context}</span> · {state}{target}</div>
+  {description}
+</li>"##,
+                dot = dot,
+                context = esc(&status.context),
+                state = esc(label),
+                target = target,
+                description = description,
+            )
+        })
+        .collect::<String>();
+    format!(
+        r##"<section class="card">
+  <div class="card__head"><h2>Checks {aggregate}</h2></div>
+  <div class="card__body">
+    <p class="muted">Head commit <code class="oid">{head}</code></p>
+    <ul class="issue-list">{rows}</ul>
+  </div>
+</section>"##,
+        aggregate = aggregate_dot,
+        head = esc(&short_oid(head_oid)),
+        rows = rows,
     )
 }
 

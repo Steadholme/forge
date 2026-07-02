@@ -167,6 +167,17 @@ fn post_form_groups(
         .unwrap()
 }
 
+fn post_json(path: &str, body: &str, bearer: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(token) = bearer {
+        b = b.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
 /// Open an issue through the web flow as `subject`; returns the new issue's detail location.
 async fn open_issue(
     app: &axum::Router,
@@ -1309,6 +1320,144 @@ async fn commit_page_renders_diff_and_escapes_remote_input() {
     )
     .await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn commit_status_api_updates_json_and_ssr_checks() {
+    let mut state = temp_state();
+    Arc::make_mut(&mut state.config).status_token = "status-secret".to_string();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+    let status_path = format!("/r/alice/proj/statuses/{feature_oid}");
+
+    let before = send(
+        &app,
+        get("/r/alice/proj/commits?ref=feature", Some("alice")),
+    )
+    .await;
+    assert_eq!(before.status, StatusCode::OK);
+    assert!(
+        !before.body.contains("commit-status"),
+        "commits without statuses do not render a badge"
+    );
+
+    let unauth = send(
+        &app,
+        post_json(
+            &status_path,
+            r#"{"state":"pending","context":"ci/anvil"}"#,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(unauth.status, StatusCode::UNAUTHORIZED);
+
+    let pending = send(
+        &app,
+        post_json(
+            &status_path,
+            r#"{"state":"pending","context":"ci/anvil","description":"queued"}"#,
+            Some("status-secret"),
+        ),
+    )
+    .await;
+    assert_eq!(pending.status, StatusCode::OK);
+    assert!(pending.body.contains(r#""state":"pending""#));
+
+    let success = send(
+        &app,
+        post_json(
+            &status_path,
+            r#"{"state":"success","context":"ci/anvil","description":"build <ok>","target_url":"https://ci.example/run/1?x=<y>"}"#,
+            Some("status-secret"),
+        ),
+    )
+    .await;
+    assert_eq!(success.status, StatusCode::OK);
+    assert!(success.body.contains(r#""state":"success""#));
+
+    let failure = send(
+        &app,
+        post_json(
+            &status_path,
+            r#"{"state":"failure","context":"test","description":"tests failed","target_url":"https://ci.example/test"}"#,
+            Some("status-secret"),
+        ),
+    )
+    .await;
+    assert_eq!(failure.status, StatusCode::OK);
+    assert!(failure.body.contains(r#""state":"failure""#));
+
+    let json = send(
+        &app,
+        get(
+            &format!("/r/alice/proj/commits/{feature_oid}/status"),
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(json.status, StatusCode::OK);
+    assert!(json.content_type().starts_with("application/json"));
+    assert!(json.body.contains(r#""state":"failure""#));
+    assert!(json.body.contains(r#""context":"ci/anvil""#));
+    assert!(json.body.contains(r#""context":"test""#));
+
+    let hist = send(
+        &app,
+        get("/r/alice/proj/commits?ref=feature", Some("alice")),
+    )
+    .await;
+    assert_eq!(hist.status, StatusCode::OK);
+    assert!(hist.body.contains("commit-status--failure"));
+    assert!(hist.body.contains("status-dot--failure"));
+
+    let commit = send(
+        &app,
+        get(
+            &format!("/r/alice/proj/commit/{feature_oid}"),
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(commit.status, StatusCode::OK);
+    assert!(commit.body.contains("commit-status--failure"));
+
+    let cmp = send(
+        &app,
+        get("/r/alice/proj/compare?base=main&head=feature", Some("bob")),
+    )
+    .await;
+    let csrf = cmp.csrf_cookie().unwrap();
+    let created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls",
+            &[
+                ("csrf_token", &csrf),
+                ("base", "main"),
+                ("head", "feature"),
+                ("title", "Add second line"),
+                ("body", ""),
+            ],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+
+    let pr = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert_eq!(pr.status, StatusCode::OK);
+    assert!(pr.body.contains("<h2>Checks "));
+    assert!(pr.body.contains("Head commit"));
+    assert!(pr.body.contains("ci/anvil"));
+    assert!(pr.body.contains("test"));
+    assert!(pr.body.contains("build &lt;ok&gt;"));
+    assert!(pr.body.contains("tests failed"));
+    assert!(pr.body.contains("https://ci.example/test"));
 }
 
 #[tokio::test]

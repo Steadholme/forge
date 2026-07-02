@@ -76,6 +76,14 @@ pub fn app(state: AppState) -> Router {
         .route("/r/{owner}/{name}/blob/{*path}", get(handlers::repos::blob))
         .route("/r/{owner}/{name}/commits", get(handlers::commits::history))
         .route(
+            "/r/{owner}/{name}/commits/{sha}/status",
+            get(handlers::commits::status_json),
+        )
+        .route(
+            "/r/{owner}/{name}/statuses/{sha}",
+            post(handlers::commits::upsert_status),
+        )
+        .route(
             "/r/{owner}/{name}/commit/{sha}",
             get(handlers::commits::detail),
         )

@@ -200,6 +200,30 @@ pub struct PullReviewComment {
     pub created_at: i64,
 }
 
+/// Latest CI/check status for one `(repo, commit_sha, context)` tuple.
+/// Field order/types mirror the `commit_statuses` table exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitStatus {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id.
+    pub repo_id: String,
+    /// Full resolved commit object id.
+    pub commit_sha: String,
+    /// `pending`, `success`, `failure`, or `error`.
+    pub state: String,
+    /// Status/check context, e.g. `ci/anvil`, `build`, `test`.
+    pub context: String,
+    /// Optional short human-readable summary. Empty means none.
+    pub description: String,
+    /// Optional URL for the CI/check run. Empty means none.
+    pub target_url: String,
+    /// First creation time, epoch seconds.
+    pub created_at: i64,
+    /// Last update time, epoch seconds.
+    pub updated_at: i64,
+}
+
 /// A personal access token. Only the SHA-256 hash is stored; the secret is shown once at mint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pat {

@@ -42,6 +42,8 @@ pub struct Config {
     pub git_http_backend: String,
     /// `git` binary (`GIT_BIN`).
     pub git_bin: String,
+    /// Bearer token accepted by the internal commit-status write API (`LOOM_STATUS_TOKEN`).
+    pub status_token: String,
 }
 
 impl Config {
@@ -53,6 +55,7 @@ impl Config {
             public_base_url: DEFAULT_PUBLIC_BASE_URL.to_string(),
             git_http_backend: DEFAULT_GIT_HTTP_BACKEND.to_string(),
             git_bin: DEFAULT_GIT_BIN.to_string(),
+            status_token: String::new(),
         }
     }
 
@@ -73,6 +76,9 @@ impl Config {
         }
         if let Some(v) = env_nonempty("GIT_BIN") {
             config.git_bin = v;
+        }
+        if let Some(v) = env_nonempty("LOOM_STATUS_TOKEN") {
+            config.status_token = v;
         }
         config
     }

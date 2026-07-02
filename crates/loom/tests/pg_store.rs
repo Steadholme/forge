@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use loom::model::{Pat, Repo};
+use loom::model::{CommitStatus, Pat, Repo};
 use loom::now_secs;
 use loom::store::{PgStore, Store};
 use sqlx::postgres::PgPoolOptions;
@@ -35,6 +35,20 @@ fn repo(owner: &str, name: &str, private: bool, created: i64) -> Repo {
         protect_default_branch: false,
         forked_from_id: String::new(),
         created_at: created,
+    }
+}
+
+fn commit_status(repo_id: &str, context: &str, state: &str, updated_at: i64) -> CommitStatus {
+    CommitStatus {
+        id: format!("cs_{}", context.replace('/', "_")),
+        repo_id: repo_id.to_string(),
+        commit_sha: "abc123".to_string(),
+        state: state.to_string(),
+        context: context.to_string(),
+        description: format!("{context} {state}"),
+        target_url: format!("https://ci.example/{context}"),
+        created_at: 1,
+        updated_at,
     }
 }
 
@@ -67,6 +81,7 @@ async fn pg_store_full_integration() {
         "issue_comments",
         "pr_review_comments",
         "pr_reviews",
+        "commit_statuses",
         "issues",
         "pulls",
         "labels",
@@ -149,6 +164,49 @@ async fn pg_store_full_integration() {
 
     // --- issues: sequential numbering per repo + state ---------------------
     let repo_id = got.id.clone();
+    assert!(store
+        .aggregate_state_for_commit(&repo_id, "abc123")
+        .await
+        .unwrap()
+        .is_none());
+    store
+        .upsert_commit_status(&commit_status(&repo_id, "ci/anvil", "pending", now + 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .aggregate_state_for_commit(&repo_id, "abc123")
+            .await
+            .unwrap(),
+        Some("pending".to_string())
+    );
+    let updated = store
+        .upsert_commit_status(&commit_status(&repo_id, "ci/anvil", "success", now + 11))
+        .await
+        .unwrap();
+    assert_eq!(updated.state, "success");
+    assert_eq!(updated.created_at, 1);
+    assert_eq!(updated.updated_at, now + 11);
+    store
+        .upsert_commit_status(&commit_status(&repo_id, "test", "error", now + 12))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .aggregate_state_for_commit(&repo_id, "abc123")
+            .await
+            .unwrap(),
+        Some("failure".to_string())
+    );
+    let contexts: Vec<String> = store
+        .list_commit_statuses(&repo_id, "abc123")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.context)
+        .collect();
+    assert_eq!(contexts, vec!["ci/anvil", "test"]);
+
     let i1 = store
         .create_issue("is1", &repo_id, "first", "body", "alice", now)
         .await

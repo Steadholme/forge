@@ -20,7 +20,8 @@ use thiserror::Error;
 
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
-    Issue, IssueComment, Label, Milestone, Pat, Pull, PullReview, PullReviewComment, Repo,
+    CommitStatus, Issue, IssueComment, Label, Milestone, Pat, Pull, PullReview, PullReviewComment,
+    Repo,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -28,6 +29,31 @@ use crate::model::{
 pub enum StoreError {
     #[error("store error: {0}")]
     Backend(String),
+}
+
+/// Aggregate latest per-context commit statuses:
+/// failure/error wins, then pending, then success; no rows means no aggregate status.
+pub fn aggregate_commit_statuses(statuses: &[CommitStatus]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+    let mut saw_pending = false;
+    let mut saw_success = false;
+    for status in statuses {
+        match status.state.as_str() {
+            "failure" | "error" => return Some("failure".to_string()),
+            "pending" => saw_pending = true,
+            "success" => saw_success = true,
+            _ => saw_pending = true,
+        }
+    }
+    if saw_pending {
+        Some("pending".to_string())
+    } else if saw_success {
+        Some("success".to_string())
+    } else {
+        None
+    }
 }
 
 /// Pluggable metadata store.
@@ -272,6 +298,25 @@ pub trait Store: Send + Sync {
         pull_id: &str,
     ) -> Result<Vec<PullReviewComment>, StoreError>;
 
+    // --- commit statuses -------------------------------------------------------
+    /// Insert or replace the latest status for `(repo_id, commit_sha, context)`.
+    async fn upsert_commit_status(&self, status: &CommitStatus)
+        -> Result<CommitStatus, StoreError>;
+
+    /// Latest statuses for every context on one commit, ordered by context.
+    async fn list_commit_statuses(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Vec<CommitStatus>, StoreError>;
+
+    /// Aggregate state for one commit after considering each context's latest status.
+    async fn aggregate_state_for_commit(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Option<String>, StoreError>;
+
     // --- pats ----------------------------------------------------------------
     /// Insert a personal access token (only the hash is stored).
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError>;
@@ -304,6 +349,7 @@ pub struct InMemoryStore {
     milestones: Mutex<Vec<Milestone>>,
     pull_reviews: Mutex<Vec<PullReview>>,
     pull_review_comments: Mutex<Vec<PullReviewComment>>,
+    commit_statuses: Mutex<Vec<CommitStatus>>,
     pats: Mutex<Vec<Pat>>,
 }
 
@@ -1026,6 +1072,56 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
+    async fn upsert_commit_status(
+        &self,
+        status: &CommitStatus,
+    ) -> Result<CommitStatus, StoreError> {
+        let mut statuses = self
+            .commit_statuses
+            .lock()
+            .expect("commit_statuses lock poisoned");
+        if let Some(existing) = statuses.iter_mut().find(|s| {
+            s.repo_id == status.repo_id
+                && s.commit_sha == status.commit_sha
+                && s.context == status.context
+        }) {
+            existing.state = status.state.clone();
+            existing.description = status.description.clone();
+            existing.target_url = status.target_url.clone();
+            existing.updated_at = status.updated_at;
+            return Ok(existing.clone());
+        }
+        statuses.push(status.clone());
+        Ok(status.clone())
+    }
+
+    async fn list_commit_statuses(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Vec<CommitStatus>, StoreError> {
+        let statuses = self
+            .commit_statuses
+            .lock()
+            .expect("commit_statuses lock poisoned");
+        let mut out: Vec<CommitStatus> = statuses
+            .iter()
+            .filter(|s| s.repo_id == repo_id && s.commit_sha == commit_sha)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.context.cmp(&b.context));
+        Ok(out)
+    }
+
+    async fn aggregate_state_for_commit(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let statuses = self.list_commit_statuses(repo_id, commit_sha).await?;
+        Ok(aggregate_commit_statuses(&statuses))
+    }
+
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError> {
         let mut pats = self.pats.lock().expect("pats lock poisoned");
         pats.push(pat.clone());
@@ -1084,6 +1180,8 @@ const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
 const REVIEW_COLS: &str = "id, pull_id, reviewer_sub, verdict, body, created_at";
 const REVIEW_COMMENT_COLS: &str =
     "id, pull_id, review_id, path, line, author_sub, body, created_at";
+const COMMIT_STATUS_COLS: &str =
+    "id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -1365,6 +1463,33 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS commit_statuses (\
+                 id TEXT PRIMARY KEY, \
+                 repo_id TEXT NOT NULL, \
+                 commit_sha TEXT NOT NULL, \
+                 state TEXT NOT NULL, \
+                 context TEXT NOT NULL, \
+                 description TEXT NOT NULL DEFAULT '', \
+                 target_url TEXT NOT NULL DEFAULT '', \
+                 created_at BIGINT NOT NULL, \
+                 updated_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_commit_statuses_repo_sha_context \
+             ON commit_statuses (repo_id, commit_sha, context)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_commit_statuses_repo_sha \
+             ON commit_statuses (repo_id, commit_sha)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Per-repo PR numbering uniqueness (backs the race-safe ON CONFLICT retry).
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pulls_repo_number \
@@ -1496,6 +1621,20 @@ impl PgStore {
             author_sub: row.try_get("author_sub")?,
             body: row.try_get("body")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn commit_status_from_row(row: &sqlx::postgres::PgRow) -> Result<CommitStatus, sqlx::Error> {
+        Ok(CommitStatus {
+            id: row.try_get("id")?,
+            repo_id: row.try_get("repo_id")?,
+            commit_sha: row.try_get("commit_sha")?,
+            state: row.try_get("state")?,
+            context: row.try_get("context")?,
+            description: row.try_get("description")?,
+            target_url: row.try_get("target_url")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
         })
     }
 }
@@ -2427,6 +2566,79 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn upsert_commit_status(
+        &self,
+        status: &CommitStatus,
+    ) -> Result<CommitStatus, StoreError> {
+        sqlx::query(
+            "INSERT INTO commit_statuses \
+                 (id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (repo_id, commit_sha, context) DO UPDATE SET \
+                 state = EXCLUDED.state, \
+                 description = EXCLUDED.description, \
+                 target_url = EXCLUDED.target_url, \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&status.id)
+        .bind(&status.repo_id)
+        .bind(&status.commit_sha)
+        .bind(&status.state)
+        .bind(&status.context)
+        .bind(&status.description)
+        .bind(&status.target_url)
+        .bind(status.created_at)
+        .bind(status.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {COMMIT_STATUS_COLS} FROM commit_statuses \
+             WHERE repo_id = $1 AND commit_sha = $2 AND context = $3"
+        ))
+        .bind(&status.repo_id)
+        .bind(&status.commit_sha)
+        .bind(&status.context)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::commit_status_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .ok_or_else(|| StoreError::Backend("commit status upsert did not persist".to_string()))
+    }
+
+    async fn list_commit_statuses(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Vec<CommitStatus>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {COMMIT_STATUS_COLS} FROM commit_statuses \
+             WHERE repo_id = $1 AND commit_sha = $2 ORDER BY context ASC"
+        ))
+        .bind(repo_id)
+        .bind(commit_sha)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::commit_status_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn aggregate_state_for_commit(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let statuses = self.list_commit_statuses(repo_id, commit_sha).await?;
+        Ok(aggregate_commit_statuses(&statuses))
+    }
+
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO pats (id, owner_sub, name, token_hash, created_at) \
@@ -2498,6 +2710,20 @@ mod tests {
             protect_default_branch: false,
             forked_from_id: String::new(),
             created_at: created,
+        }
+    }
+
+    fn commit_status(context: &str, state: &str, updated_at: i64) -> CommitStatus {
+        CommitStatus {
+            id: format!("cs_{}", context.replace('/', "_")),
+            repo_id: "r".into(),
+            commit_sha: "abc123".into(),
+            state: state.into(),
+            context: context.into(),
+            description: format!("{context} {state}"),
+            target_url: format!("https://ci.example/{context}"),
+            created_at: 1,
+            updated_at,
         }
     }
 
@@ -2766,6 +2992,67 @@ mod tests {
             s.list_pull_review_comments(&pull.id).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn commit_status_upsert_and_aggregate() {
+        let s = InMemoryStore::new();
+        assert!(s
+            .aggregate_state_for_commit("r", "abc123")
+            .await
+            .unwrap()
+            .is_none());
+
+        let build = s
+            .upsert_commit_status(&commit_status("build", "pending", 10))
+            .await
+            .unwrap();
+        assert_eq!(build.state, "pending");
+        assert_eq!(
+            s.aggregate_state_for_commit("r", "abc123").await.unwrap(),
+            Some("pending".to_string())
+        );
+
+        s.upsert_commit_status(&commit_status("test", "success", 11))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.aggregate_state_for_commit("r", "abc123").await.unwrap(),
+            Some("pending".to_string()),
+            "pending wins over all-success until every context succeeds"
+        );
+
+        let updated = s
+            .upsert_commit_status(&commit_status("build", "success", 12))
+            .await
+            .unwrap();
+        assert_eq!(updated.state, "success");
+        assert_eq!(
+            updated.created_at, 1,
+            "upsert preserves first creation time"
+        );
+        assert_eq!(updated.updated_at, 12);
+        assert_eq!(
+            s.aggregate_state_for_commit("r", "abc123").await.unwrap(),
+            Some("success".to_string())
+        );
+
+        s.upsert_commit_status(&commit_status("lint", "error", 13))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.aggregate_state_for_commit("r", "abc123").await.unwrap(),
+            Some("failure".to_string()),
+            "failure/error wins over every other state"
+        );
+        let contexts: Vec<String> = s
+            .list_commit_statuses("r", "abc123")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.context)
+            .collect();
+        assert_eq!(contexts, vec!["build", "lint", "test"]);
     }
 
     #[tokio::test]
