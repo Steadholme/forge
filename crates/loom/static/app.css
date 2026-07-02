@@ -868,3 +868,129 @@ th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
   background:var(--surface-3);
   transition:background var(--dur) var(--ease);
 }
+
+/* ============================================================================
+   PR file-tree sidebar + per-file "Viewed" state
+   ----------------------------------------------------------------------------
+   Pure visual layer for the PR diff review UI (backend already emits the
+   markup — see render_pr_diff / render_pr_file_tree / render_diff_file).
+   DOM shape this styles:
+     .pr-diff
+       aside.pr-filetree  > .pr-filetree__summary ("Viewed X/Y")
+                            + ol.pr-filetree__list
+                                > li.pr-filetree__item[data-viewed]
+                                    > form.pr-file-viewed.pr-file-viewed--tree
+                                    + a.pr-filetree__link
+                                        > .pr-filetree__path + .pr-filetree__stat
+       .pr-diff__files    > .diff-toolbar + .diff-files
+                            > details.diff-file[data-viewed]  (viewed => collapsed)
+   Reuses Odyssey v2 tokens only — no new fonts / libraries / external links.
+   ========================================================================== */
+
+/* Two-column shell: narrow sticky tree beside the scrolling diff body. */
+.pr-diff { display:flex; align-items:flex-start; gap:20px; }
+.pr-diff__files { flex:1 1 auto; min-width:0; }
+
+/* --- File-tree sidebar --------------------------------------------------- */
+.pr-filetree {
+  flex:none; width:250px;
+  position:sticky; top:16px;
+  max-height:calc(100vh - 32px); overflow:auto;
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:var(--r-sm); box-shadow:var(--sh-xs);
+}
+/* "Viewed X/Y" — weak label pinned atop the scrolling list. */
+.pr-filetree__summary {
+  position:sticky; top:0; z-index:1;
+  padding:9px 12px; border-bottom:1px solid var(--hairline);
+  background:var(--surface-2);
+  font:600 11px/1.2 var(--mono); letter-spacing:.02em; color:var(--ink-3);
+}
+.pr-filetree__list { list-style:none; margin:0; padding:6px; }
+
+.pr-filetree__item {
+  display:flex; flex-direction:column; gap:2px;
+  padding:4px 6px; border-radius:var(--r-xs);
+  transition:background var(--dur) var(--ease);
+}
+.pr-filetree__item:hover { background:var(--surface-2); }
+
+/* Path row: mono path (ellipsised) + right-aligned add/del counts. */
+.pr-filetree__link {
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  min-width:0; text-decoration:none; color:var(--ink-2);
+}
+.pr-filetree__link:hover { text-decoration:none; color:var(--ink); }
+.pr-filetree__link:focus-visible {
+  outline:2px solid var(--ring); outline-offset:2px; border-radius:var(--r-xs);
+}
+.pr-filetree__path {
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font:500 12px/1.4 var(--mono);
+}
+.pr-filetree__stat { flex:none; font:700 11px/1 var(--mono); }
+.pr-filetree__stat .diff-add,
+.pr-filetree__stat .diff-del { font-size:11px; }   /* +add uses --ok, -del uses --down (inherited) */
+
+/* Compact viewed control in the tree row — surfaces on hover / focus. */
+.pr-file-viewed--tree { font-size:11px; opacity:.72; }
+.pr-filetree__item:hover .pr-file-viewed--tree,
+.pr-file-viewed--tree:focus-within { opacity:1; }
+.pr-file-viewed--tree .pr-file-viewed__submit {
+  height:24px; padding:0 8px; font-size:11px; border-radius:var(--r-xs);
+}
+
+/* Viewed rows recede so unseen files stand out at a glance. */
+.pr-filetree__item--viewed,
+.pr-filetree__item[data-viewed="true"] { opacity:.62; }
+.pr-filetree__item--viewed:hover,
+.pr-filetree__item[data-viewed="true"]:hover { opacity:1; }
+.pr-filetree__item--viewed .pr-filetree__path,
+.pr-filetree__item[data-viewed="true"] .pr-filetree__path {
+  color:var(--ink-3); font-weight:400;
+}
+
+/* --- Diff file blocks: de-emphasise viewed, cue the jump target ---------- */
+/* Viewed files are rendered collapsed (no [open]); fade the chrome too. */
+.diff-file--viewed,
+.diff-file[data-viewed="true"] { border-color:var(--hairline); }
+.diff-file--viewed > .diff-file__summary,
+.diff-file[data-viewed="true"] > .diff-file__summary {
+  color:var(--ink-3); background:var(--surface);
+}
+
+/* Anchor jump from the tree: offset for sticky context + a brief accent cue. */
+.diff-file { scroll-margin-top:16px; }
+.diff-file:target { border-color:var(--accent-border); box-shadow:var(--sh-sm); }
+.diff-file:target > .diff-file__summary {
+  background:var(--accent-soft); color:var(--accent-ink);
+}
+
+/* --- Per-file "Viewed" form (base shared by tree + diff variants) -------- */
+.pr-file-viewed {
+  display:flex; align-items:center; gap:8px; margin:0;
+  font-size:12px; color:var(--ink-2);
+}
+.pr-file-viewed--diff {
+  padding:8px 12px; border-bottom:1px solid var(--border);
+  background:var(--surface-2);
+}
+.pr-file-viewed__label {
+  display:inline-flex; align-items:center; gap:6px;
+  cursor:pointer; user-select:none;
+}
+.pr-file-viewed__checkbox {
+  width:15px; height:15px; margin:0; flex:none; cursor:pointer;
+  accent-color:var(--accent);          /* clear checked state, no extra assets */
+}
+/* Checked "Viewed" reads as done (progressive — ignored where :has is absent). */
+.pr-file-viewed__label:has(.pr-file-viewed__checkbox:checked) { color:var(--ok-ink); }
+
+/* --- Responsive: stack the tree above the diff on narrow viewports ------- */
+@media (max-width:900px){
+  .pr-diff { flex-direction:column; }
+  .pr-filetree {
+    width:auto; position:static;
+    max-height:220px;                  /* internal scroll so it never dominates */
+  }
+}
