@@ -1470,3 +1470,72 @@ mark.code-search-hit {
    switch; this bar adds no motion of its own. Dark mode needs no override —
    every colour resolves through the shared semantic tokens, so it follows the
    theme layer automatically. */
+
+
+
+/* ==========================================================================
+   Blob line anchors & permalink  —  visual layer for the SSR row hooks
+   (tr.blob-line#L{n}[data-line] > td.blob-line__num > a[href="#L{n}"]  +
+    td.blob-line__code, inside table.blob-code). The backend + app.js own the
+   behaviour; this section is pure presentation and resolves every colour
+   through the shared Odyssey tokens, so dark mode and the global
+   prefers-reduced-motion kill-switch are inherited automatically.
+   ========================================================================== */
+
+/* Land a jumped-to line just below the sticky .appbar (56px) rather than
+   hidden beneath it — covers both #L{n} :target and app.js scroll-into-view. */
+.blob-line { scroll-margin-top:68px; }
+
+/* Clickable line numbers: the gutter anchor is a permalink to its own line.
+   Faint by default (inherits the .blob-line__num ink-3 wash), it firms up to
+   the accent ink on hover so the "click to pin this line" affordance reads. */
+.blob-line__num a {
+  display:block;
+  color:inherit; text-decoration:none; cursor:pointer;
+  transition:color var(--dur) var(--ease);
+}
+.blob-line__num a:hover { color:var(--accent-ink); text-decoration:none; }
+
+/* Highlighted line(s): permalink :target (single line) and the app.js
+   .blob-line--highlight class (single line or a contiguous range). A soft warn
+   wash carries the whole row; because border-collapse leaves no gaps and every
+   row in a range gets the same fill, a multi-line selection reads as one
+   seamless band. Code stays --ink for full readability. */
+.blob-line--highlight > .blob-line__code,
+.blob-line:target      > .blob-line__code {
+  background:var(--warn-soft);
+}
+/* The gutter echoes the wash with a warmer ink and a 3px rail painted along its
+   left edge (a background gradient, not a box-shadow, so it renders reliably on
+   border-collapse cells). The rail is continuous down a range, marking the
+   selection without shouting. */
+.blob-line--highlight > .blob-line__num,
+.blob-line:target      > .blob-line__num {
+  color:var(--warn-ink);
+  background:
+    linear-gradient(var(--warn), var(--warn)) left top / 3px 100% no-repeat,
+    var(--warn-soft);
+}
+
+/* Permalink button — sits in .blob-actions at the exact ghost weight/size of
+   the neighbouring History / Blame buttons (it already carries .btn-ghost
+   .btn-sm). A faint leading link glyph, masked and tinted through currentColor
+   so it tracks the ghost text colour, is the only thing that sets it apart. */
+.blob-actions .btn-permalink {
+  --icon-link:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm5-6v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5h-4z'/%3E%3C/svg%3E");
+  gap:6px;
+}
+.blob-actions .btn-permalink::before {
+  content:""; flex:0 0 auto; width:13px; height:13px;
+  background:currentColor; opacity:.85;
+  -webkit-mask:var(--icon-link) center / contain no-repeat;
+          mask:var(--icon-link) center / contain no-repeat;
+}
+
+/* Reduced motion: the global kill-switch already zeroes the number-hover
+   transition above; this explicit guard mirrors the pattern used elsewhere in
+   this sheet so the intent stays obvious. Dark mode needs no override — every
+   colour resolves through the shared semantic tokens. */
+@media (prefers-reduced-motion:reduce) {
+  .blob-line__num a { transition:none; }
+}
