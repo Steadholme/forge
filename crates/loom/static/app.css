@@ -2072,3 +2072,105 @@ mark.code-search-hit {
 /* Punctuation stays near the body ink, a touch quieter so it never competes
    with the coloured tokens above. */
 .tok-punct { color:var(--ink-2); }
+
+
+/* ==========================================================================
+   Repository settings — Collaborators + Danger Zone
+   SSR hooks (crates/loom): the collaborator manager stamps a
+   `.card.collaborator-settings` holding a `.collaborator-list` of
+   `.collaborator-item` rows (name + `.state-badge.collab-role` chip + inline
+   `.collaborator-role-form` / `.collaborator-remove-form`), followed by a
+   `.collaborator-form--new` composer; the destructive block is a
+   `.card.danger-zone` wrapping the `.delete-repo-form`.
+   Every destructive cue below draws from the shared --down family
+   (down / down-soft / down-ink / down-border) that .btn-danger and
+   .alert-danger already use — no new colour is introduced, so both the global
+   reduced-motion guard and a future token dark theme apply with no extra rule.
+   ========================================================================== */
+
+/* 1. Collaborator list — reset spacing and stack each collaborator as a row
+   divided by a hairline, matching the .pat-item / .pr-item settings idiom. */
+.collaborator-list { display:flex; flex-direction:column; }
+.collaborator-item {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:12px 0; border-top:1px solid var(--hairline);
+}
+.collaborator-item:first-child { border-top:0; padding-top:2px; }
+
+/* 2. Role chip — reuse the .state-badge pill on a neutral surface tone so it
+   stays role-agnostic (read/write/admin all read the same weight); uppercased
+   and tracked out like the table captions so it scans as metadata, not a
+   live status. --ink-2 on --surface-3 clears AA comfortably (>7:1). */
+.state-badge.collab-role {
+  background:var(--surface-3); color:var(--ink-2); border:1px solid var(--border);
+  text-transform:uppercase; letter-spacing:.05em; font-size:10.5px;
+}
+
+/* 3. Row actions — the inline forms cluster on the trailing edge. The first
+   form takes margin-left:auto so the whole action group shifts right whether
+   or not the role-update form is present (an owner row may omit it). The role
+   <select> must not stretch to the .input 100% width, so it is sized to its
+   content and shrunk to the .btn-sm height to sit snug beside Update. */
+.collaborator-item form:first-of-type { margin-left:auto; }
+.collaborator-role-form { align-items:center; gap:8px; }
+.collaborator-remove-form { align-items:center; }
+.collaborator-role-form .select {
+  width:auto; min-width:112px; height:32px; font-size:12.5px;
+  padding:0 30px 0 10px; background-position:right 8px center;
+}
+
+/* 4. Remove — stays the ghost/sm button the SSR emits; hover borrows the
+   shared --down destructive family so the intent reads without stacking a
+   second red into the resting state (mirrors .btn-delete-webhook). */
+.btn-remove-collaborator:hover {
+  color:var(--down-ink); border-color:var(--down-border); background:var(--down-soft);
+}
+
+/* 5. Add composer — divided from the list by a hairline, then laid out as a
+   single row: the User input grows, the Role select is fixed, the Add button
+   hugs its label. Element selectors carry the flex sizing so the layout holds
+   whether the controls ship as .input/.select or bare fields; on narrow
+   widths flex-wrap stacks them to full-width controls. */
+.collaborator-form--new {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  margin-top:16px; padding-top:16px; border-top:1px solid var(--hairline);
+}
+.collaborator-form--new input { flex:1 1 200px; width:auto; }
+.collaborator-form--new select { flex:0 0 auto; width:auto; min-width:132px; }
+.collaborator-form--new .btn-add-collaborator { flex:0 0 auto; }
+
+/* 6. Danger Zone — set apart from ordinary settings cards by a clearly red
+   frame (a --down / --down-border mix, distinct from the neutral --border grey
+   of every other card) and a red-tinted head. Colour never carries the meaning
+   alone: the heading text states the destructive intent. */
+.card.danger-zone { border-color:color-mix(in srgb, var(--down) 38%, var(--down-border)); }
+.card.danger-zone .card__head {
+  background:var(--down-soft); border-bottom-color:var(--down-border);
+  border-radius:var(--r) var(--r) 0 0;
+}
+.card.danger-zone .card__ico { background:var(--down-soft); color:var(--down); }
+.card.danger-zone .card__title h3,
+.card.danger-zone h2, .card.danger-zone h3 { color:var(--down-ink); }
+
+/* 7. Delete form — label, a confirm input where the operator retypes the repo
+   name, then the destructive button. Stacked with clear breathing room; the
+   input takes the --mono face so the typed name checks character-for-character
+   against the heading, and is capped so it reads as a confirm field. */
+.delete-repo-form { display:flex; flex-direction:column; gap:12px; align-items:flex-start; }
+.delete-repo-form label, .delete-repo-form .label { color:var(--ink); font-weight:600; margin:0; }
+.delete-repo-form .input { font-family:var(--mono); max-width:340px; }
+
+/* 8. Delete button — .btn-danger already paints it red-on-white from the
+   shared --down family (white on --down measures ~4.7:1, AA-clear). It ships
+   `disabled` until the client script confirms the typed name matches: the
+   disabled look is desaturated to a neutral grey (not a faded red, which could
+   still read as "armed") with a not-allowed cursor, overriding the base
+   .btn[disabled] opacity so an un-armed button never signals danger. A
+   disabled control is exempt from the AA text-contrast requirement. */
+.btn-delete-repo:disabled,
+.btn-delete-repo[disabled] {
+  background:var(--bg-2); color:var(--ink-3); box-shadow:none;
+  opacity:1; cursor:not-allowed;
+}
+.btn-delete-repo:disabled:hover,
+.btn-delete-repo[disabled]:hover { background:var(--bg-2); }
