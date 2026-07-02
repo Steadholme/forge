@@ -180,6 +180,29 @@ impl GitOps {
         let _ = tokio::fs::remove_dir_all(path).await;
     }
 
+    /// Fork a repository by cloning the source bare repo into a new bare repo path. The caller
+    /// creates metadata first and rolls it back if this fails.
+    pub async fn clone_bare(
+        &self,
+        src_owner: &str,
+        src_name: &str,
+        dst_owner: &str,
+        dst_name: &str,
+    ) -> std::io::Result<()> {
+        let src = self.repo_path(src_owner, src_name);
+        let dst = self.repo_path(dst_owner, dst_name);
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let src_str = src.to_string_lossy().to_string();
+        let dst_str = dst.to_string_lossy().to_string();
+        self.run_git(&["clone", "--bare", &src_str, &dst_str])
+            .await?;
+        self.run_git_in(&dst_str, &["config", "http.receivepack", "true"])
+            .await?;
+        Ok(())
+    }
+
     /// Resolve the default-branch HEAD to a commit OID, or `None` when the repo has no commits
     /// yet (a freshly created/empty repo).
     pub async fn head_commit(&self, owner: &str, name: &str) -> Option<String> {
@@ -235,10 +258,7 @@ impl GitOps {
             format!("{commit_oid}:{}", path.trim_end_matches('/'))
         };
         let out = match self
-            .run_git_in_capture(
-                &repo.to_string_lossy(),
-                &["ls-tree", "--long", "-z", &spec],
-            )
+            .run_git_in_capture(&repo.to_string_lossy(), &["ls-tree", "--long", "-z", &spec])
             .await
         {
             Ok(out) if out.status => out,
@@ -294,10 +314,7 @@ impl GitOps {
         let fmt = "--pretty=format:%H%x1f%an%x1f%ae%x1f%at%x1f%s%x00";
         let max = format!("--max-count={limit}");
         let out = match self
-            .run_git_in_capture(
-                &repo.to_string_lossy(),
-                &["log", &max, fmt, commit_oid],
-            )
+            .run_git_in_capture(&repo.to_string_lossy(), &["log", &max, fmt, commit_oid])
             .await
         {
             Ok(out) if out.status => out,
@@ -362,12 +379,7 @@ impl GitOps {
     /// The unified diff a commit introduced (`git show` against its first parent; a root commit
     /// diffs against the empty tree). `None` when the git invocation fails. For a merge commit
     /// git emits the combined diff, which is empty unless the merge itself changed files.
-    pub async fn commit_patch(
-        &self,
-        owner: &str,
-        name: &str,
-        commit_oid: &str,
-    ) -> Option<String> {
+    pub async fn commit_patch(&self, owner: &str, name: &str, commit_oid: &str) -> Option<String> {
         let repo = self.repo_path(owner, name);
         let out = self
             .run_git_in_capture(&repo.to_string_lossy(), &["show", "--format=", commit_oid])
@@ -418,8 +430,11 @@ impl GitOps {
     /// branch name is caller-validated, so the argument is never option-like.
     pub async fn set_head(&self, owner: &str, name: &str, branch: &str) -> std::io::Result<()> {
         let path = self.repo_path(owner, name).to_string_lossy().to_string();
-        self.run_git_in(&path, &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])
-            .await
+        self.run_git_in(
+            &path,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -511,7 +526,8 @@ impl GitOps {
 
         // Base is an ancestor of head — a clean fast-forward.
         if self.is_ancestor(&dir, &base_oid, &head_oid).await {
-            self.update_ref(&dir, &base_ref, &head_oid, &base_oid).await?;
+            self.update_ref(&dir, &base_ref, &head_oid, &base_oid)
+                .await?;
             return Ok(MergeOutcome::FastForward);
         }
 
@@ -568,8 +584,9 @@ impl GitOps {
             .map_err(|e| format!("merge-tree failed: {e}"))?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status {
-            return Err("the branches have conflicting changes that must be resolved manually"
-                .to_string());
+            return Err(
+                "the branches have conflicting changes that must be resolved manually".to_string(),
+            );
         }
         // On success the first line is the merged tree OID.
         stdout
@@ -839,10 +856,7 @@ fn parse_commit_detail(text: &str) -> Option<CommitDetail> {
         author_name: fields[1].to_string(),
         author_email: fields[2].to_string(),
         time: fields[3].trim().parse::<i64>().unwrap_or(0),
-        parents: fields[4]
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
+        parents: fields[4].split_whitespace().map(str::to_string).collect(),
         message: fields[5].trim_end_matches('\n').to_string(),
     })
 }
@@ -947,9 +961,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -1018,7 +1030,10 @@ mod tests {
         let tags = parse_tag_refs(raw);
         assert_eq!(tags.len(), 2);
         assert!(tags[0].annotated);
-        assert_eq!(tags[0].oid, "ccc333", "annotated tag peels to the target commit");
+        assert_eq!(
+            tags[0].oid, "ccc333",
+            "annotated tag peels to the target commit"
+        );
         assert_eq!(tags[0].message, "first release");
         assert!(!tags[1].annotated);
         assert_eq!(tags[1].oid, "ddd444");

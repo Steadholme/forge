@@ -80,6 +80,21 @@ pub async fn handle(
             None => return unauthorized(),
         }
     }
+    if op == GitOp::Push
+        && repo.protect_default_branch
+        && method == Method::POST
+        && body_touches_branch(&body, &repo.default_branch)
+    {
+        tracing::warn!(
+            repo = repo.id,
+            branch = repo.default_branch,
+            "protected branch push blocked"
+        );
+        return text_response(
+            StatusCode::FORBIDDEN,
+            "direct push to the protected default branch is blocked; use web merge",
+        );
+    }
 
     // --- run git http-backend as a CGI -------------------------------------
     let path_info = format!("/{path}");
@@ -204,19 +219,22 @@ fn header_str(headers: &HeaderMap, name: impl axum::http::header::AsHeaderName) 
         .map(str::to_string)
 }
 
+fn body_touches_branch(body: &[u8], branch: &str) -> bool {
+    let needle = format!("refs/heads/{branch}");
+    String::from_utf8_lossy(body).contains(&needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn classify_info_refs_fetch_and_push() {
-        let (o, n, op) =
-            classify("alice/proj.git/info/refs", "service=git-upload-pack").unwrap();
+        let (o, n, op) = classify("alice/proj.git/info/refs", "service=git-upload-pack").unwrap();
         assert_eq!((o.as_str(), n.as_str()), ("alice", "proj"));
         assert_eq!(op, GitOp::Fetch);
 
-        let (_, _, op) =
-            classify("alice/proj.git/info/refs", "service=git-receive-pack").unwrap();
+        let (_, _, op) = classify("alice/proj.git/info/refs", "service=git-receive-pack").unwrap();
         assert_eq!(op, GitOp::Push);
     }
 
@@ -245,5 +263,12 @@ mod tests {
             Some("git-upload-pack")
         );
         assert_eq!(service_param("foo=bar").as_deref(), None);
+    }
+
+    #[test]
+    fn protected_branch_detection_reads_pkt_text() {
+        let body = b"0000000000000000000000000000000000000000 abc refs/heads/main\0 caps";
+        assert!(body_touches_branch(body, "main"));
+        assert!(!body_touches_branch(body, "feature"));
     }
 }

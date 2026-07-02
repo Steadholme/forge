@@ -10,6 +10,8 @@
 //! (title, branch names, commit subjects, diff bytes) is HTML-escaped on render; PR bodies go
 //! through the sanitising [`crate::markdown`] pipeline.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
@@ -21,11 +23,13 @@ use crate::config::{COMMIT_LIMIT, MAX_BLOB_RENDER_BYTES};
 use crate::error::AppError;
 use crate::gitops::CommitInfo;
 use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
-use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect, short_oid};
-use crate::model::{Pull, Repo};
+use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect, short_oid};
+use crate::model::{Label, Milestone, Pull, PullReview, PullReviewComment, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
 const PULL_ID_LEN: usize = 16;
+const REVIEW_ID_LEN: usize = 16;
+const REVIEW_COMMENT_ID_LEN: usize = 16;
 
 // ===========================================================================
 // Shared helpers
@@ -35,12 +39,22 @@ const PULL_ID_LEN: usize = 16;
 async fn pr_header(state: &AppState, repo: &Repo, active: &str) -> String {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
-    render_repo_header(repo, &state.config.public_base_url, open_issues, open_pulls, active)
+    render_repo_header(
+        repo,
+        &state.config.public_base_url,
+        open_issues,
+        open_pulls,
+        active,
+    )
 }
 
 /// True when `who` may merge/close a PR on `repo`: the repo owner (maintainer) or the PR author.
 fn can_gate(repo: &Repo, pull: &Pull, who: &Identity) -> bool {
     repo.owner_sub == who.subject || pull.author_sub == who.subject
+}
+
+fn can_review(repo: &Repo, pull: &Pull, who: &Identity, headers: &HeaderMap) -> bool {
+    can_gate(repo, pull, who) || auth::is_admin(headers)
 }
 
 // ===========================================================================
@@ -72,7 +86,11 @@ pub async fn compare(
     let body = render_compare(&state, &repo, &branches, &base, &head, &csrf, None).await;
     Ok(html_with_csrf(
         StatusCode::OK,
-        page(&format!("{owner}/{name} · Compare"), Some(&who.email), &body),
+        page(
+            &format!("{owner}/{name} · Compare"),
+            Some(&who.email),
+            &body,
+        ),
         &csrf,
     ))
 }
@@ -95,16 +113,42 @@ fn pick_base(repo: &Repo, branches: &[String], requested: Option<&str>) -> Strin
 // GET /r/{owner}/{name}/pulls — list
 // ===========================================================================
 
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub milestone: Option<String>,
+}
+
 pub async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let pulls = state.store.list_pulls(&repo.id).await?;
+    let label_filter = q.label.unwrap_or_default();
+    let milestone_filter = q.milestone.unwrap_or_default();
+    let pulls = state
+        .store
+        .list_pulls_filtered(&repo.id, &label_filter, &milestone_filter)
+        .await?;
+    let labels = state.store.list_labels(&repo.id).await?;
+    let milestones = state.store.list_milestones(&repo.id).await?;
+    let pull_labels = state.store.list_pull_labels(&repo.id).await?;
     let header = pr_header(&state, &repo, "pulls").await;
-    let body = render_list(&repo, &header, &pulls);
+    let body = render_list(
+        &repo,
+        &header,
+        &pulls,
+        &labels,
+        &milestones,
+        &pull_labels,
+        &label_filter,
+        &milestone_filter,
+    );
     Ok(crate::handlers::html_ok(page(
         &format!("{owner}/{name} · Pull requests"),
         Some(&who.email),
@@ -128,6 +172,10 @@ pub struct CreateForm {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    pub milestone_id: String,
+    #[serde(default, deserialize_with = "crate::handlers::form_vec")]
+    pub labels: Vec<String>,
 }
 
 pub async fn create(
@@ -180,10 +228,16 @@ pub async fn create(
         .await;
         return Ok(html_with_csrf(
             StatusCode::BAD_REQUEST,
-            page(&format!("{owner}/{name} · Compare"), Some(&who.email), &body),
+            page(
+                &format!("{owner}/{name} · Compare"),
+                Some(&who.email),
+                &body,
+            ),
             &csrf,
         ));
     }
+    let (milestone_id, label_ids) =
+        clean_pull_metadata(&state, &repo, &form.milestone_id, &form.labels).await?;
 
     let pull = state
         .store
@@ -198,6 +252,10 @@ pub async fn create(
             now_secs(),
         )
         .await?;
+    state
+        .store
+        .set_pull_metadata(&pull.id, &milestone_id, &label_ids)
+        .await?;
 
     // Audit: no dedicated AuditSink in this crate — tracing is the audit surface (as with repo
     // create / issue open / PAT mint).
@@ -209,7 +267,40 @@ pub async fn create(
         author = who.subject,
         "pull request opened"
     );
-    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{}", pull.number)))
+    Ok(redirect(&format!(
+        "/r/{owner}/{name}/pulls/{}",
+        pull.number
+    )))
+}
+
+async fn clean_pull_metadata(
+    state: &AppState,
+    repo: &Repo,
+    milestone_id: &str,
+    labels: &[String],
+) -> Result<(String, Vec<String>), AppError> {
+    let milestones = state.store.list_milestones(&repo.id).await?;
+    let clean_milestone = if milestone_id.trim().is_empty()
+        || milestones.iter().any(|m| m.id == milestone_id.trim())
+    {
+        milestone_id.trim().to_string()
+    } else {
+        return Err(AppError::BadRequest(
+            "Choose an existing milestone.".to_string(),
+        ));
+    };
+    let repo_labels = state.store.list_labels(&repo.id).await?;
+    let mut clean_labels = Vec::new();
+    for label in labels {
+        let id = label.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if repo_labels.iter().any(|l| l.id == id) && !clean_labels.iter().any(|l| l == id) {
+            clean_labels.push(id.to_string());
+        }
+    }
+    Ok((clean_milestone, clean_labels))
 }
 
 // ===========================================================================
@@ -229,8 +320,28 @@ pub async fn detail(
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
     let csrf = auth::new_csrf_token();
+    let labels = state.store.list_labels(&repo.id).await?;
+    let pull_labels = state.store.pull_labels(&pull.id).await?;
+    let milestones = state.store.list_milestones(&repo.id).await?;
+    let reviews = state.store.list_pull_reviews(&pull.id).await?;
+    let review_comments = state.store.list_pull_review_comments(&pull.id).await?;
     let header = pr_header(&state, &repo, "pulls").await;
-    let body = render_detail(&state, &repo, &pull, &header, &who, &csrf, None).await;
+    let body = render_detail(
+        &state,
+        &repo,
+        &pull,
+        &labels,
+        &pull_labels,
+        &milestones,
+        &reviews,
+        &review_comments,
+        &header,
+        &who,
+        &headers,
+        &csrf,
+        None,
+    )
+    .await;
     Ok(html_with_csrf(
         StatusCode::OK,
         page(
@@ -282,6 +393,34 @@ pub async fn merge(
             "This pull request is no longer open.".to_string(),
         ));
     }
+    let reviews = state.store.list_pull_reviews(&pull.id).await?;
+    let review_summary = review_summary(&reviews);
+    if repo.require_approval && review_summary.approvals.is_empty() {
+        let csrf = auth::new_csrf_token();
+        let header = pr_header(&state, &repo, "pulls").await;
+        let body = render_detail_with_fresh_metadata(
+            &state,
+            &repo,
+            &pull,
+            &header,
+            &who,
+            &headers,
+            &csrf,
+            Some("This repository requires at least one approval before merge."),
+        )
+        .await?;
+        return Ok(html_with_csrf(
+            StatusCode::BAD_REQUEST,
+            page(
+                &format!("{owner}/{name} · PR #{number}"),
+                Some(&who.email),
+                &body,
+            ),
+            &csrf,
+        ));
+    }
+    let closing_commits = commits_for_closing(&state, &repo, &pull).await;
+    let closing_issues = closing_issue_numbers(&pull.body, &closing_commits);
 
     let message = format!(
         "Merge pull request #{number} from {head}\n\n{title}",
@@ -304,6 +443,7 @@ pub async fn merge(
     {
         Ok(outcome) => {
             let _ = state.store.merge_pull(&pull.id, now_secs()).await?;
+            close_linked_issues(&state, &repo, &closing_issues).await?;
             tracing::info!(
                 repo = repo.id,
                 number = pull.number,
@@ -319,16 +459,17 @@ pub async fn merge(
             // Expected user-facing failure (conflicts / racing push): re-render with the reason.
             let csrf = auth::new_csrf_token();
             let header = pr_header(&state, &repo, "pulls").await;
-            let body = render_detail(
+            let body = render_detail_with_fresh_metadata(
                 &state,
                 &repo,
                 &pull,
                 &header,
                 &who,
+                &headers,
                 &csrf,
                 Some(&format!("Could not merge automatically: {reason}")),
             )
-            .await;
+            .await?;
             Ok(html_with_csrf(
                 StatusCode::CONFLICT,
                 page(
@@ -340,6 +481,305 @@ pub async fn merge(
             ))
         }
     }
+}
+
+async fn render_detail_with_fresh_metadata(
+    state: &AppState,
+    repo: &Repo,
+    pull: &Pull,
+    header: &str,
+    who: &Identity,
+    headers: &HeaderMap,
+    csrf: &str,
+    error: Option<&str>,
+) -> Result<String, AppError> {
+    let labels = state.store.list_labels(&repo.id).await?;
+    let pull_labels = state.store.pull_labels(&pull.id).await?;
+    let milestones = state.store.list_milestones(&repo.id).await?;
+    let reviews = state.store.list_pull_reviews(&pull.id).await?;
+    let review_comments = state.store.list_pull_review_comments(&pull.id).await?;
+    Ok(render_detail(
+        state,
+        repo,
+        pull,
+        &labels,
+        &pull_labels,
+        &milestones,
+        &reviews,
+        &review_comments,
+        header,
+        who,
+        headers,
+        csrf,
+        error,
+    )
+    .await)
+}
+
+async fn commits_for_closing(state: &AppState, repo: &Repo, pull: &Pull) -> Vec<CommitInfo> {
+    state
+        .git
+        .commits_between(
+            &repo.owner_sub,
+            &repo.name,
+            &pull.base,
+            &pull.head,
+            COMMIT_LIMIT,
+        )
+        .await
+}
+
+fn closing_issue_numbers(body: &str, commits: &[CommitInfo]) -> Vec<i64> {
+    let mut found = BTreeSet::new();
+    collect_closing_numbers(body, &mut found);
+    for commit in commits {
+        collect_closing_numbers(&commit.subject, &mut found);
+    }
+    found.into_iter().collect()
+}
+
+fn collect_closing_numbers(text: &str, out: &mut BTreeSet<i64>) {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for pair in words.windows(2) {
+        let keyword = pair[0]
+            .trim_matches(|c: char| !c.is_ascii_alphabetic())
+            .to_ascii_lowercase();
+        if !matches!(
+            keyword.as_str(),
+            "fix"
+                | "fixes"
+                | "fixed"
+                | "close"
+                | "closes"
+                | "closed"
+                | "resolve"
+                | "resolves"
+                | "resolved"
+        ) {
+            continue;
+        }
+        let issue = pair[1].trim_matches(|c: char| c == '.' || c == ',' || c == ';' || c == ')');
+        if let Some(num) = issue.strip_prefix('#').and_then(|n| n.parse::<i64>().ok()) {
+            out.insert(num);
+        }
+    }
+}
+
+async fn close_linked_issues(
+    state: &AppState,
+    repo: &Repo,
+    numbers: &[i64],
+) -> Result<(), AppError> {
+    for number in numbers {
+        let Some(issue) = state.store.get_issue(&repo.id, *number).await? else {
+            continue;
+        };
+        if issue.is_open() {
+            state
+                .store
+                .set_issue_state(&issue.id, "closed", now_secs())
+                .await?;
+            tracing::info!(
+                repo = repo.id,
+                issue = number,
+                "issue auto-closed by pull merge"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/review — add a review verdict
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+pub async fn review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<ReviewForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    if !can_review(&repo, &pull, &who, &headers) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner, pull-request author, or an administrator can review."
+                .to_string(),
+        ));
+    }
+    let verdict = normalize_verdict(&form.verdict)?;
+    state
+        .store
+        .create_pull_review(
+            &format!("rv_{}", random_alnum(REVIEW_ID_LEN)),
+            &pull.id,
+            &who.subject,
+            verdict,
+            &form.body.trim().chars().take(20_000).collect::<String>(),
+            now_secs(),
+        )
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        reviewer = who.subject,
+        verdict,
+        "pull request reviewed"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+fn normalize_verdict(raw: &str) -> Result<&'static str, AppError> {
+    match raw.trim() {
+        "comment" => Ok("comment"),
+        "approve" => Ok("approve"),
+        "request_changes" => Ok("request_changes"),
+        _ => Err(AppError::BadRequest(
+            "Choose a valid review verdict.".to_string(),
+        )),
+    }
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/inline-comment — add anchored comment
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct InlineCommentForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub line: i64,
+    #[serde(default)]
+    pub body: String,
+}
+
+pub async fn inline_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<InlineCommentForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    if !can_review(&repo, &pull, &who, &headers) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner, pull-request author, or an administrator can comment."
+                .to_string(),
+        ));
+    }
+    let path = form.path.trim().chars().take(500).collect::<String>();
+    let body = form.body.trim().chars().take(20_000).collect::<String>();
+    if path.is_empty() || body.is_empty() {
+        return Err(AppError::BadRequest(
+            "Inline comments need a file path and a comment body.".to_string(),
+        ));
+    }
+    state
+        .store
+        .create_pull_review_comment(
+            &format!("rc_{}", random_alnum(REVIEW_COMMENT_ID_LEN)),
+            &pull.id,
+            "",
+            &path,
+            form.line.max(0),
+            &who.subject,
+            &body,
+            now_secs(),
+        )
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        actor = who.subject,
+        "pull inline comment added"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/metadata — labels/milestone
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct MetadataForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub milestone_id: String,
+    #[serde(default, deserialize_with = "crate::handlers::form_vec")]
+    pub labels: Vec<String>,
+}
+
+pub async fn metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<MetadataForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    if !can_gate(&repo, &pull, &who) && !auth::is_admin(&headers) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner, pull-request author, or an administrator can edit metadata."
+                .to_string(),
+        ));
+    }
+    let (milestone_id, label_ids) =
+        clean_pull_metadata(&state, &repo, &form.milestone_id, &form.labels).await?;
+    state
+        .store
+        .set_pull_metadata(&pull.id, &milestone_id, &label_ids)
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        number,
+        actor = who.subject,
+        "pull metadata updated"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
 }
 
 // ===========================================================================
@@ -384,7 +824,12 @@ pub async fn toggle(
     }
     let next = if pull.is_open() { "closed" } else { "open" };
     state.store.set_pull_state(&pull.id, next).await?;
-    tracing::info!(repo = repo.id, number, state = next, "pull request state changed");
+    tracing::info!(
+        repo = repo.id,
+        number,
+        state = next,
+        "pull request state changed"
+    );
     Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
 }
 
@@ -452,6 +897,13 @@ async fn render_compare(
 
         let commits_card = render_commits_card(&commits);
         let diff_card = render_diff_card(&diff);
+        let labels = state.store.list_labels(&repo.id).await.unwrap_or_default();
+        let milestones = state
+            .store
+            .list_milestones(&repo.id)
+            .await
+            .unwrap_or_default();
+        let metadata_fields = render_pull_metadata_fields(&labels, &milestones, "", &[]);
 
         // Prefill the title from the single/top commit subject, else "head into base".
         let default_title = commits
@@ -477,6 +929,7 @@ async fn render_compare(
         <label for="pr-body">Description</label>
         <textarea id="pr-body" name="body" class="issue-input" placeholder="Optional details…"></textarea>
       </div>
+      {metadata_fields}
       <div class="actions">
         <button class="btn btn-primary" type="submit">Create pull request</button>
       </div>
@@ -489,6 +942,7 @@ async fn render_compare(
             base_v = esc(base),
             head_v = esc(head),
             title = esc(&default_title),
+            metadata_fields = metadata_fields,
         );
         format!("{commits_card}{diff_card}{create_form}")
     };
@@ -520,18 +974,42 @@ fn render_branch_select(field: &str, branches: &[String], current: &str) -> Stri
         .iter()
         .map(|b| {
             let sel = if b == current { " selected" } else { "" };
-            format!("<option value=\"{v}\"{sel}>{v}</option>", v = esc(b), sel = sel)
+            format!(
+                "<option value=\"{v}\"{sel}>{v}</option>",
+                v = esc(b),
+                sel = sel
+            )
         })
         .collect::<String>();
     format!("<select name=\"{field}\" class=\"compare-picker__select\">{opts}</select>")
 }
 
 /// The PR list card.
-fn render_list(repo: &Repo, header: &str, pulls: &[Pull]) -> String {
+fn render_list(
+    repo: &Repo,
+    header: &str,
+    pulls: &[Pull],
+    labels: &[Label],
+    milestones: &[Milestone],
+    pull_labels: &[(String, Label)],
+    label_filter: &str,
+    milestone_filter: &str,
+) -> String {
+    let filters = render_pr_filters(repo, labels, milestones, label_filter, milestone_filter);
     let list = if pulls.is_empty() {
         "<li class=\"pr-item pr-item--empty\">No pull requests yet.</li>".to_string()
     } else {
-        pulls.iter().map(|p| render_pr_row(repo, p)).collect::<String>()
+        pulls
+            .iter()
+            .map(|p| {
+                let labels_for_pull: Vec<Label> = pull_labels
+                    .iter()
+                    .filter(|(pull_id, _)| pull_id == &p.id)
+                    .map(|(_, label)| label.clone())
+                    .collect();
+                render_pr_row(repo, p, &labels_for_pull, milestones)
+            })
+            .collect::<String>()
     };
     format!(
         r##"{header}
@@ -541,23 +1019,32 @@ fn render_list(repo: &Repo, header: &str, pulls: &[Pull]) -> String {
       <h2>Pull requests</h2>
       <a class="btn btn-primary btn-sm" href="/r/{owner}/{name}/compare">New pull request</a>
     </div>
-    <div class="card__body"><ul class="pr-list">{list}</ul></div>
+    <div class="card__body">{filters}<ul class="pr-list">{list}</ul></div>
   </section>
 </div>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
+        filters = filters,
+        list = list,
     )
 }
 
-fn render_pr_row(repo: &Repo, pull: &Pull) -> String {
+fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Milestone]) -> String {
     let (cls, label) = state_badge(pull);
+    let label_chips = render_label_chips(labels);
+    let milestone = milestones
+        .iter()
+        .find(|m| m.id == pull.milestone_id)
+        .map(|m| format!(" · milestone {}", esc(&m.title)))
+        .unwrap_or_default();
     format!(
         r##"<li class="pr-item">
   <div class="pr-item__head">
     <span class="state-badge {cls}">{label}</span>
     <a class="pr-item__title" href="/r/{owner}/{name}/pulls/{number}">#{number} {title}</a>
   </div>
-  <span class="pr-item__meta">{head} &rarr; {base} · opened {when} by {author}</span>
+  <div class="label-row">{label_chips}</div>
+  <span class="pr-item__meta">{head} &rarr; {base} · opened {when} by {author}{milestone}</span>
 </li>"##,
         cls = cls,
         label = label,
@@ -565,10 +1052,128 @@ fn render_pr_row(repo: &Repo, pull: &Pull) -> String {
         name = esc(&repo.name),
         number = pull.number,
         title = esc(&pull.title),
+        label_chips = label_chips,
         head = esc(&pull.head),
         base = esc(&pull.base),
         when = esc(&fmt_ts(pull.created_at)),
         author = esc(&pull.author_sub),
+        milestone = milestone,
+    )
+}
+
+fn render_pr_filters(
+    repo: &Repo,
+    labels: &[Label],
+    milestones: &[Milestone],
+    label_filter: &str,
+    milestone_filter: &str,
+) -> String {
+    if labels.is_empty() && milestones.is_empty() {
+        return String::new();
+    }
+    format!(
+        r##"<form method="get" action="/r/{owner}/{name}/pulls" class="compare-picker">
+  <span class="compare-picker__label">label</span>
+  <select name="label" class="compare-picker__select">{label_opts}</select>
+  <span class="compare-picker__label">milestone</span>
+  <select name="milestone" class="compare-picker__select">{milestone_opts}</select>
+  <button class="btn btn-secondary btn-sm" type="submit">Filter</button>
+</form>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        label_opts = render_label_options(labels, label_filter, "All labels"),
+        milestone_opts = render_milestone_options(milestones, milestone_filter, "All milestones"),
+    )
+}
+
+fn render_label_options(labels: &[Label], selected: &str, empty_label: &str) -> String {
+    let mut out = format!("<option value=\"\">{}</option>", esc(empty_label));
+    for label in labels {
+        let sel = if label.id == selected {
+            " selected"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "<option value=\"{id}\"{sel}>{name}</option>",
+            id = esc(&label.id),
+            sel = sel,
+            name = esc(&label.name),
+        ));
+    }
+    out
+}
+
+fn render_milestone_options(milestones: &[Milestone], selected: &str, empty_label: &str) -> String {
+    let mut out = format!("<option value=\"\">{}</option>", esc(empty_label));
+    for milestone in milestones {
+        let sel = if milestone.id == selected {
+            " selected"
+        } else {
+            ""
+        };
+        let suffix = if milestone.is_open() { "" } else { " (closed)" };
+        out.push_str(&format!(
+            "<option value=\"{id}\"{sel}>{title}{suffix}</option>",
+            id = esc(&milestone.id),
+            sel = sel,
+            title = esc(&milestone.title),
+            suffix = suffix,
+        ));
+    }
+    out
+}
+
+fn render_label_chips(labels: &[Label]) -> String {
+    labels
+        .iter()
+        .map(|label| {
+            format!(
+                "<span class=\"label-chip\" style=\"--label-color: #{color}\">{name}</span>",
+                color = esc(&label.color),
+                name = esc(&label.name),
+            )
+        })
+        .collect::<String>()
+}
+
+fn render_pull_metadata_fields(
+    labels: &[Label],
+    milestones: &[Milestone],
+    milestone_id: &str,
+    selected_labels: &[Label],
+) -> String {
+    let label_checks = if labels.is_empty() {
+        "<p class=\"hint hint--muted\">No labels yet.</p>".to_string()
+    } else {
+        labels
+            .iter()
+            .map(|label| {
+                let checked = if selected_labels.iter().any(|l| l.id == label.id) {
+                    " checked"
+                } else {
+                    ""
+                };
+                format!(
+                    "<label class=\"check\"><input type=\"checkbox\" name=\"labels\" value=\"{id}\"{checked}> {name}</label>",
+                    id = esc(&label.id),
+                    checked = checked,
+                    name = esc(&label.name),
+                )
+            })
+            .collect::<String>()
+    };
+    format!(
+        r##"<div class="field">
+  <label for="pr-milestone-id">Milestone</label>
+  <select id="pr-milestone-id" name="milestone_id">{milestones}</select>
+</div>
+<div class="field">
+  <label>Labels</label>
+  <div class="check-list">{label_checks}</div>
+</div>"##,
+        milestones = render_milestone_options(milestones, milestone_id, "No milestone"),
+        label_checks = label_checks,
     )
 }
 
@@ -577,27 +1182,51 @@ async fn render_detail(
     state: &AppState,
     repo: &Repo,
     pull: &Pull,
+    labels: &[Label],
+    pull_labels: &[Label],
+    milestones: &[Milestone],
+    reviews: &[PullReview],
+    review_comments: &[PullReviewComment],
     header: &str,
     who: &Identity,
+    headers: &HeaderMap,
     csrf: &str,
     error: Option<&str>,
 ) -> String {
     let (cls, label) = state_badge(pull);
     let error_block = error_block(error);
+    let summary = review_summary(reviews);
+    let review_badges = render_review_badges(&summary);
+    let label_chips = render_label_chips(pull_labels);
+    let milestone = milestones
+        .iter()
+        .find(|m| m.id == pull.milestone_id)
+        .map(|m| esc(&m.title))
+        .unwrap_or_else(|| "No milestone".to_string());
 
     let body_html = if pull.body.trim().is_empty() {
         "<p class=\"muted\">No description provided.</p>".to_string()
     } else {
         format!(
             "<div class=\"markdown-body\">{}</div>",
-            crate::markdown::render(&pull.body)
+            link_issue_refs(
+                &crate::markdown::render(&pull.body),
+                &repo.owner_sub,
+                &repo.name,
+            )
         )
     };
 
     // Commits + diff for the (still current) base..head range.
     let commits = state
         .git
-        .commits_between(&repo.owner_sub, &repo.name, &pull.base, &pull.head, COMMIT_LIMIT)
+        .commits_between(
+            &repo.owner_sub,
+            &repo.name,
+            &pull.base,
+            &pull.head,
+            COMMIT_LIMIT,
+        )
         .await;
     let diff = state
         .git
@@ -606,6 +1235,33 @@ async fn render_detail(
         .unwrap_or_default();
     let commits_card = render_commits_card(&commits);
     let diff_card = render_diff_card(&diff);
+    let reviews_card =
+        render_reviews_card(repo, reviews, review_comments, csrf, pull, who, headers);
+    let metadata_form = if can_gate(repo, pull, who) || auth::is_admin(headers) {
+        let fields =
+            render_pull_metadata_fields(labels, milestones, &pull.milestone_id, pull_labels);
+        format!(
+            r##"<section class="card">
+  <div class="card__head"><h2>Metadata</h2></div>
+  <div class="card__body">
+    <form method="post" action="/r/{owner}/{name}/pulls/{number}/metadata">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      {fields}
+      <div class="actions">
+        <button class="btn btn-secondary" type="submit">Save metadata</button>
+      </div>
+    </form>
+  </div>
+</section>"##,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            number = pull.number,
+            csrf = esc(csrf),
+            fields = fields,
+        )
+    } else {
+        String::new()
+    };
 
     // Action strip: merge + open/close, shown only to a gated user on an OPEN PR.
     let actions = if pull.is_open() && can_gate(repo, pull, who) {
@@ -645,7 +1301,10 @@ async fn render_detail(
             csrf = esc(csrf),
         )
     } else {
-        format!("<p class=\"pr-status\">This pull request is {}.</p>", esc(label))
+        format!(
+            "<p class=\"pr-status\">This pull request is {}.</p>",
+            esc(label)
+        )
     };
 
     format!(
@@ -655,7 +1314,8 @@ async fn render_detail(
     <span class="state-badge {cls}">{label}</span>
     <h1 class="pr-title">#{number} {title}</h1>
   </div>
-  <p class="sub"><code>{head}</code> &rarr; <code>{base}</code> · opened {when} by {author}</p>
+  <p class="sub"><code>{head}</code> &rarr; <code>{base}</code> · opened {when} by {author} · milestone {milestone}</p>
+  <div class="label-row">{label_chips}{review_badges}</div>
 </div>
 <section class="card">
   <div class="card__head"><h2>Description</h2></div>
@@ -663,6 +1323,8 @@ async fn render_detail(
 </section>
 {commits_card}
 {diff_card}
+{reviews_card}
+{metadata_form}
 <section class="card">
   <div class="card__body">
     {error_block}
@@ -677,8 +1339,186 @@ async fn render_detail(
         base = esc(&pull.base),
         when = esc(&fmt_ts(pull.created_at)),
         author = esc(&pull.author_sub),
+        milestone = milestone,
+        label_chips = label_chips,
+        review_badges = review_badges,
         body_html = body_html,
+        reviews_card = reviews_card,
+        metadata_form = metadata_form,
+        error_block = error_block,
+        actions = actions,
     )
+}
+
+struct ReviewSummary {
+    approvals: Vec<String>,
+    changes_requested: Vec<String>,
+}
+
+fn review_summary(reviews: &[PullReview]) -> ReviewSummary {
+    let mut latest: BTreeMap<String, &PullReview> = BTreeMap::new();
+    for review in reviews {
+        latest.insert(review.reviewer_sub.clone(), review);
+    }
+    let mut approvals = Vec::new();
+    let mut changes_requested = Vec::new();
+    for (reviewer, review) in latest {
+        match review.verdict.as_str() {
+            "approve" => approvals.push(reviewer),
+            "request_changes" => changes_requested.push(reviewer),
+            _ => {}
+        }
+    }
+    ReviewSummary {
+        approvals,
+        changes_requested,
+    }
+}
+
+fn render_review_badges(summary: &ReviewSummary) -> String {
+    let mut out = String::new();
+    for reviewer in &summary.approvals {
+        out.push_str(&format!(
+            "<span class=\"state-badge state-badge--open\">approved by {}</span>",
+            esc(reviewer)
+        ));
+    }
+    for reviewer in &summary.changes_requested {
+        out.push_str(&format!(
+            "<span class=\"state-badge state-badge--closed\">changes requested by {}</span>",
+            esc(reviewer)
+        ));
+    }
+    out
+}
+
+fn render_reviews_card(
+    repo: &Repo,
+    reviews: &[PullReview],
+    comments: &[PullReviewComment],
+    csrf: &str,
+    pull: &Pull,
+    who: &Identity,
+    headers: &HeaderMap,
+) -> String {
+    let review_rows = if reviews.is_empty() {
+        "<li class=\"issue-item issue-item--empty\">No reviews yet.</li>".to_string()
+    } else {
+        reviews
+            .iter()
+            .map(|review| {
+                let body = if review.body.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<div class=\"issue-item__body markdown-body\">{}</div>",
+                        link_issue_refs(
+                            &crate::markdown::render(&review.body),
+                            &repo.owner_sub,
+                            &repo.name,
+                        )
+                    )
+                };
+                format!(
+                    r##"<li class="issue-item">
+  <div class="issue-item__meta"><span>{reviewer}</span> {verdict} {when}</div>
+  {body}
+</li>"##,
+                    reviewer = esc(&review.reviewer_sub),
+                    verdict = esc(&review.verdict.replace('_', " ")),
+                    when = esc(&fmt_ts(review.created_at)),
+                    body = body,
+                )
+            })
+            .collect::<String>()
+    };
+    let inline_rows = render_inline_threads(repo, comments);
+    let forms = if can_review(repo, pull, who, headers) {
+        format!(
+            r##"<div class="layout layout--repo">
+  <form method="post" action="/r/{owner}/{name}/pulls/{number}/review">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <div class="field">
+      <label for="review-verdict">Verdict</label>
+      <select id="review-verdict" name="verdict">
+        <option value="comment">Comment</option>
+        <option value="approve">Approve</option>
+        <option value="request_changes">Request changes</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="review-body">Review comment</label>
+      <textarea id="review-body" name="body" class="issue-input"></textarea>
+    </div>
+    <div class="actions"><button class="btn btn-secondary" type="submit">Submit review</button></div>
+  </form>
+  <form method="post" action="/r/{owner}/{name}/pulls/{number}/inline-comment">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <div class="field">
+      <label for="inline-path">File</label>
+      <input type="text" id="inline-path" name="path" maxlength="500" required>
+    </div>
+    <div class="field">
+      <label for="inline-line">Line</label>
+      <input type="number" id="inline-line" name="line" min="0" value="0">
+    </div>
+    <div class="field">
+      <label for="inline-body">Comment</label>
+      <textarea id="inline-body" name="body" class="issue-input" required></textarea>
+    </div>
+    <div class="actions"><button class="btn btn-secondary" type="submit">Add inline comment</button></div>
+  </form>
+</div>"##,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            number = pull.number,
+            csrf = esc(csrf),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r##"<section class="card">
+  <div class="card__head"><h2>Reviews <span class="tab__count">{nreviews}</span></h2></div>
+  <div class="card__body">
+    <ul class="issue-list">{review_rows}</ul>
+    <h3 class="section-subhead">Inline comments</h3>
+    <ul class="issue-list">{inline_rows}</ul>
+    {forms}
+  </div>
+</section>"##,
+        nreviews = reviews.len(),
+        review_rows = review_rows,
+        inline_rows = inline_rows,
+        forms = forms,
+    )
+}
+
+fn render_inline_threads(repo: &Repo, comments: &[PullReviewComment]) -> String {
+    if comments.is_empty() {
+        return "<li class=\"issue-item issue-item--empty\">No inline comments yet.</li>"
+            .to_string();
+    }
+    comments
+        .iter()
+        .map(|comment| {
+            format!(
+                r##"<li class="issue-item">
+  <div class="issue-item__meta"><span>{path}:{line}</span> · {author} commented {when}</div>
+  <div class="issue-item__body markdown-body">{body}</div>
+</li>"##,
+                path = esc(&comment.path),
+                line = comment.line,
+                author = esc(&comment.author_sub),
+                when = esc(&fmt_ts(comment.created_at)),
+                body = link_issue_refs(
+                    &crate::markdown::render(&comment.body),
+                    &repo.owner_sub,
+                    &repo.name,
+                ),
+            )
+        })
+        .collect::<String>()
 }
 
 /// Card listing the commits a PR would add (newest first).
@@ -726,7 +1566,10 @@ pub(crate) fn render_diff_card(diff: &str) -> String {
          Fetch the branches locally to review it.</p></div>"
             .to_string()
     } else {
-        format!("<div class=\"card__body card__body--code\">{}</div>", render_diff(diff))
+        format!(
+            "<div class=\"card__body card__body--code\">{}</div>",
+            render_diff(diff)
+        )
     };
     format!(
         r##"<section class="card">
@@ -828,6 +1671,9 @@ mod tests {
             description: String::new(),
             is_private: false,
             default_branch: "main".into(),
+            require_approval: false,
+            protect_default_branch: false,
+            forked_from_id: String::new(),
             created_at: 0,
         };
         let branches = vec!["dev".to_string(), "main".to_string()];

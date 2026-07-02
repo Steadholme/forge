@@ -20,9 +20,7 @@ use crate::auth::{self, Identity};
 use crate::config::COMMIT_LIMIT;
 use crate::error::AppError;
 use crate::gitops::TreeEntry;
-use crate::handlers::{
-    esc, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid,
-};
+use crate::handlers::{esc, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
 use crate::model::{validate_owner_sub, validate_repo_name, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
@@ -42,7 +40,11 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
         .await
         .unwrap_or_default();
     let body = render_index(&who, &csrf, &repos, None);
-    html_with_csrf(StatusCode::OK, page("Repositories", Some(&who.email), &body), &csrf)
+    html_with_csrf(
+        StatusCode::OK,
+        page("Repositories", Some(&who.email), &body),
+        &csrf,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +92,9 @@ pub async fn create(
         description: form.description.trim().chars().take(500).collect(),
         is_private,
         default_branch: default_branch.clone(),
+        require_approval: false,
+        protect_default_branch: false,
+        forked_from_id: String::new(),
         created_at: now_secs(),
     };
 
@@ -127,8 +132,78 @@ pub async fn view(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let body = render_code_page(&state, &repo, "").await?;
-    Ok(html_ok(page(&format!("{}/{}", owner, name), Some(&who.email), &body)))
+    let csrf = auth::new_csrf_token();
+    let mut body = render_code_page(&state, &repo, "").await?;
+    body.push_str(&render_fork_card(&repo, &who, &csrf));
+    Ok(html_with_csrf(
+        StatusCode::OK,
+        page(&format!("{}/{}", owner, name), Some(&who.email), &body),
+        &csrf,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForkForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+pub async fn fork(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<ForkForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    validate_owner_sub(&who.subject).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let source = load_visible_repo(&state, &who, &owner, &name).await?;
+    let fork_name = if form.name.trim().is_empty() {
+        source.name.clone()
+    } else {
+        form.name.trim().to_string()
+    };
+    validate_repo_name(&fork_name).map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let repo = Repo {
+        id: format!("rp_{}", random_alnum(ID_LEN)),
+        owner_sub: who.subject.clone(),
+        name: fork_name.clone(),
+        description: format!("Fork of {}/{}", source.owner_sub, source.name),
+        is_private: source.is_private,
+        default_branch: source.default_branch.clone(),
+        require_approval: false,
+        protect_default_branch: false,
+        forked_from_id: source.id.clone(),
+        created_at: now_secs(),
+    };
+    if !state.store.create_repo(&repo).await? {
+        return Err(AppError::BadRequest(
+            "You already have a repository with that name.".to_string(),
+        ));
+    }
+    if let Err(e) = state
+        .git
+        .clone_bare(&source.owner_sub, &source.name, &who.subject, &fork_name)
+        .await
+    {
+        let _ = state.store.delete_repo(&repo.id).await;
+        state.git.remove_repo(&who.subject, &fork_name).await;
+        return Err(AppError::Internal(format!("git clone --bare failed: {e}")));
+    }
+    tracing::info!(
+        source_repo = source.id,
+        fork_repo = repo.id,
+        actor = who.subject,
+        "repository forked"
+    );
+    Ok(redirect(&format!("/r/{}/{}", who.subject, fork_name)))
 }
 
 // ===========================================================================
@@ -144,7 +219,11 @@ pub async fn tree(
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
     let path = clean_subpath(&path)?;
     let body = render_code_page(&state, &repo, &path).await?;
-    Ok(html_ok(page(&format!("{}/{}", owner, name), Some(&who.email), &body)))
+    Ok(html_ok(page(
+        &format!("{}/{}", owner, name),
+        Some(&who.email),
+        &body,
+    )))
 }
 
 // ===========================================================================
@@ -212,7 +291,27 @@ pub async fn load_visible_repo(
 pub(crate) async fn header_with_counts(state: &AppState, repo: &Repo, active: &str) -> String {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
-    render_repo_header(repo, &state.config.public_base_url, open_issues, open_pulls, active)
+    let parent = fork_parent(state, repo).await;
+    render_repo_header_with_parent(
+        repo,
+        &state.config.public_base_url,
+        open_issues,
+        open_pulls,
+        active,
+        parent.as_ref(),
+    )
+}
+
+pub(crate) async fn fork_parent(state: &AppState, repo: &Repo) -> Option<Repo> {
+    if repo.forked_from_id.is_empty() {
+        return None;
+    }
+    state
+        .store
+        .get_repo_by_id(&repo.forked_from_id)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Reject a browse subpath that could escape the tree, then normalize it (no leading/trailing `/`).
@@ -322,6 +421,35 @@ fn render_index(who: &Identity, csrf: &str, repos: &[Repo], error: Option<&str>)
     )
 }
 
+fn render_fork_card(repo: &Repo, who: &Identity, csrf: &str) -> String {
+    let default_name = if repo.owner_sub == who.subject {
+        format!("{}-fork", repo.name)
+    } else {
+        repo.name.clone()
+    };
+    format!(
+        r##"<section class="card">
+  <div class="card__head"><h2>Fork</h2></div>
+  <div class="card__body">
+    <form method="post" action="/r/{owner}/{name}/fork">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <div class="field">
+        <label for="fork-name">Repository name</label>
+        <input type="text" id="fork-name" name="name" maxlength="64" value="{default_name}" autocomplete="off" spellcheck="false" required>
+      </div>
+      <div class="actions">
+        <button class="btn btn-secondary" type="submit">Fork repository</button>
+      </div>
+    </form>
+  </div>
+</section>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        csrf = esc(csrf),
+        default_name = esc(&default_name),
+    )
+}
+
 /// Re-render the index with an inline error + a fresh CSRF token (validation failures on create).
 async fn render_index_error(state: &AppState, who: &Identity, msg: &str) -> Response {
     let csrf = auth::new_csrf_token();
@@ -347,8 +475,15 @@ async fn render_code_page(
 ) -> Result<String, AppError> {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
-    let header =
-        render_repo_header(repo, &state.config.public_base_url, open_issues, open_pulls, "code");
+    let parent = fork_parent(state, repo).await;
+    let header = render_repo_header_with_parent(
+        repo,
+        &state.config.public_base_url,
+        open_issues,
+        open_pulls,
+        "code",
+        parent.as_ref(),
+    );
 
     let head = state.git.head_commit(&repo.owner_sub, &repo.name).await;
     let Some(commit) = head else {
@@ -384,7 +519,11 @@ async fn render_code_page(
         let branch_html = branches
             .iter()
             .map(|b| {
-                let current = if *b == repo.default_branch { " branch-badge--default" } else { "" };
+                let current = if *b == repo.default_branch {
+                    " branch-badge--default"
+                } else {
+                    ""
+                };
                 format!("<span class=\"branch-badge{current}\">{}</span>", esc(b))
             })
             .collect::<Vec<_>>()
@@ -473,6 +612,17 @@ pub(crate) fn render_repo_header(
     open_pulls: i64,
     active: &str,
 ) -> String {
+    render_repo_header_with_parent(repo, base_url, open_issues, open_pulls, active, None)
+}
+
+pub(crate) fn render_repo_header_with_parent(
+    repo: &Repo,
+    base_url: &str,
+    open_issues: i64,
+    open_pulls: i64,
+    active: &str,
+    forked_from: Option<&Repo>,
+) -> String {
     let badge = if repo.is_private {
         "<span class=\"vis-badge vis-badge--private\">Private</span>"
     } else {
@@ -483,6 +633,15 @@ pub(crate) fn render_repo_header(
     } else {
         format!("<p class=\"sub\">{}</p>", esc(&repo.description))
     };
+    let fork_line = forked_from
+        .map(|parent| {
+            format!(
+                "<p class=\"sub\">Forked from <a href=\"/r/{owner}/{name}\">{owner}/{name}</a></p>",
+                owner = esc(&parent.owner_sub),
+                name = esc(&parent.name),
+            )
+        })
+        .unwrap_or_default();
     let clone_url = format!(
         "{}/git/{}/{}.git",
         base_url.trim_end_matches('/'),
@@ -497,6 +656,7 @@ pub(crate) fn render_repo_header(
     {badge}
   </div>
   {desc}
+  {fork_line}
   <div class="clone-box">
     <span class="clone-box__label">Clone</span>
     <input class="clone-box__url" type="text" readonly value="{clone}" onclick="this.select()">
@@ -514,6 +674,7 @@ pub(crate) fn render_repo_header(
         name = esc(&repo.name),
         badge = badge,
         desc = desc,
+        fork_line = fork_line,
         clone = esc(&clone_url),
         code_active = tab("code"),
         commits_active = tab("commits"),

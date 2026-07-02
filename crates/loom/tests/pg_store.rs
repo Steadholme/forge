@@ -31,6 +31,9 @@ fn repo(owner: &str, name: &str, private: bool, created: i64) -> Repo {
         description: format!("desc {name}"),
         is_private: private,
         default_branch: "main".to_string(),
+        require_approval: false,
+        protect_default_branch: false,
+        forked_from_id: String::new(),
         created_at: created,
     }
 }
@@ -46,43 +49,91 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect to TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect to TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
 
     // Raw pool to reset the tables for a clean run.
-    let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    for t in ["issue_comments", "issues", "pulls", "pats", "repos"] {
-        sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
+    let raw = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    for t in [
+        "issue_labels",
+        "pull_labels",
+        "issue_comments",
+        "pr_review_comments",
+        "pr_reviews",
+        "issues",
+        "pulls",
+        "labels",
+        "milestones",
+        "pats",
+        "repos",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&raw)
+            .await
+            .unwrap();
     }
 
     let store: Arc<dyn Store> = Arc::new(pg);
     let now = now_secs();
 
     // --- repos: create + uniqueness + visibility ---------------------------
-    assert!(store.create_repo(&repo("alice", "pub", false, now)).await.unwrap());
+    assert!(store
+        .create_repo(&repo("alice", "pub", false, now))
+        .await
+        .unwrap());
     // Duplicate (owner,name) rejected.
-    assert!(!store.create_repo(&repo("alice", "pub", false, now + 1)).await.unwrap());
-    store.create_repo(&repo("alice", "sec", true, now + 2)).await.unwrap();
-    store.create_repo(&repo("bob", "bsec", true, now + 3)).await.unwrap();
-    store.create_repo(&repo("bob", "pub", false, now + 4)).await.unwrap(); // same name, other owner
+    assert!(!store
+        .create_repo(&repo("alice", "pub", false, now + 1))
+        .await
+        .unwrap());
+    store
+        .create_repo(&repo("alice", "sec", true, now + 2))
+        .await
+        .unwrap();
+    store
+        .create_repo(&repo("bob", "bsec", true, now + 3))
+        .await
+        .unwrap();
+    store
+        .create_repo(&repo("bob", "pub", false, now + 4))
+        .await
+        .unwrap(); // same name, other owner
 
-    let got = store.get_repo("alice", "pub").await.unwrap().expect("repo persisted");
+    let got = store
+        .get_repo("alice", "pub")
+        .await
+        .unwrap()
+        .expect("repo persisted");
     assert_eq!(got.description, "desc pub");
     assert!(!got.is_private);
     assert_eq!(got.default_branch, "main");
 
     // Editable settings (description + default branch) via the portable UPDATE.
     assert!(store
-        .update_repo_settings(&got.id, "edited words", "develop")
+        .update_repo_settings(&got.id, "edited words", "develop", true, true)
         .await
         .unwrap());
     let edited = store.get_repo("alice", "pub").await.unwrap().unwrap();
     assert_eq!(edited.description, "edited words");
     assert_eq!(edited.default_branch, "develop");
-    assert!(!store.update_repo_settings("rp_missing", "x", "main").await.unwrap());
+    assert!(edited.require_approval);
+    assert!(edited.protect_default_branch);
+    assert!(!store
+        .update_repo_settings("rp_missing", "x", "main", false, false)
+        .await
+        .unwrap());
     // Restore for the assertions below.
-    assert!(store.update_repo_settings(&got.id, "desc pub", "main").await.unwrap());
+    assert!(store
+        .update_repo_settings(&got.id, "desc pub", "main", false, false)
+        .await
+        .unwrap());
 
     let alice_view: Vec<String> = store
         .list_visible_repos("alice")
@@ -98,8 +149,14 @@ async fn pg_store_full_integration() {
 
     // --- issues: sequential numbering per repo + state ---------------------
     let repo_id = got.id.clone();
-    let i1 = store.create_issue("is1", &repo_id, "first", "body", "alice", now).await.unwrap();
-    let i2 = store.create_issue("is2", &repo_id, "second", "", "bob", now + 1).await.unwrap();
+    let i1 = store
+        .create_issue("is1", &repo_id, "first", "body", "alice", now)
+        .await
+        .unwrap();
+    let i2 = store
+        .create_issue("is2", &repo_id, "second", "", "bob", now + 1)
+        .await
+        .unwrap();
     assert_eq!(i1.number, 1);
     assert_eq!(i2.number, 2);
     assert_eq!(store.open_issue_count(&repo_id).await.unwrap(), 2);
@@ -109,10 +166,21 @@ async fn pg_store_full_integration() {
     assert_eq!(fetched.author_sub, "alice");
     assert!(fetched.is_open());
 
-    assert!(store.set_issue_state("is1", "closed", now + 9).await.unwrap());
+    assert!(store
+        .set_issue_state("is1", "closed", now + 9)
+        .await
+        .unwrap());
     assert_eq!(store.open_issue_count(&repo_id).await.unwrap(), 1);
     // Closing stamps updated_at.
-    assert_eq!(store.get_issue(&repo_id, 1).await.unwrap().unwrap().updated_at, now + 9);
+    assert_eq!(
+        store
+            .get_issue(&repo_id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        now + 9
+    );
 
     let listed: Vec<i64> = store
         .list_issues(&repo_id)
@@ -124,11 +192,20 @@ async fn pg_store_full_integration() {
     assert_eq!(listed, vec![2, 1]); // newest number first
 
     // Filter + pagination via the portable SQL path.
-    assert_eq!(store.count_issues(&repo_id, "").await.unwrap(), 2);
-    assert_eq!(store.count_issues(&repo_id, "open").await.unwrap(), 1);
-    assert_eq!(store.count_issues(&repo_id, "closed").await.unwrap(), 1);
+    assert_eq!(store.count_issues(&repo_id, "", "", "").await.unwrap(), 2);
+    assert_eq!(
+        store.count_issues(&repo_id, "open", "", "").await.unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_issues(&repo_id, "closed", "", "")
+            .await
+            .unwrap(),
+        1
+    );
     let open_only: Vec<i64> = store
-        .list_issues_page(&repo_id, "open", 10, 0)
+        .list_issues_page(&repo_id, "open", "", "", 10, 0)
         .await
         .unwrap()
         .into_iter()
@@ -136,7 +213,7 @@ async fn pg_store_full_integration() {
         .collect();
     assert_eq!(open_only, vec![2]); // is1 (#1) is closed
     let first_page: Vec<i64> = store
-        .list_issues_page(&repo_id, "", 1, 0)
+        .list_issues_page(&repo_id, "", "", "", 1, 0)
         .await
         .unwrap()
         .into_iter()
@@ -144,9 +221,48 @@ async fn pg_store_full_integration() {
         .collect();
     assert_eq!(first_page, vec![2]); // newest first, limit 1
 
+    // Labels/milestones attach to issues and PRs through portable relation tables.
+    let label = store
+        .create_label("lb1", &repo_id, "bug", "dc2626", now + 10)
+        .await
+        .unwrap()
+        .unwrap();
+    let milestone = store
+        .create_milestone("ms1", &repo_id, "v1", "2026-08-01", now + 11)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .set_issue_metadata(
+            "is2",
+            "alice",
+            &milestone.id,
+            std::slice::from_ref(&label.id)
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        store.issue_labels("is2").await.unwrap(),
+        vec![label.clone()]
+    );
+    let filtered_issue_numbers: Vec<i64> = store
+        .list_issues_page(&repo_id, "", &label.id, &milestone.id, 10, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.number)
+        .collect();
+    assert_eq!(filtered_issue_numbers, vec![2]);
+
     // Comments: chronological thread + last-activity bump on the parent issue.
-    store.create_comment("ic1", "is2", "alice", "first note", now + 20).await.unwrap();
-    store.create_comment("ic2", "is2", "bob", "second note", now + 21).await.unwrap();
+    store
+        .create_comment("ic1", "is2", "alice", "first note", now + 20)
+        .await
+        .unwrap();
+    store
+        .create_comment("ic2", "is2", "bob", "second note", now + 21)
+        .await
+        .unwrap();
     let thread: Vec<String> = store
         .list_comments("is2")
         .await
@@ -154,12 +270,25 @@ async fn pg_store_full_integration() {
         .into_iter()
         .map(|c| c.body)
         .collect();
-    assert_eq!(thread, vec!["first note".to_string(), "second note".to_string()]);
-    assert_eq!(store.get_issue(&repo_id, 2).await.unwrap().unwrap().updated_at, now + 21);
+    assert_eq!(
+        thread,
+        vec!["first note".to_string(), "second note".to_string()]
+    );
+    assert_eq!(
+        store
+            .get_issue(&repo_id, 2)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        now + 21
+    );
 
     // --- pulls: sequential numbering + state + merge guard -----------------
     let pr1 = store
-        .create_pull("pl1", &repo_id, "add x", "body", "main", "feat", "alice", now)
+        .create_pull(
+            "pl1", &repo_id, "add x", "body", "main", "feat", "alice", now,
+        )
         .await
         .unwrap();
     let pr2 = store
@@ -188,6 +317,42 @@ async fn pg_store_full_integration() {
     assert!(!store.merge_pull("pl1", now + 6).await.unwrap());
     assert_eq!(store.open_pull_count(&repo_id).await.unwrap(), 0);
 
+    assert!(store
+        .set_pull_metadata("pl2", &milestone.id, std::slice::from_ref(&label.id))
+        .await
+        .unwrap());
+    assert_eq!(store.pull_labels("pl2").await.unwrap(), vec![label.clone()]);
+    assert_eq!(
+        store
+            .list_pulls_filtered(&repo_id, &label.id, &milestone.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .create_pull_review("rv1", "pl2", "alice", "approve", "ok", now + 30)
+        .await
+        .is_ok());
+    assert!(store
+        .create_pull_review_comment(
+            "rc1",
+            "pl2",
+            "rv1",
+            "file.txt",
+            2,
+            "alice",
+            "note",
+            now + 31
+        )
+        .await
+        .is_ok());
+    assert_eq!(store.list_pull_reviews("pl2").await.unwrap().len(), 1);
+    assert_eq!(
+        store.list_pull_review_comments("pl2").await.unwrap().len(),
+        1
+    );
+
     // --- pats: hash lookup + ownership-scoped revoke -----------------------
     store
         .create_pat(&Pat {
@@ -200,21 +365,48 @@ async fn pg_store_full_integration() {
         .await
         .unwrap();
     assert_eq!(
-        store.find_pat_by_hash("abc123hash").await.unwrap().unwrap().owner_sub,
+        store
+            .find_pat_by_hash("abc123hash")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_sub,
         "alice"
     );
     assert!(store.find_pat_by_hash("missing").await.unwrap().is_none());
     assert!(!store.revoke_pat("pt1", "bob").await.unwrap()); // wrong owner
     assert!(store.revoke_pat("pt1", "alice").await.unwrap());
-    assert!(store.find_pat_by_hash("abc123hash").await.unwrap().is_none());
+    assert!(store
+        .find_pat_by_hash("abc123hash")
+        .await
+        .unwrap()
+        .is_none());
 
     // --- raw count sanity (portable SQL path is live) ----------------------
-    let row = sqlx::query("SELECT count(*) AS n FROM repos").fetch_one(&raw).await.unwrap();
+    let row = sqlx::query("SELECT count(*) AS n FROM repos")
+        .fetch_one(&raw)
+        .await
+        .unwrap();
     let n: i64 = row.try_get("n").unwrap();
     assert_eq!(n, 4);
 
-    for t in ["issue_comments", "issues", "pulls", "pats", "repos"] {
-        sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
+    for t in [
+        "issue_labels",
+        "pull_labels",
+        "issue_comments",
+        "pr_review_comments",
+        "pr_reviews",
+        "issues",
+        "pulls",
+        "labels",
+        "milestones",
+        "pats",
+        "repos",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&raw)
+            .await
+            .unwrap();
     }
     eprintln!("pg_store integration test passed.");
 }

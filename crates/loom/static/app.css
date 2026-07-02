@@ -481,6 +481,17 @@ input::placeholder, textarea::placeholder { color:var(--ink-4); }
 }
 .state-badge--open { background:var(--ok-soft); color:var(--ok-ink); border:1px solid var(--ok-border); }
 .state-badge--closed { background:var(--bg-2); color:var(--ink-2); border:1px solid var(--border); }
+.label-row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-height:0; }
+.label-chip {
+  display:inline-flex; align-items:center; min-height:22px; padding:2px 8px; border-radius:999px;
+  border:1px solid color-mix(in srgb, var(--label-color, #4f46e5) 55%, var(--border));
+  background:color-mix(in srgb, var(--label-color, #4f46e5) 14%, transparent);
+  color:var(--ink); font-size:11px; font-weight:650; line-height:1.2;
+}
+.check-list { display:flex; gap:10px; flex-wrap:wrap; }
+.progress { height:8px; overflow:hidden; border-radius:999px; background:var(--bg-2); border:1px solid var(--border); }
+.progress span { display:block; height:100%; background:var(--accent); }
+.section-subhead { margin:18px 0 8px; font-size:13px; color:var(--ink-2); }
 
 /* ---- PATs --------------------------------------------------------------- */
 .pat-item { display:flex; flex-direction:column; gap:4px; padding:16px 0; border-top:1px solid var(--border); }

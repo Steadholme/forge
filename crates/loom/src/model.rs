@@ -18,6 +18,12 @@ pub struct Repo {
     pub is_private: bool,
     /// Default branch name (HEAD), e.g. `main`.
     pub default_branch: String,
+    /// Whether web merges require at least one PR approval.
+    pub require_approval: bool,
+    /// Whether direct smart-HTTP pushes to the default branch are blocked.
+    pub protect_default_branch: bool,
+    /// Parent repo id when this repo is a fork; empty for original repositories.
+    pub forked_from_id: String,
     /// Creation time, epoch seconds.
     pub created_at: i64,
 }
@@ -37,6 +43,10 @@ pub struct Issue {
     pub body: String,
     /// Author subject from `X-Auth-Subject`.
     pub author_sub: String,
+    /// Optional assignee subject. Empty means unassigned.
+    pub assignee_sub: String,
+    /// Optional milestone id. Empty means no milestone.
+    pub milestone_id: String,
     /// `open` or `closed`.
     pub state: String,
     /// Creation time, epoch seconds.
@@ -88,6 +98,8 @@ pub struct Pull {
     pub head: String,
     /// Author subject from `X-Auth-Subject`.
     pub author_sub: String,
+    /// Optional milestone id. Empty means no milestone.
+    pub milestone_id: String,
     /// `open`, `merged`, or `closed`.
     pub state: String,
     /// Creation time, epoch seconds.
@@ -105,6 +117,83 @@ impl Pull {
     pub fn is_merged(&self) -> bool {
         self.state == "merged"
     }
+}
+
+/// A repo-scoped label assignable to issues and pull requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Label {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id.
+    pub repo_id: String,
+    /// Display name, unique per repo.
+    pub name: String,
+    /// Six-digit hex color, without a leading '#'.
+    pub color: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+}
+
+/// A repo-scoped milestone assignable to issues and pull requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Milestone {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id.
+    pub repo_id: String,
+    /// Display title, unique per repo.
+    pub title: String,
+    /// Optional due date as YYYY-MM-DD text. Empty means no due date.
+    pub due: String,
+    /// `open` or `closed`.
+    pub state: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+}
+
+impl Milestone {
+    /// True when the milestone is open.
+    pub fn is_open(&self) -> bool {
+        self.state == "open"
+    }
+}
+
+/// A pull-request review verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullReview {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning pull request id.
+    pub pull_id: String,
+    /// Reviewer subject from `X-Auth-Subject`.
+    pub reviewer_sub: String,
+    /// `comment`, `approve`, or `request_changes`.
+    pub verdict: String,
+    /// Optional review body.
+    pub body: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+}
+
+/// An inline pull-request review comment anchored to a file path and new-file line number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullReviewComment {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning pull request id.
+    pub pull_id: String,
+    /// Optional review id this comment belongs to. Empty means a standalone inline comment.
+    pub review_id: String,
+    /// File path in the diff.
+    pub path: String,
+    /// New-file line number in the diff. `0` means no exact line.
+    pub line: i64,
+    /// Author subject from `X-Auth-Subject`.
+    pub author_sub: String,
+    /// Comment body.
+    pub body: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
 }
 
 /// A personal access token. Only the SHA-256 hash is stored; the secret is shown once at mint.
@@ -164,6 +253,58 @@ pub fn validate_owner_sub(sub: &str) -> Result<(), &'static str> {
         return Err("invalid owner");
     }
     Ok(())
+}
+
+/// Validate a label name. Labels are plain display text, but bounded so list rows stay compact.
+pub fn validate_label_name(name: &str) -> Result<(), &'static str> {
+    if name.trim().is_empty() {
+        return Err("Label name cannot be empty.");
+    }
+    if name.chars().count() > 40 {
+        return Err("Label name is too long (40 characters maximum).");
+    }
+    Ok(())
+}
+
+/// Validate a label color as six ASCII hex digits, stored without a leading '#'.
+pub fn validate_label_color(color: &str) -> Result<(), &'static str> {
+    let c = color.trim().trim_start_matches('#');
+    if c.len() != 6 || !c.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("Label color must be a six-digit hex value.");
+    }
+    Ok(())
+}
+
+/// Validate a milestone title.
+pub fn validate_milestone_title(title: &str) -> Result<(), &'static str> {
+    if title.trim().is_empty() {
+        return Err("Milestone title cannot be empty.");
+    }
+    if title.chars().count() > 120 {
+        return Err("Milestone title is too long (120 characters maximum).");
+    }
+    Ok(())
+}
+
+/// Validate an optional YYYY-MM-DD due-date string.
+pub fn validate_milestone_due(due: &str) -> Result<(), &'static str> {
+    let due = due.trim();
+    if due.is_empty() {
+        return Ok(());
+    }
+    let bytes = due.as_bytes();
+    let ok = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    if ok {
+        Ok(())
+    } else {
+        Err("Milestone due date must be YYYY-MM-DD.")
+    }
 }
 
 #[cfg(test)]

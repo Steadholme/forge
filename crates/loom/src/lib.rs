@@ -68,6 +68,7 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(handlers::repos::index))
         .route("/new", post(handlers::repos::create))
         .route("/r/{owner}/{name}", get(handlers::repos::view))
+        .route("/r/{owner}/{name}/fork", post(handlers::repos::fork))
         .route("/r/{owner}/{name}/tree/{*path}", get(handlers::repos::tree))
         .route("/r/{owner}/{name}/blob/{*path}", get(handlers::repos::blob))
         .route("/r/{owner}/{name}/commits", get(handlers::commits::history))
@@ -75,13 +76,22 @@ pub fn app(state: AppState) -> Router {
             "/r/{owner}/{name}/commit/{sha}",
             get(handlers::commits::detail),
         )
-        .route(
-            "/r/{owner}/{name}/branches",
-            get(handlers::branches::list),
-        )
+        .route("/r/{owner}/{name}/branches", get(handlers::branches::list))
         .route(
             "/r/{owner}/{name}/settings",
             get(handlers::settings::show).post(handlers::settings::update),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/labels",
+            post(handlers::settings::create_label),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/milestones",
+            post(handlers::settings::create_milestone),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/milestones/{id}/toggle",
+            post(handlers::settings::toggle_milestone),
         )
         .route(
             "/r/{owner}/{name}/issues",
@@ -96,13 +106,14 @@ pub fn app(state: AppState) -> Router {
             post(handlers::issues::comment),
         )
         .route(
+            "/r/{owner}/{name}/issues/{number}/metadata",
+            post(handlers::issues::metadata),
+        )
+        .route(
             "/r/{owner}/{name}/issues/{number}/toggle",
             post(handlers::issues::toggle),
         )
-        .route(
-            "/r/{owner}/{name}/compare",
-            get(handlers::pulls::compare),
-        )
+        .route("/r/{owner}/{name}/compare", get(handlers::pulls::compare))
         .route(
             "/r/{owner}/{name}/pulls",
             get(handlers::pulls::list).post(handlers::pulls::create),
@@ -116,10 +127,25 @@ pub fn app(state: AppState) -> Router {
             post(handlers::pulls::merge),
         )
         .route(
+            "/r/{owner}/{name}/pulls/{number}/review",
+            post(handlers::pulls::review),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/inline-comment",
+            post(handlers::pulls::inline_comment),
+        )
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/metadata",
+            post(handlers::pulls::metadata),
+        )
+        .route(
             "/r/{owner}/{name}/pulls/{number}/toggle",
             post(handlers::pulls::toggle),
         )
-        .route("/pats", get(handlers::pats::index).post(handlers::pats::create))
+        .route(
+            "/pats",
+            get(handlers::pats::index).post(handlers::pats::create),
+        )
         .route("/pats/{id}/revoke", post(handlers::pats::revoke))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.

@@ -29,6 +29,9 @@ pub mod smart_http;
 
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use serde::de::{SeqAccess, Visitor};
+use serde::Deserializer;
+use std::fmt;
 
 /// Embedded design system, inlined into each rendered page's `<style>`.
 pub const APP_CSS: &str = include_str!("../../static/app.css");
@@ -117,7 +120,11 @@ pub fn html_with_csrf(status: StatusCode, body: String, csrf: &str) -> Response 
 
 /// A `302 Found` redirect to `location`.
 pub fn redirect(location: &str) -> Response {
-    (StatusCode::FOUND, [(header::LOCATION, location.to_string())]).into_response()
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, location.to_string())],
+    )
+        .into_response()
 }
 
 /// Two-letter avatar initials from the signed-in email (falls back to a neutral glyph).
@@ -178,8 +185,16 @@ fn user_menu(email: Option<&str>) -> String {
 /// and the avatar menu. Shared by every page so the chrome stays identical across the estate.
 pub fn userbox(title: &str, email: Option<&str>) -> String {
     let tokens_active = title == "Access tokens";
-    let repos_cls = if tokens_active { "appnav" } else { "appnav is-active" };
-    let tokens_cls = if tokens_active { "appnav is-active" } else { "appnav" };
+    let repos_cls = if tokens_active {
+        "appnav"
+    } else {
+        "appnav is-active"
+    };
+    let tokens_cls = if tokens_active {
+        "appnav is-active"
+    } else {
+        "appnav"
+    };
     format!(
         r##"<a class="appbar__brand" href="/" aria-label="HOLDFAST Loom">
   <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
@@ -233,6 +248,123 @@ pub fn esc(s: &str) -> String {
     out
 }
 
+/// Link issue references like `#12` in already-rendered, already-sanitised HTML. Replacement only
+/// happens outside tags, so generated attributes are never rewritten.
+pub fn link_issue_refs(html: &str, repo_owner: &str, repo_name: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut text = String::new();
+    let mut in_tag = false;
+    for ch in html.chars() {
+        if ch == '<' {
+            if !text.is_empty() {
+                out.push_str(&link_issue_refs_text(&text, repo_owner, repo_name));
+                text.clear();
+            }
+            in_tag = true;
+            out.push(ch);
+        } else if ch == '>' {
+            in_tag = false;
+            out.push(ch);
+        } else if in_tag {
+            out.push(ch);
+        } else {
+            text.push(ch);
+        }
+    }
+    if !text.is_empty() {
+        out.push_str(&link_issue_refs_text(&text, repo_owner, repo_name));
+    }
+    out
+}
+
+fn link_issue_refs_text(text: &str, repo_owner: &str, repo_name: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    let mut last = 0;
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '#' {
+            continue;
+        }
+        let prev_ok = idx == 0
+            || text[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_');
+        if !prev_ok {
+            continue;
+        }
+        let start_digits = idx + ch.len_utf8();
+        let mut end = start_digits;
+        while let Some((next_idx, next_ch)) = chars.peek().copied() {
+            if next_ch.is_ascii_digit() {
+                end = next_idx + next_ch.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if end == start_digits {
+            continue;
+        }
+        out.push_str(&text[last..idx]);
+        let n = &text[start_digits..end];
+        out.push_str(&format!(
+            "<a href=\"/r/{}/{}/issues/{}\">#{}</a>",
+            esc(repo_owner),
+            esc(repo_name),
+            n,
+            n
+        ));
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Form helper for checkbox groups. `serde_urlencoded` may present one checked box as a scalar
+/// and several checked boxes as a sequence; accept both shapes.
+pub fn form_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct FormVecVisitor;
+
+    impl<'de> Visitor<'de> for FormVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string or list of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                out.push(value);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(FormVecVisitor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +372,14 @@ mod tests {
     #[test]
     fn escapes_html_metacharacters() {
         assert_eq!(esc("<script>&\"'"), "&lt;script&gt;&amp;&quot;&#x27;");
+    }
+
+    #[test]
+    fn issue_refs_link_outside_tags_only() {
+        let html = "<p>fixes #12</p><a href=\"#x\">#notnum</a>";
+        let linked = link_issue_refs(html, "alice", "proj");
+        assert!(linked.contains("/r/alice/proj/issues/12"));
+        assert!(linked.contains("href=\"#x\""));
     }
 
     #[test]

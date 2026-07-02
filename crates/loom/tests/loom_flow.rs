@@ -71,7 +71,9 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
     let headers = res.headers().clone();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     Resp {
         status,
         headers,
@@ -98,6 +100,21 @@ fn get_basic(path: &str, password: &str) -> Request<Body> {
         .uri(path)
         .header(header::AUTHORIZATION, format!("Basic {cred}"))
         .body(Body::empty())
+        .unwrap()
+}
+
+fn post_basic(path: &str, password: &str, body: &str) -> Request<Body> {
+    use base64::Engine;
+    let cred = base64::engine::general_purpose::STANDARD.encode(format!("git:{password}"));
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Basic {cred}"))
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-request",
+        )
+        .body(Body::from(body.to_string()))
         .unwrap()
 }
 
@@ -151,7 +168,13 @@ fn post_form_groups(
 }
 
 /// Open an issue through the web flow as `subject`; returns the new issue's detail location.
-async fn open_issue(app: &axum::Router, subject: &str, repo: &str, title: &str, body: &str) -> String {
+async fn open_issue(
+    app: &axum::Router,
+    subject: &str,
+    repo: &str,
+    title: &str,
+    body: &str,
+) -> String {
     let page = send(app, get(&format!("/r/{repo}/issues"), Some(subject))).await;
     let csrf = page.csrf_cookie().expect("csrf on issues page");
     let created = send(
@@ -164,7 +187,11 @@ async fn open_issue(app: &axum::Router, subject: &str, repo: &str, title: &str, 
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::FOUND, "issue create should 302 to detail");
+    assert_eq!(
+        created.status,
+        StatusCode::FOUND,
+        "issue create should 302 to detail"
+    );
     created.location()
 }
 
@@ -214,7 +241,11 @@ async fn web_create_repo_issues_and_xss_escaping() {
         &app,
         post_form(
             "/new",
-            &[("csrf_token", &csrf), ("name", "proj"), ("default_branch", "main")],
+            &[
+                ("csrf_token", &csrf),
+                ("name", "proj"),
+                ("default_branch", "main"),
+            ],
             &csrf,
             Some("alice"),
         ),
@@ -279,14 +310,26 @@ async fn issue_detail_comments_filter_and_admin_gate() {
     let detail = send(&app, get(&loc, Some("bob"))).await;
     assert_eq!(detail.status, StatusCode::OK);
     assert!(detail.body.contains("#1"));
-    assert!(detail.body.contains("<strong>bold</strong>"), "issue body markdown rendered");
+    assert!(
+        detail.body.contains("<strong>bold</strong>"),
+        "issue body markdown rendered"
+    );
     assert!(detail.body.contains("Add a comment"));
-    assert!(detail.body.contains("Close issue"), "author sees the close action");
+    assert!(
+        detail.body.contains("Close issue"),
+        "author sees the close action"
+    );
 
     // carol (neither owner nor author, not admin) sees NO close button on the detail page.
     let carol_view = send(&app, get(&loc, Some("carol"))).await;
-    assert!(!carol_view.body.contains("Close issue"), "non-moderator has no close action");
-    assert!(carol_view.body.contains("Add a comment"), "any signed-in user can comment");
+    assert!(
+        !carol_view.body.contains("Close issue"),
+        "non-moderator has no close action"
+    );
+    assert!(
+        carol_view.body.contains("Add a comment"),
+        "any signed-in user can comment"
+    );
     let carol_csrf = carol_view.csrf_cookie().expect("csrf on detail");
 
     // carol adds a comment with a markdown + XSS payload; markup is rendered, script is escaped.
@@ -307,8 +350,14 @@ async fn issue_detail_comments_filter_and_admin_gate() {
     assert_eq!(commented.location(), "/r/alice/proj/issues/1");
 
     let with_comment = send(&app, get(&loc, Some("bob"))).await;
-    assert!(with_comment.body.contains("<em>italic</em>"), "comment markdown rendered");
-    assert!(!with_comment.body.contains("<script>alert(1)</script>"), "script escaped");
+    assert!(
+        with_comment.body.contains("<em>italic</em>"),
+        "comment markdown rendered"
+    );
+    assert!(
+        !with_comment.body.contains("<script>alert(1)</script>"),
+        "script escaped"
+    );
     assert!(with_comment.body.contains("&lt;script&gt;"));
     assert!(with_comment.body.contains("carol"), "comment author shown");
 
@@ -355,11 +404,23 @@ async fn issue_detail_comments_filter_and_admin_gate() {
     assert_eq!(close1.status, StatusCode::FOUND);
 
     let open_only = send(&app, get("/r/alice/proj/issues?state=open", Some("bob"))).await;
-    assert!(open_only.body.contains("Second bug"), "open filter shows the open issue");
-    assert!(!open_only.body.contains("First bug"), "open filter hides the closed issue");
+    assert!(
+        open_only.body.contains("Second bug"),
+        "open filter shows the open issue"
+    );
+    assert!(
+        !open_only.body.contains("First bug"),
+        "open filter hides the closed issue"
+    );
     let closed_only = send(&app, get("/r/alice/proj/issues?state=closed", Some("bob"))).await;
-    assert!(closed_only.body.contains("First bug"), "closed filter shows the closed issue");
-    assert!(!closed_only.body.contains("Second bug"), "closed filter hides the open issue");
+    assert!(
+        closed_only.body.contains("First bug"),
+        "closed filter shows the closed issue"
+    );
+    assert!(
+        !closed_only.body.contains("Second bug"),
+        "closed filter hides the open issue"
+    );
 
     // Admin gate on toggle: carol (non-owner, non-author) is refused without an admin group...
     let forbidden = send(
@@ -386,10 +447,17 @@ async fn issue_detail_comments_filter_and_admin_gate() {
         ),
     )
     .await;
-    assert_eq!(admin_close.status, StatusCode::FOUND, "admin may close a foreign issue");
+    assert_eq!(
+        admin_close.status,
+        StatusCode::FOUND,
+        "admin may close a foreign issue"
+    );
     let both_closed = send(&app, get("/r/alice/proj/issues?state=closed", Some("bob"))).await;
     assert!(both_closed.body.contains("First bug"));
-    assert!(both_closed.body.contains("Second bug"), "admin close landed");
+    assert!(
+        both_closed.body.contains("Second bug"),
+        "admin close landed"
+    );
 
     // Delegated admin: a product-scoped operator (X-Auth-Groups: git-admins) may ALSO moderate a
     // foreign issue — here reopening issue 2 — WITHOUT being in a global admin group.
@@ -419,6 +487,100 @@ async fn issue_detail_missing_is_404() {
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn labels_milestones_assignees_and_issue_filters() {
+    let state = temp_state();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+
+    let settings = send(&app, get("/r/alice/proj/settings", Some("alice"))).await;
+    let csrf = settings.csrf_cookie().unwrap();
+    let label_created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/labels",
+            &[("csrf_token", &csrf), ("name", "bug"), ("color", "dc2626")],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(label_created.status, StatusCode::FOUND);
+    let milestone_created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/milestones",
+            &[
+                ("csrf_token", &csrf),
+                ("title", "v1"),
+                ("due", "2026-08-01"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(milestone_created.status, StatusCode::FOUND);
+
+    let label = store.list_labels(&repo.id).await.unwrap().pop().unwrap();
+    let milestone = store
+        .list_milestones(&repo.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    let issues_page = send(&app, get("/r/alice/proj/issues", Some("alice"))).await;
+    let csrf = issues_page.csrf_cookie().unwrap();
+    let opened = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues",
+            &[
+                ("csrf_token", &csrf),
+                ("title", "Tagged bug"),
+                ("body", "fix this"),
+                ("assignee", "bob"),
+                ("milestone_id", &milestone.id),
+                ("labels", &label.id),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(opened.status, StatusCode::FOUND);
+
+    let by_label = send(
+        &app,
+        get(
+            &format!("/r/alice/proj/issues?label={}", label.id),
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert!(by_label.body.contains("Tagged bug"));
+    assert!(by_label.body.contains("bug"));
+    assert!(by_label.body.contains("assigned to bob"));
+
+    let by_milestone = send(
+        &app,
+        get(
+            &format!("/r/alice/proj/issues?milestone={}", milestone.id),
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert!(by_milestone.body.contains("milestone v1"));
+
+    let detail = send(&app, get("/r/alice/proj/issues/1", Some("alice"))).await;
+    assert!(detail.body.contains("Assignee: bob"));
+    assert!(detail.body.contains("Milestone: v1"));
+    assert!(detail.body.contains("bug"));
+}
+
 /// Run `git --git-dir=<dir> <args>` feeding `stdin`, asserting success; returns trimmed stdout.
 fn git_capture(git_dir: &str, args: &[&str], stdin: &str) -> String {
     use std::io::Write;
@@ -439,7 +601,12 @@ fn git_capture(git_dir: &str, args: &[&str], stdin: &str) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
@@ -458,7 +625,11 @@ fn seed_repo(git_dir: &str, branch: &str, files: &[(&str, &str)]) {
     }
     let tree_oid = git_capture(git_dir, &["mktree"], &tree);
     let commit = git_capture(git_dir, &["commit-tree", &tree_oid, "-m", "seed"], "");
-    git_capture(git_dir, &["update-ref", &format!("refs/heads/{branch}"), &commit], "");
+    git_capture(
+        git_dir,
+        &["update-ref", &format!("refs/heads/{branch}"), &commit],
+        "",
+    );
 }
 
 #[tokio::test]
@@ -484,7 +655,10 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
     // Repo page renders the README as sanitised HTML (heading + emphasis are live markup).
     let view = send(&app, get("/r/alice/docs", Some("alice"))).await;
     assert_eq!(view.status, StatusCode::OK);
-    assert!(view.body.contains("<h1>Hello</h1>"), "README heading rendered");
+    assert!(
+        view.body.contains("<h1>Hello</h1>"),
+        "README heading rendered"
+    );
     assert!(view.body.contains("<strong>bold</strong>"));
     // The raw <script> in the README must be neutralised, not served as live markup.
     assert!(!view.body.contains("<script>alert(1)</script>"));
@@ -493,7 +667,10 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
     // A non-markdown blob renders as a line-numbered, escaped monospace table.
     let blob = send(&app, get("/r/alice/docs/blob/main.rs", Some("alice"))).await;
     assert_eq!(blob.status, StatusCode::OK);
-    assert!(blob.body.contains("blob-line__num"), "line-number gutter present");
+    assert!(
+        blob.body.contains("blob-line__num"),
+        "line-number gutter present"
+    );
     assert!(blob.body.contains("println!"));
 
     // A markdown blob view renders as sanitised HTML too.
@@ -501,6 +678,48 @@ async fn readme_renders_markdown_and_blob_is_line_numbered() {
     assert_eq!(md.status, StatusCode::OK);
     assert!(md.body.contains("<h1>Hello</h1>"));
     assert!(!md.body.contains("<script>alert(1)</script>"));
+}
+
+#[tokio::test]
+async fn fork_clones_bare_repo_and_shows_attribution() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    seed_repo(&git_dir, "main", &[("README.md", "# Fork me\n")]);
+
+    let source_page = send(&app, get("/r/alice/proj", Some("bob"))).await;
+    assert_eq!(source_page.status, StatusCode::OK);
+    let csrf = source_page.csrf_cookie().unwrap();
+    let forked = send(
+        &app,
+        post_form(
+            "/r/alice/proj/fork",
+            &[("csrf_token", &csrf), ("name", "proj-fork")],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(forked.status, StatusCode::FOUND);
+    assert_eq!(forked.location(), "/r/bob/proj-fork");
+
+    let source = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    let fork = store.get_repo("bob", "proj-fork").await.unwrap().unwrap();
+    assert_eq!(fork.forked_from_id, source.id);
+    let fork_dir = git
+        .repo_path("bob", "proj-fork")
+        .to_string_lossy()
+        .to_string();
+    let fork_head = git_capture(&fork_dir, &["rev-parse", "refs/heads/main"], "");
+    let source_head = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_eq!(fork_head, source_head);
+
+    let fork_page = send(&app, get("/r/bob/proj-fork", Some("bob"))).await;
+    assert!(fork_page.body.contains("Forked from"));
+    assert!(fork_page.body.contains("/r/alice/proj"));
 }
 
 #[tokio::test]
@@ -528,7 +747,11 @@ async fn csrf_required_on_repo_create() {
         &app,
         post_form(
             "/new",
-            &[("csrf_token", "wrong"), ("name", "x"), ("default_branch", "main")],
+            &[
+                ("csrf_token", "wrong"),
+                ("name", "x"),
+                ("default_branch", "main"),
+            ],
             "the-cookie",
             Some("alice"),
         ),
@@ -572,16 +795,31 @@ async fn pat_mint_shows_secret_once() {
 fn seed_two_branches(git_dir: &str) -> String {
     // main: file.txt = "one\n"
     let blob_a = git_capture(git_dir, &["hash-object", "-w", "--stdin"], "one\n");
-    let tree_a = git_capture(git_dir, &["mktree"], &format!("100644 blob {blob_a}\tfile.txt\n"));
+    let tree_a = git_capture(
+        git_dir,
+        &["mktree"],
+        &format!("100644 blob {blob_a}\tfile.txt\n"),
+    );
     let commit_a = git_capture(git_dir, &["commit-tree", &tree_a, "-m", "A"], "");
     git_capture(git_dir, &["update-ref", "refs/heads/main", &commit_a], "");
 
     // feature: file.txt = "one\ntwo\n", parented on A (fast-forward relationship).
     let blob_b = git_capture(git_dir, &["hash-object", "-w", "--stdin"], "one\ntwo\n");
-    let tree_b = git_capture(git_dir, &["mktree"], &format!("100644 blob {blob_b}\tfile.txt\n"));
-    let commit_b =
-        git_capture(git_dir, &["commit-tree", &tree_b, "-p", &commit_a, "-m", "B"], "");
-    git_capture(git_dir, &["update-ref", "refs/heads/feature", &commit_b], "");
+    let tree_b = git_capture(
+        git_dir,
+        &["mktree"],
+        &format!("100644 blob {blob_b}\tfile.txt\n"),
+    );
+    let commit_b = git_capture(
+        git_dir,
+        &["commit-tree", &tree_b, "-p", &commit_a, "-m", "B"],
+        "",
+    );
+    git_capture(
+        git_dir,
+        &["update-ref", "refs/heads/feature", &commit_b],
+        "",
+    );
     commit_b
 }
 
@@ -597,12 +835,18 @@ async fn pull_request_compare_create_and_merge() {
     // --- compare: commits ahead + escaped diff -----------------------------
     let cmp = send(
         &app,
-        get("/r/alice/proj/compare?base=main&head=feature", Some("alice")),
+        get(
+            "/r/alice/proj/compare?base=main&head=feature",
+            Some("alice"),
+        ),
     )
     .await;
     assert_eq!(cmp.status, StatusCode::OK);
     assert!(cmp.body.contains("Create pull request"));
-    assert!(cmp.body.contains("diff-row--add"), "diff shows an added line");
+    assert!(
+        cmp.body.contains("diff-row--add"),
+        "diff shows an added line"
+    );
     assert!(cmp.body.contains("two"), "added content present");
     let csrf = cmp.csrf_cookie().expect("csrf on compare");
 
@@ -694,7 +938,144 @@ async fn pull_request_compare_create_and_merge() {
         ),
     )
     .await;
-    assert_eq!(remerge.status, StatusCode::BAD_REQUEST, "merged PR is terminal");
+    assert_eq!(
+        remerge.status,
+        StatusCode::BAD_REQUEST,
+        "merged PR is terminal"
+    );
+}
+
+#[tokio::test]
+async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+    open_issue(&app, "alice", "alice/proj", "Tracked bug", "").await;
+
+    let settings = send(&app, get("/r/alice/proj/settings", Some("alice"))).await;
+    let csrf = settings.csrf_cookie().unwrap();
+    let saved = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings",
+            &[
+                ("csrf_token", &csrf),
+                ("description", "requires reviews"),
+                ("default_branch", "main"),
+                ("require_approval", "on"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::FOUND);
+
+    let cmp = send(
+        &app,
+        get("/r/alice/proj/compare?base=main&head=feature", Some("bob")),
+    )
+    .await;
+    let csrf = cmp.csrf_cookie().unwrap();
+    let created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls",
+            &[
+                ("csrf_token", &csrf),
+                ("base", "main"),
+                ("head", "feature"),
+                ("title", "Add second line"),
+                ("body", "fixes #1"),
+            ],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+
+    let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let csrf = detail.csrf_cookie().unwrap();
+    let blocked = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(blocked.status, StatusCode::BAD_REQUEST);
+    assert!(blocked.body.contains("requires at least one approval"));
+
+    let approved = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/review",
+            &[
+                ("csrf_token", &csrf),
+                ("verdict", "approve"),
+                ("body", "looks good #1"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(approved.status, StatusCode::FOUND);
+    let inline = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/inline-comment",
+            &[
+                ("csrf_token", &csrf),
+                ("path", "file.txt"),
+                ("line", "2"),
+                ("body", "line note"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(inline.status, StatusCode::FOUND);
+
+    let reviewed = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(reviewed.body.contains("approved by alice"));
+    assert!(reviewed.body.contains("file.txt:2"));
+    assert!(
+        reviewed.body.contains("/r/alice/proj/issues/1"),
+        "#N autolink rendered"
+    );
+    let csrf = reviewed.csrf_cookie().unwrap();
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(merged.status, StatusCode::FOUND);
+    let main_oid = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_eq!(main_oid, feature_oid);
+
+    let closed = send(
+        &app,
+        get("/r/alice/proj/issues?state=closed", Some("alice")),
+    )
+    .await;
+    assert!(
+        closed.body.contains("Tracked bug"),
+        "fixes #1 closed the linked issue"
+    );
 }
 
 // ===========================================================================
@@ -705,7 +1086,11 @@ async fn pull_request_compare_create_and_merge() {
 /// the commit OIDs OLDEST-first.
 fn seed_linear_commits(git_dir: &str, branch: &str, n: usize) -> Vec<String> {
     let blob = git_capture(git_dir, &["hash-object", "-w", "--stdin"], "x\n");
-    let tree = git_capture(git_dir, &["mktree"], &format!("100644 blob {blob}\tfile.txt\n"));
+    let tree = git_capture(
+        git_dir,
+        &["mktree"],
+        &format!("100644 blob {blob}\tfile.txt\n"),
+    );
     let mut oids = Vec::with_capacity(n);
     let mut parent: Option<String> = None;
     for i in 1..=n {
@@ -719,7 +1104,11 @@ fn seed_linear_commits(git_dir: &str, branch: &str, n: usize) -> Vec<String> {
     }
     git_capture(
         git_dir,
-        &["update-ref", &format!("refs/heads/{branch}"), oids.last().unwrap()],
+        &[
+            "update-ref",
+            &format!("refs/heads/{branch}"),
+            oids.last().unwrap(),
+        ],
         "",
     );
     oids
@@ -747,19 +1136,30 @@ async fn commit_history_keyset_pagination() {
         "Older link anchors at the last shown commit"
     );
     // Short shas link to the commit page.
-    assert!(p1.body.contains(&format!("/r/alice/hist/commit/{}", oids[54])));
+    assert!(p1
+        .body
+        .contains(&format!("/r/alice/hist/commit/{}", oids[54])));
 
     // Page 2 (keyset): the remaining 5, no further Older link, and a Newest rewind.
     let p2 = send(
         &app,
-        get(&format!("/r/alice/hist/commits?ref=main&after={anchor}"), Some("alice")),
+        get(
+            &format!("/r/alice/hist/commits?ref=main&after={anchor}"),
+            Some("alice"),
+        ),
     )
     .await;
     assert_eq!(p2.status, StatusCode::OK);
     assert!(p2.body.contains("commit-005"));
     assert!(p2.body.contains("commit-001"));
-    assert!(!p2.body.contains("commit-006"), "the anchor itself is not repeated");
-    assert!(!p2.body.contains("after="), "no next page after the last commit");
+    assert!(
+        !p2.body.contains("commit-006"),
+        "the anchor itself is not repeated"
+    );
+    assert!(
+        !p2.body.contains("after="),
+        "no next page after the last commit"
+    );
     assert!(p2.body.contains("Newest"));
 
     // An unknown branch is a 404; a malformed anchor is a 400.
@@ -791,40 +1191,76 @@ async fn commit_page_renders_diff_and_escapes_remote_input() {
     // The commit page: metadata + the diff of commit B (adds the line "two").
     let page = send(
         &app,
-        get(&format!("/r/alice/proj/commit/{feature_oid}"), Some("alice")),
+        get(
+            &format!("/r/alice/proj/commit/{feature_oid}"),
+            Some("alice"),
+        ),
     )
     .await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.contains(&feature_oid), "full sha shown");
     assert!(page.body.contains("Seed"), "author shown");
-    assert!(page.body.contains("diff-row--add"), "diff rendered with the diff renderer");
-    assert!(page.body.contains("1 file changed"), "shortstat summary shown");
+    assert!(
+        page.body.contains("diff-row--add"),
+        "diff rendered with the diff renderer"
+    );
+    assert!(
+        page.body.contains("1 file changed"),
+        "shortstat summary shown"
+    );
     // Parent link points at commit A.
     assert!(page.body.contains("/r/alice/proj/commit/"));
 
     // An abbreviated sha resolves to the same commit.
     let short = &feature_oid[..10];
-    let abbrev = send(&app, get(&format!("/r/alice/proj/commit/{short}"), Some("alice"))).await;
+    let abbrev = send(
+        &app,
+        get(&format!("/r/alice/proj/commit/{short}"), Some("alice")),
+    )
+    .await;
     assert_eq!(abbrev.status, StatusCode::OK);
     assert!(abbrev.body.contains(&feature_oid));
 
     // A commit whose subject carries an XSS payload renders escaped on BOTH the history list and
     // the commit page (commit messages are remote input).
-    let blob = git_capture(&git_dir, &["hash-object", "-w", "--stdin"], "one\ntwo\nthree\n");
-    let tree = git_capture(&git_dir, &["mktree"], &format!("100644 blob {blob}\tfile.txt\n"));
+    let blob = git_capture(
+        &git_dir,
+        &["hash-object", "-w", "--stdin"],
+        "one\ntwo\nthree\n",
+    );
+    let tree = git_capture(
+        &git_dir,
+        &["mktree"],
+        &format!("100644 blob {blob}\tfile.txt\n"),
+    );
     let evil = git_capture(
         &git_dir,
-        &["commit-tree", &tree, "-p", &feature_oid, "-m", "evil <script>alert(1)</script>"],
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &feature_oid,
+            "-m",
+            "evil <script>alert(1)</script>",
+        ],
         "",
     );
     git_capture(&git_dir, &["update-ref", "refs/heads/feature", &evil], "");
 
-    let hist = send(&app, get("/r/alice/proj/commits?ref=feature", Some("alice"))).await;
+    let hist = send(
+        &app,
+        get("/r/alice/proj/commits?ref=feature", Some("alice")),
+    )
+    .await;
     assert_eq!(hist.status, StatusCode::OK);
     assert!(!hist.body.contains("<script>alert(1)</script>"));
     assert!(hist.body.contains("evil &lt;script&gt;"));
 
-    let evil_page = send(&app, get(&format!("/r/alice/proj/commit/{evil}"), Some("alice"))).await;
+    let evil_page = send(
+        &app,
+        get(&format!("/r/alice/proj/commit/{evil}"), Some("alice")),
+    )
+    .await;
     assert_eq!(evil_page.status, StatusCode::OK);
     assert!(!evil_page.body.contains("<script>alert(1)</script>"));
     assert!(evil_page.body.contains("evil &lt;script&gt;"));
@@ -832,7 +1268,11 @@ async fn commit_page_renders_diff_and_escapes_remote_input() {
     // Malformed sha -> 400; well-formed but unknown -> 404.
     let bad = send(&app, get("/r/alice/proj/commit/not-hex!", Some("alice"))).await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
-    let missing = send(&app, get("/r/alice/proj/commit/deadbeefdead", Some("alice"))).await;
+    let missing = send(
+        &app,
+        get("/r/alice/proj/commit/deadbeefdead", Some("alice")),
+    )
+    .await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
 }
 
@@ -848,7 +1288,14 @@ async fn branches_page_lists_branches_and_tags() {
     // One annotated tag (with a message that needs escaping) and one lightweight tag.
     git_capture(
         &git_dir,
-        &["tag", "-a", "v1.0", "-m", "first release <tag>", &feature_oid],
+        &[
+            "tag",
+            "-a",
+            "v1.0",
+            "-m",
+            "first release <tag>",
+            &feature_oid,
+        ],
         "",
     );
     git_capture(&git_dir, &["tag", "v0-light", &feature_oid], "");
@@ -860,11 +1307,14 @@ async fn branches_page_lists_branches_and_tags() {
     assert!(page.body.contains("feature"));
     assert!(page.body.contains(">default</span>"), "default-branch pill");
     assert!(
-        page.body.contains("/r/alice/proj/compare?base=main&amp;head=feature"),
+        page.body
+            .contains("/r/alice/proj/compare?base=main&amp;head=feature"),
         "compare link into the existing PR compare"
     );
     // Head sha links into the commit page.
-    assert!(page.body.contains(&format!("/r/alice/proj/commit/{feature_oid}")));
+    assert!(page
+        .body
+        .contains(&format!("/r/alice/proj/commit/{feature_oid}")));
     // Tags: the annotated message is shown (escaped); the lightweight tag has none.
     assert!(page.body.contains("v1.0"));
     assert!(page.body.contains("first release &lt;tag&gt;"));
@@ -872,7 +1322,9 @@ async fn branches_page_lists_branches_and_tags() {
     assert!(page.body.contains("v0-light"));
 
     // The tab row is present with Branches active.
-    assert!(page.body.contains("tab--active\" href=\"/r/alice/proj/branches\""));
+    assert!(page
+        .body
+        .contains("tab--active\" href=\"/r/alice/proj/branches\""));
 }
 
 #[tokio::test]
@@ -891,7 +1343,11 @@ async fn settings_guarded_and_default_branch_validated() {
         &app,
         post_form(
             "/r/alice/proj/settings",
-            &[("csrf_token", "tok"), ("description", "hax"), ("default_branch", "main")],
+            &[
+                ("csrf_token", "tok"),
+                ("description", "hax"),
+                ("default_branch", "main"),
+            ],
             "tok",
             Some("bob"),
         ),
@@ -923,7 +1379,11 @@ async fn settings_guarded_and_default_branch_validated() {
         &app,
         post_form(
             "/r/alice/proj/settings",
-            &[("csrf_token", &csrf), ("description", "d"), ("default_branch", "nope")],
+            &[
+                ("csrf_token", &csrf),
+                ("description", "d"),
+                ("default_branch", "nope"),
+            ],
             &csrf,
             Some("alice"),
         ),
@@ -955,7 +1415,10 @@ async fn settings_guarded_and_default_branch_validated() {
     assert!(home.body.contains("new words &lt;b&gt;"));
     assert!(!home.body.contains("new words <b>"));
     let head = git_capture(&git_dir, &["symbolic-ref", "HEAD"], "");
-    assert_eq!(head, "refs/heads/feature", "bare-repo HEAD follows the default branch");
+    assert_eq!(
+        head, "refs/heads/feature",
+        "bare-repo HEAD follows the default branch"
+    );
 
     // An estate admin (X-Auth-Groups: admins) may edit a foreign repo's settings.
     let admin_save = send(
@@ -973,7 +1436,11 @@ async fn settings_guarded_and_default_branch_validated() {
         ),
     )
     .await;
-    assert_eq!(admin_save.status, StatusCode::FOUND, "admin may edit settings");
+    assert_eq!(
+        admin_save.status,
+        StatusCode::FOUND,
+        "admin may edit settings"
+    );
 }
 
 // ===========================================================================
@@ -1001,7 +1468,10 @@ async fn smart_http_public_fetch_is_anonymous_push_requires_pat() {
     // Anonymous receive-pack (push) advertisement -> 401 (push always needs a PAT).
     let push_anon = send(
         &app,
-        get("/git/alice/pub.git/info/refs?service=git-receive-pack", None),
+        get(
+            "/git/alice/pub.git/info/refs?service=git-receive-pack",
+            None,
+        ),
     )
     .await;
     assert_eq!(push_anon.status, StatusCode::UNAUTHORIZED);
@@ -1045,7 +1515,11 @@ async fn smart_http_private_and_pat_authorization() {
         ),
     )
     .await;
-    assert_eq!(ok.status, StatusCode::OK, "alice's PAT clones her private repo");
+    assert_eq!(
+        ok.status,
+        StatusCode::OK,
+        "alice's PAT clones her private repo"
+    );
 
     // A PAT owned by someone else cannot reach alice's repo -> 403.
     let bob_secret = new_pat_secret();
@@ -1072,10 +1546,56 @@ async fn smart_http_private_and_pat_authorization() {
     // A bogus token -> 401.
     let bogus = send(
         &app,
-        get_basic("/git/alice/sec.git/info/refs?service=git-upload-pack", "nope"),
+        get_basic(
+            "/git/alice/sec.git/info/refs?service=git-upload-pack",
+            "nope",
+        ),
     )
     .await;
     assert_eq!(bogus.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn smart_http_blocks_direct_push_to_protected_default_branch() {
+    let state = temp_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    assert!(store
+        .update_repo_settings(
+            &repo.id,
+            &repo.description,
+            &repo.default_branch,
+            false,
+            true
+        )
+        .await
+        .unwrap());
+
+    let secret = new_pat_secret();
+    store
+        .create_pat(&Pat {
+            id: "pt_push".into(),
+            owner_sub: "alice".into(),
+            name: "push".into(),
+            token_hash: hash_token(&secret),
+            created_at: now_secs(),
+        })
+        .await
+        .unwrap();
+
+    let blocked = send(
+        &app,
+        post_basic(
+            "/git/alice/proj.git/git-receive-pack",
+            &secret,
+            "0000 old new refs/heads/main\0 report-status",
+        ),
+    )
+    .await;
+    assert_eq!(blocked.status, StatusCode::FORBIDDEN);
+    assert!(blocked.body.contains("protected default branch"));
 }
 
 #[tokio::test]
@@ -1083,7 +1603,10 @@ async fn smart_http_unknown_repo_is_404() {
     let app = app(temp_state());
     let missing = send(
         &app,
-        get("/git/ghost/none.git/info/refs?service=git-upload-pack", None),
+        get(
+            "/git/ghost/none.git/info/refs?service=git-upload-pack",
+            None,
+        ),
     )
     .await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
