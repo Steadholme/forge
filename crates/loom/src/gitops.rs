@@ -362,6 +362,34 @@ impl GitOps {
         parse_log(&String::from_utf8_lossy(&out.stdout))
     }
 
+    /// Commit history for one file path, newest first, following renames, capped at `limit`.
+    pub async fn file_log(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+        path: &str,
+        limit: usize,
+    ) -> Vec<CommitInfo> {
+        if !is_safe_repo_path(path) {
+            return Vec::new();
+        }
+        let repo = self.repo_path(owner, name);
+        let fmt = "--pretty=format:%H%x1f%an%x1f%ae%x1f%at%x1f%s%x00";
+        let max = format!("--max-count={limit}");
+        let out = match self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["log", "--follow", &max, fmt, commit_oid, "--", path],
+            )
+            .await
+        {
+            Ok(out) if out.status => out,
+            _ => return Vec::new(),
+        };
+        parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
     // -----------------------------------------------------------------------
     // History browsing: commit resolve/detail/diff, branch + tag listings.
     // -----------------------------------------------------------------------

@@ -1289,6 +1289,46 @@ fn seed_linear_commits(git_dir: &str, branch: &str, n: usize) -> Vec<String> {
     oids
 }
 
+/// Seed `n` commits for one file. The first commit writes `old.txt`; later commits write
+/// `new.txt`, so file history must use `git log --follow` to see the root commit.
+fn seed_file_history_commits(git_dir: &str, branch: &str, n: usize) -> Vec<String> {
+    assert!(n >= 2);
+    let mut oids = Vec::with_capacity(n);
+    let mut parent: Option<String> = None;
+    for i in 1..=n {
+        let path = if i == 1 { "old.txt" } else { "new.txt" };
+        let content = format!("stable line\nanother stable line\nversion {i:03}\n");
+        let blob = git_capture(git_dir, &["hash-object", "-w", "--stdin"], &content);
+        let tree = git_capture(
+            git_dir,
+            &["mktree"],
+            &format!("100644 blob {blob}\t{path}\n"),
+        );
+        let msg = match i {
+            1 => "add old".to_string(),
+            2 => "rename to new".to_string(),
+            x if x == n => format!("file-change-{i:03} <script>alert(1)</script>"),
+            _ => format!("file-change-{i:03}"),
+        };
+        let commit = match &parent {
+            Some(p) => git_capture(git_dir, &["commit-tree", &tree, "-p", p, "-m", &msg], ""),
+            None => git_capture(git_dir, &["commit-tree", &tree, "-m", &msg], ""),
+        };
+        parent = Some(commit.clone());
+        oids.push(commit);
+    }
+    git_capture(
+        git_dir,
+        &[
+            "update-ref",
+            &format!("refs/heads/{branch}"),
+            oids.last().unwrap(),
+        ],
+        "",
+    );
+    oids
+}
+
 #[tokio::test]
 async fn commit_history_keyset_pagination() {
     let state = temp_state();
@@ -1353,6 +1393,100 @@ async fn commit_history_keyset_pagination() {
     let empty = send(&app, get("/r/alice/empty/commits", Some("alice"))).await;
     assert_eq!(empty.status, StatusCode::OK);
     assert!(empty.body.contains("no commits yet"));
+}
+
+#[tokio::test]
+async fn file_history_follows_renames_and_paginates() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "files", "").await;
+    let git_dir = git
+        .repo_path("alice", "files")
+        .to_string_lossy()
+        .to_string();
+    let oids = seed_file_history_commits(&git_dir, "main", 52);
+
+    let blob = send(&app, get("/r/alice/files/blob/new.txt", Some("alice"))).await;
+    assert_eq!(blob.status, StatusCode::OK);
+    assert!(
+        blob.body
+            .contains(r#"href="/r/alice/files/history/HEAD/new.txt""#),
+        "blob view links to file history"
+    );
+
+    let blame = send(
+        &app,
+        get("/r/alice/files/blame/HEAD/new.txt", Some("alice")),
+    )
+    .await;
+    assert_eq!(blame.status, StatusCode::OK);
+    assert!(
+        blame
+            .body
+            .contains(r#"href="/r/alice/files/history/HEAD/new.txt""#),
+        "blame view links to file history"
+    );
+
+    // Page 1: newest 50 commits (52..3), with remote commit subjects escaped.
+    let p1 = send(
+        &app,
+        get("/r/alice/files/history/HEAD/new.txt", Some("alice")),
+    )
+    .await;
+    assert_eq!(p1.status, StatusCode::OK);
+    assert!(p1.body.contains("class=\"card file-history\""));
+    assert!(p1.body.contains("file-history__item"));
+    assert!(!p1.body.contains("<script>alert(1)</script>"));
+    assert!(p1.body.contains("file-change-052 &lt;script&gt;"));
+    assert!(p1.body.contains("file-change-003"));
+    assert!(
+        !p1.body.contains("rename to new"),
+        "page 1 stops at 50 file commits"
+    );
+    assert!(
+        p1.body
+            .contains(&format!("/r/alice/files/commit/{}", oids[51]))
+    );
+    let anchor = &oids[2];
+    assert!(
+        p1.body.contains(&format!("after={anchor}")),
+        "Older link anchors at the last shown file commit"
+    );
+
+    // Page 2: the anchor is excluded, and --follow brings in the pre-rename root commit.
+    let p2 = send(
+        &app,
+        get(
+            &format!("/r/alice/files/history/HEAD/new.txt?after={anchor}"),
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(p2.status, StatusCode::OK);
+    assert!(p2.body.contains("rename to new"));
+    assert!(p2.body.contains("add old"));
+    assert!(!p2.body.contains("file-change-003"));
+    assert!(p2.body.contains("Newest"));
+    assert!(!p2.body.contains("Older"));
+
+    let missing = send(
+        &app,
+        get("/r/alice/files/history/HEAD/missing.txt", Some("alice")),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::OK);
+    assert!(missing.body.contains("No commits found for this file."));
+
+    let bad_after = send(
+        &app,
+        get(
+            "/r/alice/files/history/HEAD/new.txt?after=--not-hex",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(bad_after.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

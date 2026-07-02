@@ -78,6 +78,10 @@ pub fn app(state: AppState) -> Router {
             "/r/{owner}/{name}/blame/{ref}/{*path}",
             get(handlers::repos::blame),
         )
+        .route(
+            "/r/{owner}/{name}/history/{ref}/{*path}",
+            get(handlers::repos::file_history),
+        )
         .route("/r/{owner}/{name}/commits", get(handlers::commits::history))
         .route(
             "/r/{owner}/{name}/commits/{sha}/status",

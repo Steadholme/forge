@@ -10,22 +10,23 @@
 //! sanitising [`crate::markdown`] pipeline: raw HTML is downgraded to text and unsafe link schemes
 //! are defused, so no producer-supplied markup ever executes.
 
-use axum::extract::{Path, State};
+use axum::Form;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::Form;
 use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::config::COMMIT_LIMIT;
 use crate::error::AppError;
-use crate::gitops::{BlameLine, TreeEntry};
+use crate::gitops::{BlameLine, CommitInfo, TreeEntry};
 use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
-use crate::model::{validate_owner_sub, validate_repo_name, Release, Repo};
-use crate::{now_secs, random_alnum, AppState};
+use crate::model::{Release, Repo, validate_owner_sub, validate_repo_name};
+use crate::{AppState, now_secs, random_alnum};
 
 /// Length of a repo/issue/pat id (62-symbol alphabet).
 const ID_LEN: usize = 16;
+const FILE_HISTORY_PER_PAGE: usize = 50;
 
 // ===========================================================================
 // GET / — repo list + create form
@@ -293,7 +294,13 @@ pub async fn blame(
     let header = header_with_counts(&state, &repo, "code").await;
     let title = format!("{owner}/{name} · Blame");
     let Some(commit) = resolve_blame_ref(&state, &repo, ref_name).await else {
-        let body = render_blame_notice(&repo, &header, &path, "No such ref in this repository.");
+        let body = render_blame_notice(
+            &repo,
+            &header,
+            ref_name,
+            &path,
+            "No such ref in this repository.",
+        );
         return Ok(html_ok(page(&title, Some(&who.email), &body)));
     };
     let Some(bytes) = state
@@ -301,16 +308,24 @@ pub async fn blame(
         .read_blob(&repo.owner_sub, &repo.name, &commit, &path)
         .await
     else {
-        let body = render_blame_notice(&repo, &header, &path, "No such file at this ref.");
+        let body =
+            render_blame_notice(&repo, &header, ref_name, &path, "No such file at this ref.");
         return Ok(html_ok(page(&title, Some(&who.email), &body)));
     };
 
     let body = if bytes.contains(&0) {
-        render_blame_notice(&repo, &header, &path, "Binary file blame is not shown.")
+        render_blame_notice(
+            &repo,
+            &header,
+            ref_name,
+            &path,
+            "Binary file blame is not shown.",
+        )
     } else if bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
         render_blame_notice(
             &repo,
             &header,
+            ref_name,
             &path,
             &format!(
                 "File is too large to blame inline ({}).",
@@ -327,12 +342,94 @@ pub async fn blame(
             None => render_blame_notice(
                 &repo,
                 &header,
+                ref_name,
                 &path,
                 "Could not compute blame for this file.",
             ),
         }
     };
 
+    Ok(html_ok(page(&title, Some(&who.email), &body)))
+}
+
+// ===========================================================================
+// GET /r/{owner}/{name}/history/{ref}/{*path} — single-file commit history
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct FileHistoryQuery {
+    /// Keyset anchor: the OID of the last commit on the previous page.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+pub async fn file_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, ref_name, path)): Path<(String, String, String, String)>,
+    Query(q): Query<FileHistoryQuery>,
+) -> Result<Response, AppError> {
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let path = clean_blame_subpath(&path)?;
+    let ref_name = ref_name.trim();
+    if ref_name.is_empty() {
+        return Err(AppError::BadRequest("Invalid ref.".to_string()));
+    }
+
+    let header = header_with_counts(&state, &repo, "code").await;
+    let title = format!("{owner}/{name} · File history");
+    if path.is_empty() {
+        let body = render_file_history_notice(&repo, &header, ref_name, &path, "No file path.");
+        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+    }
+
+    let Some(commit) = resolve_blame_ref(&state, &repo, ref_name).await else {
+        let body = render_file_history_notice(
+            &repo,
+            &header,
+            ref_name,
+            &path,
+            "No such ref in this repository.",
+        );
+        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+    };
+
+    let after = match q.after.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => {
+            if !is_hex_oid(a) {
+                return Err(AppError::BadRequest("Invalid commit id.".to_string()));
+            }
+            Some(
+                state
+                    .git
+                    .resolve_commit(&repo.owner_sub, &repo.name, a)
+                    .await
+                    .ok_or_else(|| AppError::NotFound("No such commit.".to_string()))?,
+            )
+        }
+        None => None,
+    };
+
+    let paged = after.is_some();
+    let start = after.as_deref().unwrap_or(&commit);
+    let limit = FILE_HISTORY_PER_PAGE + if paged { 2 } else { 1 };
+    let mut commits = state
+        .git
+        .file_log(&repo.owner_sub, &repo.name, start, &path, limit)
+        .await;
+    if let Some(anchor) = after.as_deref() {
+        if commits.first().map(|c| c.oid.as_str()) == Some(anchor) {
+            commits.remove(0);
+        }
+    }
+    let has_next = commits.len() > FILE_HISTORY_PER_PAGE;
+    commits.truncate(FILE_HISTORY_PER_PAGE);
+
+    let body = format!(
+        "{header}{history}",
+        history = render_file_history(&repo, ref_name, &path, &commits, paged, has_next),
+    );
     Ok(html_ok(page(&title, Some(&who.email), &body)))
 }
 
@@ -980,6 +1077,13 @@ fn render_file_browser(repo: &Repo, subpath: &str, entries: &[TreeEntry]) -> Str
     )
 }
 
+fn file_history_href(repo: &Repo, ref_name: &str, path: &str) -> String {
+    format!(
+        "/r/{}/{}/history/{}/{}",
+        repo.owner_sub, repo.name, ref_name, path
+    )
+}
+
 /// File-view card: repo header + breadcrumb + escaped file content (or a binary/too-large notice).
 fn render_blob(
     repo: &Repo,
@@ -998,6 +1102,7 @@ fn render_blob(
         release_count,
         "code",
     );
+    let history_href = file_history_href(repo, "HEAD", path);
     let blame_href = format!("/r/{}/{}/blame/HEAD/{}", repo.owner_sub, repo.name, path);
     let content = if bytes.contains(&0) {
         "<div class=\"card__body\"><p class=\"muted\">Binary file not shown.</p></div>".to_string()
@@ -1025,26 +1130,35 @@ fn render_blob(
     format!(
         r##"{header}
 <section class="card">
-  <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm" href="{blame_href}">Blame</a><span class="muted">{size}</span></span></div>
+  <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm" href="{history_href}">History</a><a class="btn btn-ghost btn-sm" href="{blame_href}">Blame</a><span class="muted">{size}</span></span></div>
   {content}
 </section>"##,
         header = header,
         breadcrumb = render_breadcrumb(repo, path, true),
+        history_href = esc(&history_href),
         blame_href = esc(&blame_href),
         size = esc(&human_size(bytes.len() as i64)),
         content = content,
     )
 }
 
-fn render_blame_notice(repo: &Repo, header: &str, path: &str, message: &str) -> String {
+fn render_blame_notice(
+    repo: &Repo,
+    header: &str,
+    ref_name: &str,
+    path: &str,
+    message: &str,
+) -> String {
+    let history_href = file_history_href(repo, ref_name, path);
     format!(
         r##"{header}
 <section class="card">
-  <div class="card__head">{breadcrumb}<span class="muted">Blame</span></div>
+  <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm" href="{history_href}">History</a><span class="muted">Blame</span></span></div>
   <div class="card__body"><p class="muted">{message}</p></div>
 </section>"##,
         header = header,
         breadcrumb = render_breadcrumb(repo, path, true),
+        history_href = esc(&history_href),
         message = esc(message),
     )
 }
@@ -1065,23 +1179,123 @@ fn render_blame(
             render_blame_table(repo, lines)
         )
     };
+    let history_href = file_history_href(repo, ref_name, path);
     format!(
         r##"{header}
 <section class="card">
   <div class="card__head">
     {breadcrumb}
-    <span class="muted">Blame {ref_name} at <a href="/r/{owner}/{name}/commit/{commit}"><code class="oid">{short}</code></a></span>
+    <span class="blob-actions"><a class="btn btn-ghost btn-sm" href="{history_href}">History</a><span class="muted">Blame {ref_name} at <a href="/r/{owner}/{name}/commit/{commit}"><code class="oid">{short}</code></a></span></span>
   </div>
   {content}
 </section>"##,
         header = header,
         breadcrumb = render_breadcrumb(repo, path, true),
+        history_href = esc(&history_href),
         ref_name = esc(ref_name),
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         commit = esc(commit),
         short = esc(&short_oid(commit)),
         content = content,
+    )
+}
+
+fn render_file_history_notice(
+    repo: &Repo,
+    header: &str,
+    ref_name: &str,
+    path: &str,
+    message: &str,
+) -> String {
+    format!(
+        r##"{header}
+<section class="card file-history">
+  <div class="card__head">{breadcrumb}<span class="muted">History {ref_name}</span></div>
+  <div class="card__body"><p class="muted">{message}</p></div>
+</section>"##,
+        header = header,
+        breadcrumb = render_breadcrumb(repo, path, true),
+        ref_name = esc(ref_name),
+        message = esc(message),
+    )
+}
+
+fn render_file_history(
+    repo: &Repo,
+    ref_name: &str,
+    path: &str,
+    commits: &[CommitInfo],
+    paged: bool,
+    has_next: bool,
+) -> String {
+    let now = now_secs();
+    let rows = if commits.is_empty() {
+        "<li class=\"commit-item commit-item--empty file-history__item\">No commits found for this file.</li>"
+            .to_string()
+    } else {
+        commits
+            .iter()
+            .map(|c| {
+                format!(
+                    "<li class=\"commit-item file-history__item\">\
+                       <a class=\"commit-item__subject file-history__message\" href=\"/r/{owner}/{name}/commit/{oid}\">{subject}</a>\
+                       <span class=\"commit-item__meta file-history__meta\">\
+                         <a href=\"/r/{owner}/{name}/commit/{oid}\"><code class=\"oid\">{short}</code></a>\
+                         <span>{author}</span>\
+                         <span title=\"{abs}\">{rel}</span>\
+                       </span>\
+                     </li>",
+                    owner = esc(&repo.owner_sub),
+                    name = esc(&repo.name),
+                    oid = esc(&c.oid),
+                    short = esc(&short_oid(&c.oid)),
+                    subject = esc(&c.subject),
+                    author = esc(&c.author_name),
+                    abs = esc(&fmt_ts(c.time)),
+                    rel = esc(&fmt_rel(now, c.time)),
+                )
+            })
+            .collect::<String>()
+    };
+
+    let base_href = file_history_href(repo, ref_name, path);
+    let newest = if paged {
+        format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{href}\">&larr; Newest</a>",
+            href = esc(&base_href),
+        )
+    } else {
+        String::new()
+    };
+    let older = match (has_next, commits.last()) {
+        (true, Some(last)) => format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{href}?after={oid}\">Older &rarr;</a>",
+            href = esc(&base_href),
+            oid = esc(&last.oid),
+        ),
+        _ => String::new(),
+    };
+    let pager = if newest.is_empty() && older.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div class=\"pager file-history__pager\">{newest}<span class=\"spacer\"></span>{older}</div>"
+        )
+    };
+
+    format!(
+        r##"<section class="card file-history">
+  <div class="card__head">{breadcrumb}<span class="muted">History {ref_name}</span></div>
+  <div class="card__body">
+    <ul class="commit-list file-history__list">{rows}</ul>
+    {pager}
+  </div>
+</section>"##,
+        breadcrumb = render_breadcrumb(repo, path, true),
+        ref_name = esc(ref_name),
+        rows = rows,
+        pager = pager,
     )
 }
 
