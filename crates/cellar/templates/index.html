@@ -30,15 +30,15 @@
     </div>
 
     <div class="table-wrap">
-      <table class="data">
+      <table class="data" data-sortable>
         <thead>
           <tr>
-            <th>Repository</th>
-            <th>Images</th>
-            <th>Tags</th>
-            <th>Size</th>
-            <th>Last pushed</th>
-            <th>Pulls</th>
+            <th data-sort="text" aria-label="Sort by repository">Repository</th>
+            <th data-sort="num">Images</th>
+            <th data-sort="num">Tags</th>
+            <th data-sort="num">Size</th>
+            <th data-sort="num">Last pushed</th>
+            <th data-sort="num">Pulls</th>
           </tr>
         </thead>
         <tbody>
@@ -52,5 +52,6 @@
     <span>HOLDFAST · Cellar</span>
     <span>Container registry · part of the HOLDFAST estate</span>
   </footer>
+  <script>{{JS}}</script>
 </body>
 </html>

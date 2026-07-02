@@ -23,6 +23,7 @@
     <div class="cmd-strip">
       <span class="cmd-label">Pull</span>
       <code>{{PULL_CMD}}</code>
+      <button class="btn btn-ghost btn-sm copy-btn" type="button" data-copy aria-label="Copy pull command">Copy</button>
     </div>
 
     <div class="section-head">
@@ -31,15 +32,15 @@
     </div>
 
     <div class="table-wrap">
-      <table class="data">
+      <table class="data" data-sortable>
         <thead>
           <tr>
-            <th>Tag</th>
-            <th>Manifest digest</th>
-            <th>Media type</th>
-            <th>Size</th>
-            <th>Updated</th>
-            <th></th>
+            <th data-sort="text">Tag</th>
+            <th data-sort="text">Manifest digest</th>
+            <th data-sort="text">Media type</th>
+            <th data-sort="num">Size</th>
+            <th data-sort="num">Updated</th>
+            <th data-nosort></th>
           </tr>
         </thead>
         <tbody>
@@ -53,5 +54,6 @@
     <span>HOLDFAST · Cellar</span>
     <span>Container registry · part of the HOLDFAST estate</span>
   </footer>
+  <script>{{JS}}</script>
 </body>
 </html>

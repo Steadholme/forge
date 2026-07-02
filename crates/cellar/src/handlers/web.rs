@@ -9,13 +9,14 @@
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::Form;
+use axum::{Form, Json};
 use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
 use crate::handlers::{
-    esc, fmt_ts, human_size, short_digest, time_ago, userbox, APP_CSS, LAYERS_SVG, SHIELD_SVG,
+    esc, fmt_ts, human_size, short_digest, time_ago, userbox, APP_CSS, APP_JS, LAYERS_SVG,
+    SHIELD_SVG,
 };
 use crate::model::{
     image_size, index_child_digests, index_entries, index_platforms, is_manifest_list,
@@ -150,7 +151,34 @@ pub async fn delete_tag(
     headers: HeaderMap,
     Form(form): Form<DeleteTagForm>,
 ) -> Result<Response, WebError> {
-    if !auth::verify_csrf(&headers, &form.csrf_token) {
+    do_delete_tag(&state, &headers, &form).await?;
+    Ok((
+        StatusCode::FOUND,
+        [(header::LOCATION, format!("/r/{}", form.repo))],
+    )
+        .into_response())
+}
+
+/// `POST /delete-tag.json` — JSON sibling of [`delete_tag`] backing the optimistic (no-reload) tag
+/// removal on the repository page. Same double-submit CSRF, same audit; returns whether a tag was
+/// removed. The form route above is unchanged for no-JS clients (progressive enhancement).
+pub async fn delete_tag_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteTagForm>,
+) -> Result<Response, WebError> {
+    let removed = do_delete_tag(&state, &headers, &form).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "removed": removed })).into_response())
+}
+
+/// Shared core for both tag-delete routes: CSRF-check, validate, remove the tag, audit. Returns
+/// whether a tag was actually removed.
+async fn do_delete_tag(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: &DeleteTagForm,
+) -> Result<bool, WebError> {
+    if !auth::verify_csrf(headers, &form.csrf_token) {
         return Err(WebError::BadRequest(
             "Your session token expired. Reload the page and try again.".to_string(),
         ));
@@ -158,14 +186,10 @@ pub async fn delete_tag(
     if form.repo.is_empty() || form.tag.is_empty() {
         return Err(WebError::BadRequest("Missing repository or tag.".to_string()));
     }
-    let actor = auth::identity(&headers);
+    let actor = auth::identity(headers);
     let removed = state.store.delete_tag(&form.repo, &form.tag).await?;
     tracing::info!(repo = form.repo, tag = form.tag, removed, actor = actor.subject, "tag delete");
-    Ok((
-        StatusCode::FOUND,
-        [(header::LOCATION, format!("/r/{}", form.repo))],
-    )
-        .into_response())
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +307,7 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
     };
     INDEX_HTML
         .replace("{{CSS}}", APP_CSS)
+        .replace("{{JS}}", APP_JS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
         .replace("{{HOST}}", &esc(host))
@@ -294,10 +319,12 @@ fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
     if repos.is_empty() {
         return format!(
             "<tr class=\"empty-row\"><td colspan=\"6\">\
-               No images have been pushed yet. Authenticate and push one:<br>\
-               <code>docker login {host}</code><br>\
-               <code>docker tag alpine {host}/alpine:latest</code><br>\
-               <code>docker push {host}/alpine:latest</code>\
+               <div class=\"empty\">\
+                 <svg class=\"empty__icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m12.83 2.18 8 4A2 2 0 0 1 22 8v8a2 2 0 0 1-1.17 1.82l-8 4a2 2 0 0 1-1.66 0l-8-4A2 2 0 0 1 2 16V8a2 2 0 0 1 1.17-1.82l8-4a2 2 0 0 1 1.66 0Z\"/><path d=\"m7 5 10 5\"/></svg>\
+                 <div class=\"empty__title\">No images pushed yet</div>\
+                 <div class=\"empty__text\">Authenticate and push your first image over the Docker Registry V2 protocol.</div>\
+                 <div class=\"cmd-strip\"><span class=\"cmd-label\">Login</span><code>docker login {host}</code><button class=\"btn btn-ghost btn-sm copy-btn\" type=\"button\" data-copy=\"docker login {host}\" aria-label=\"Copy docker login command\">Copy</button></div>\
+               </div>\
              </td></tr>",
             host = esc(host),
         );
@@ -309,19 +336,22 @@ fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
             format!(
                 "<tr>\
                    <td class=\"repo-cell\"><a href=\"/r/{name_attr}\"><span class=\"repo-glyph\">{glyph}</span><span class=\"repo-name\">{name}</span></a></td>\
-                   <td>{images}</td>\
-                   <td>{tags}</td>\
-                   <td class=\"num\">{size}</td>\
-                   <td class=\"muted\">{date}</td>\
-                   <td class=\"muted\">{pulls}</td>\
+                   <td class=\"num\" data-sort-value=\"{images}\">{images}</td>\
+                   <td class=\"num\" data-sort-value=\"{tags}\">{tags}</td>\
+                   <td class=\"num\" data-sort-value=\"{size_bytes}\"><span class=\"pill pill-size\">{size}</span></td>\
+                   <td class=\"muted\" data-sort-value=\"{pushed}\">{date}</td>\
+                   <td class=\"muted\" data-sort-value=\"{pulls_n}\"><span class=\"pill pill-pulls\">{pulls}</span></td>\
                  </tr>",
                 name_attr = esc(&r.name),
                 glyph = LAYERS_SVG,
                 name = esc(&r.name),
                 images = r.manifest_count,
                 tags = r.tag_count,
+                size_bytes = r.total_size,
                 size = esc(&human_size(r.total_size)),
+                pushed = r.last_pushed,
                 date = esc(&fmt_ts(r.last_pushed)),
+                pulls_n = r.pulls,
                 pulls = esc(&pull_summary(r.pulls, r.last_pulled_at, now)),
             )
         })
@@ -346,6 +376,7 @@ fn render_repo(
     let pull_cmd = format!("docker pull {host}/{name}:{sample_tag}");
     REPO_HTML
         .replace("{{CSS}}", APP_CSS)
+        .replace("{{JS}}", APP_JS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{LAYERS}}", LAYERS_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
@@ -472,6 +503,7 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
     let pull_cmd = format!("docker pull {host}/{name}@{digest}", name = v.name, digest = v.digest);
     MANIFEST_HTML
         .replace("{{CSS}}", APP_CSS)
+        .replace("{{JS}}", APP_JS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
         .replace("{{SUBTITLE}}", &esc(&subtitle))
@@ -669,10 +701,10 @@ fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
                    <td><a class=\"tag-pill\" href=\"/m/{repo_attr}?ref={tag_ref}\">{tag}</a></td>\
                    <td class=\"mono\" title=\"{digest_full}\"><a href=\"/m/{repo_attr}?ref={digest_ref}\">{digest_short}</a></td>\
                    <td class=\"muted\">{mtype}{arch}</td>\
-                   <td class=\"num\">{size}</td>\
-                   <td class=\"muted\">{date}</td>\
+                   <td class=\"num\" data-sort-value=\"{size_bytes}\"><span class=\"pill pill-size\">{size}</span></td>\
+                   <td class=\"muted\" data-sort-value=\"{updated}\">{date}</td>\
                    <td class=\"row-action\">\
-                     <form method=\"post\" action=\"/delete-tag\" onsubmit=\"return confirm('Delete tag {tag_js}? The image stays until garbage-collected.');\">\
+                     <form method=\"post\" action=\"/delete-tag\" data-delete-row onsubmit=\"return confirm('Delete tag {tag_js}? The image stays until garbage-collected.');\">\
                        <input type=\"hidden\" name=\"repo\" value=\"{repo_attr}\">\
                        <input type=\"hidden\" name=\"tag\" value=\"{tag_attr}\">\
                        <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
@@ -687,7 +719,9 @@ fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
                 digest_short = esc(&short_digest(&t.manifest_digest)),
                 mtype = esc(&t.media_type),
                 arch = arch_badge(&t.platforms),
+                size_bytes = t.size,
                 size = esc(&human_size(t.size)),
+                updated = t.updated_at,
                 date = esc(&fmt_ts(t.updated_at)),
                 tag_js = esc(&t.tag),
                 repo_attr = esc(repo),

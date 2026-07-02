@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, esc, human_size, userbox, APP_CSS};
+use crate::handlers::{admin_tabs, esc, human_size, userbox, APP_CSS, APP_JS};
 use crate::model::{repo_pattern_matches, RetentionRule};
 use crate::names::is_valid_repo_pattern;
 use crate::{now_secs, random_alnum, AppState};
@@ -189,6 +189,29 @@ pub async fn preview(
     ))
 }
 
+/// `POST /admin/retention/preview.json` — JSON sibling of [`preview`] backing the inline (no-reload)
+/// dry-run on the retention panel. Same admin gate + double-submit CSRF; returns the candidate
+/// `(repo, tag)` pairs. The form route above is unchanged for no-JS clients (progressive enhancement).
+pub async fn preview_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<IdForm>,
+) -> Result<Response, WebError> {
+    auth::require_admin(&headers)?;
+    csrf_guard(&headers, &form.csrf_token)?;
+    let deletions = plan_retention(&state, now_secs()).await?;
+    let items: Vec<serde_json::Value> = deletions
+        .iter()
+        .map(|(repo, tag)| serde_json::json!({ "repo": repo, "tag": tag }))
+        .collect();
+    Ok(axum::Json(serde_json::json!({
+        "ok": true,
+        "count": deletions.len(),
+        "deletions": items,
+    }))
+    .into_response())
+}
+
 /// `POST /admin/retention/apply` — delete every non-kept tag (via the existing tag-delete path),
 /// then reclaim the now-orphaned manifests + blobs through the shared GC sweep. CSRF-checked;
 /// audited. Never deletes a `latest` tag or a tag kept by a rule.
@@ -348,6 +371,7 @@ fn render(who: &Identity, rules: &[RetentionRule], csrf: &str, notice: &str, pre
     };
     RETENTION_HTML
         .replace("{{CSS}}", APP_CSS)
+        .replace("{{JS}}", APP_JS)
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
         .replace("{{TABS}}", &admin_tabs("retention"))
         .replace("{{NOTICE}}", notice)

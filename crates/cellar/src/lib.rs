@@ -60,6 +60,9 @@ pub fn app(state: AppState) -> Router {
         .route("/r/{*name}", get(handlers::web::repo_detail))
         .route("/m/{*name}", get(handlers::web::manifest_detail))
         .route("/delete-tag", post(handlers::web::delete_tag))
+        // JSON sibling of the delete-tag form (optimistic, no-reload row removal). Progressive
+        // enhancement: the form route above still works with JavaScript off.
+        .route("/delete-tag.json", post(handlers::web::delete_tag_json))
         // --- /admin subtree (admin-gated: storage accounting + garbage collection) ---
         .route("/admin", get(handlers::admin::index))
         .route("/admin/gc", post(handlers::admin::gc))
@@ -69,6 +72,10 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/retention/toggle", post(handlers::retention::toggle))
         .route("/admin/retention/delete", post(handlers::retention::delete))
         .route("/admin/retention/preview", post(handlers::retention::preview))
+        .route(
+            "/admin/retention/preview.json",
+            post(handlers::retention::preview_json),
+        )
         .route("/admin/retention/apply", post(handlers::retention::apply))
         // Robot accounts: mint (token shown once), list, disable, delete.
         .route("/admin/robots", get(handlers::robots::index))

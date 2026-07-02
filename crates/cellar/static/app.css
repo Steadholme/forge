@@ -400,3 +400,41 @@ table.data td.mono, table.data td .mono { font-family:var(--mono); font-size:12p
 .site-foot a { color:var(--ink-2); }
 .site-foot a:hover { color:var(--accent-ink); }
 @media (max-width:560px) { .site-foot { flex-direction:column; gap:4px; } }
+
+/* ============================================================================
+   Odyssey v2 — progressive-enhancement additions (Cellar). Additive only;
+   transitions use --dur (140ms) + --ease and are disabled under reduced motion.
+   ============================================================================ */
+.toast-root{position:fixed;right:16px;bottom:16px;z-index:1000;display:flex;flex-direction:column;gap:8px;max-width:min(92vw,360px)}
+.toast{background:var(--surface);color:var(--ink);border:1px solid var(--border);border-left-width:4px;border-radius:var(--r-sm);box-shadow:var(--sh-pop);padding:10px 14px;font:500 13px/1.4 var(--font);opacity:0;transform:translateY(8px);transition:opacity var(--dur) var(--ease),transform var(--dur) var(--ease)}
+.toast.is-in{opacity:1;transform:none}
+.toast--ok{border-left-color:var(--ok-ink)}
+.toast--err{border-left-color:var(--down-ink)}
+
+th.th-sort{cursor:pointer;user-select:none;white-space:nowrap}
+th.th-sort:hover{color:var(--accent-ink)}
+th.th-sort:focus-visible{outline:2px solid var(--ring);outline-offset:-2px}
+th.th-sort::after{content:"\2195";opacity:.35;margin-left:6px;font-size:11px;font-weight:400}
+th.th-sort[aria-sort="ascending"]::after{content:"\2191";opacity:1}
+th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
+
+.pill-size{background:var(--accent-soft);color:var(--accent-ink)}
+.pill-pulls{height:auto;padding:2px 9px;white-space:normal;line-height:1.35;background:var(--surface-3);color:var(--ink-2)}
+
+.copy-btn{cursor:pointer}
+.cmd-strip .copy-btn{margin-left:auto}
+
+.empty{display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:32px 16px;color:var(--ink-3)}
+.empty__icon{width:40px;height:40px;color:var(--ink-4)}
+.empty__title{font:600 15px/1.2 var(--font);color:var(--ink-2)}
+.empty__text{font:400 13px/1.5 var(--font);color:var(--ink-3);max-width:48ch}
+.empty .cmd-strip{margin-top:4px}
+
+@media (max-width:720px){
+  .toast-root{left:12px;right:12px;bottom:12px;max-width:none}
+  .cmd-strip{flex-wrap:wrap}
+  .cmd-strip .copy-btn{margin-left:0}
+}
+@media (prefers-reduced-motion:reduce){
+  .toast,th.th-sort,.copy-btn{transition:none}
+}

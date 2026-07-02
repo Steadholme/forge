@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
-use axum::Form;
+use axum::response::{IntoResponse, Response};
+use axum::{Form, Json};
 use serde::Deserialize;
 
 use crate::auth::{self, Identity};
@@ -682,19 +682,53 @@ pub async fn inline_comment(
     Path((owner, name, number)): Path<(String, String, i64)>,
     Form(form): Form<InlineCommentForm>,
 ) -> Result<Response, AppError> {
-    if !auth::verify_csrf(&headers, &form.csrf_token) {
+    add_inline_comment(&state, &headers, &owner, &name, number, &form).await?;
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+/// JSON sibling of [`inline_comment`] backing the optimistic "click a diff line → comment" UX. Same
+/// CSRF (double-submit), same reviewer/owner/admin gate, same audit; returns the stored comment so
+/// the page can insert it without a reload. The form route above is unchanged for no-JS clients.
+pub async fn inline_comment_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<InlineCommentForm>,
+) -> Result<Response, AppError> {
+    let comment = add_inline_comment(&state, &headers, &owner, &name, number, &form).await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "path": comment.0,
+        "line": comment.1,
+        "author": comment.2,
+        "body": comment.3,
+    }))
+    .into_response())
+}
+
+/// Shared core for both inline-comment routes: CSRF-check, load + authorize, validate, persist, and
+/// audit. Returns `(path, line, author, body)` of the stored comment.
+async fn add_inline_comment(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    form: &InlineCommentForm,
+) -> Result<(String, i64, String, String), AppError> {
+    if !auth::verify_csrf(headers, &form.csrf_token) {
         return Err(AppError::BadRequest(
             "Your session token expired. Reload the page and try again.".to_string(),
         ));
     }
-    let who = auth::identity(&headers);
-    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
     let pull = state
         .store
         .get_pull(&repo.id, number)
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
-    if !can_review(&repo, &pull, &who, &headers) {
+    if !can_review(&repo, &pull, &who, headers) {
         return Err(AppError::Forbidden(
             "Only the repository owner, pull-request author, or an administrator can comment."
                 .to_string(),
@@ -707,6 +741,7 @@ pub async fn inline_comment(
             "Inline comments need a file path and a comment body.".to_string(),
         ));
     }
+    let line = form.line.max(0);
     state
         .store
         .create_pull_review_comment(
@@ -714,7 +749,7 @@ pub async fn inline_comment(
             &pull.id,
             "",
             &path,
-            form.line.max(0),
+            line,
             &who.subject,
             &body,
             now_secs(),
@@ -726,7 +761,7 @@ pub async fn inline_comment(
         actor = who.subject,
         "pull inline comment added"
     );
-    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+    Ok((path, line, who.subject, body))
 }
 
 // ===========================================================================
@@ -997,7 +1032,18 @@ fn render_list(
 ) -> String {
     let filters = render_pr_filters(repo, labels, milestones, label_filter, milestone_filter);
     let list = if pulls.is_empty() {
-        "<li class=\"pr-item pr-item--empty\">No pull requests yet.</li>".to_string()
+        format!(
+            "<li class=\"pr-item pr-item--empty\">\
+               <div class=\"empty\">\
+                 <svg class=\"empty__icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"6\" cy=\"6\" r=\"3\"/><circle cx=\"6\" cy=\"18\" r=\"3\"/><path d=\"M18 9a9 9 0 0 1-9 9\"/><circle cx=\"18\" cy=\"6\" r=\"3\"/></svg>\
+                 <div class=\"empty__title\">No pull requests yet</div>\
+                 <div class=\"empty__text\">Compare two branches to open the first pull request.</div>\
+                 <a class=\"btn btn-primary btn-sm\" href=\"/r/{owner}/{name}/compare\">New pull request</a>\
+               </div>\
+             </li>",
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+        )
     } else {
         pulls
             .iter()
@@ -1307,11 +1353,22 @@ async fn render_detail(
         )
     };
 
+    // Progressive-enhancement config for the inline-comment affordance on diff lines. Read by the
+    // JS layer; ignored (and hidden) when JavaScript is off — the standalone inline-comment form
+    // below still posts to the form route.
+    let pr_inline = format!(
+        "<div id=\"pr-inline\" data-endpoint=\"/r/{owner}/{name}/pulls/{number}/inline-comment.json\" hidden></div>",
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        number = pull.number,
+    );
+
     format!(
         r##"{header}
+{pr_inline}
 <div class="console__head">
   <div class="repo-title">
-    <span class="state-badge {cls}">{label}</span>
+    <span class="state-badge {cls}" id="state-badge-main">{label}</span>
     <h1 class="pr-title">#{number} {title}</h1>
   </div>
   <p class="sub"><code>{head}</code> &rarr; <code>{base}</code> · opened {when} by {author} · milestone {milestone}</p>
@@ -1347,6 +1404,7 @@ async fn render_detail(
         metadata_form = metadata_form,
         error_block = error_block,
         actions = actions,
+        pr_inline = pr_inline,
     )
 }
 
@@ -1379,13 +1437,13 @@ fn render_review_badges(summary: &ReviewSummary) -> String {
     let mut out = String::new();
     for reviewer in &summary.approvals {
         out.push_str(&format!(
-            "<span class=\"state-badge state-badge--open\">approved by {}</span>",
+            "<span class=\"state-badge state-badge--open verdict-pill verdict-pill--approve\">approved by {}</span>",
             esc(reviewer)
         ));
     }
     for reviewer in &summary.changes_requested {
         out.push_str(&format!(
-            "<span class=\"state-badge state-badge--closed\">changes requested by {}</span>",
+            "<span class=\"state-badge state-badge--closed verdict-pill verdict-pill--changes\">changes requested by {}</span>",
             esc(reviewer)
         ));
     }
@@ -1439,12 +1497,12 @@ fn render_reviews_card(
   <form method="post" action="/r/{owner}/{name}/pulls/{number}/review">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <div class="field">
-      <label for="review-verdict">Verdict</label>
-      <select id="review-verdict" name="verdict">
-        <option value="comment">Comment</option>
-        <option value="approve">Approve</option>
-        <option value="request_changes">Request changes</option>
-      </select>
+      <label id="review-verdict-label">Verdict</label>
+      <div class="verdict-picker" role="radiogroup" aria-labelledby="review-verdict-label">
+        <label class="verdict-pill verdict-pill--comment"><input type="radio" name="verdict" value="comment" checked> Comment</label>
+        <label class="verdict-pill verdict-pill--approve"><input type="radio" name="verdict" value="approve"> Approve</label>
+        <label class="verdict-pill verdict-pill--changes"><input type="radio" name="verdict" value="request_changes"> Request changes</label>
+      </div>
     </div>
     <div class="field">
       <label for="review-body">Review comment</label>
@@ -1483,7 +1541,7 @@ fn render_reviews_card(
   <div class="card__body">
     <ul class="issue-list">{review_rows}</ul>
     <h3 class="section-subhead">Inline comments</h3>
-    <ul class="issue-list">{inline_rows}</ul>
+    <ul class="issue-list" id="pr-inline-thread">{inline_rows}</ul>
     {forms}
   </div>
 </section>"##,
@@ -1579,24 +1637,137 @@ pub(crate) fn render_diff_card(diff: &str) -> String {
     )
 }
 
-/// Render a unified diff into a line-classified, HTML-escaped table (row background fills width).
+/// One file's slice of a unified diff (its header line + body lines).
+struct DiffFile {
+    path: String,
+    lines: Vec<String>,
+}
+
+/// Render a unified diff into per-file **collapsible** blocks, each a line-classified, HTML-escaped
+/// table. Code rows carry `data-line` (their line number in the new file, tracked from the hunk
+/// headers) so the progressive-enhancement layer can anchor an inline comment to a line — with
+/// JavaScript off the standalone inline-comment form still works. Every byte is HTML-escaped.
 fn render_diff(diff: &str) -> String {
     let text = diff.strip_suffix('\n').unwrap_or(diff);
-    let mut rows = String::new();
+
+    // Group into files. A new file starts at a `diff --git ` line; any preamble before the first
+    // such line forms an initial unnamed group so nothing is ever dropped.
+    let mut files: Vec<DiffFile> = Vec::new();
     for raw in text.split('\n') {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let line = raw.strip_suffix('\r').unwrap_or(raw).to_string();
+        if line.starts_with("diff --git ") {
+            files.push(DiffFile {
+                path: path_from_diff_header(&line),
+                lines: vec![line],
+            });
+        } else {
+            if files.is_empty() {
+                files.push(DiffFile {
+                    path: String::new(),
+                    lines: Vec::new(),
+                });
+            }
+            let f = files.last_mut().expect("a file group exists");
+            if f.path.is_empty() {
+                if let Some(p) = path_from_plus_header(&line) {
+                    f.path = p;
+                }
+            }
+            f.lines.push(line);
+        }
+    }
+
+    let mut out = String::from("<div class=\"diff-toolbar\" data-diff-toolbar></div><div class=\"diff-files\">");
+    for f in &files {
+        out.push_str(&render_diff_file(f));
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// Render one file block: a `<details>` with the file path + add/del counts in its summary, then the
+/// line-classified table.
+fn render_diff_file(file: &DiffFile) -> String {
+    let mut rows = String::new();
+    let mut new_line: Option<i64> = None; // current line number in the new file (inside a hunk)
+    let mut adds = 0i64;
+    let mut dels = 0i64;
+    for line in &file.lines {
         let (row_cls, gutter) = classify_diff_line(line);
+        let mut attr = String::new();
+        if line.starts_with("@@") {
+            new_line = parse_hunk_new_start(line);
+        } else if row_cls == "diff-row--add" {
+            adds += 1;
+            if let Some(n) = new_line {
+                attr = format!(" data-line=\"{n}\"");
+                new_line = Some(n + 1);
+            }
+        } else if row_cls == "diff-row--ctx" {
+            if let Some(n) = new_line {
+                attr = format!(" data-line=\"{n}\"");
+                new_line = Some(n + 1);
+            }
+        } else if row_cls == "diff-row--del" {
+            dels += 1;
+        }
         rows.push_str(&format!(
-            "<tr class=\"diff-row {row_cls}\">\
+            "<tr class=\"diff-row {row_cls}\"{attr}>\
                <td class=\"diff-gutter\">{gutter}</td>\
                <td class=\"diff-code\">{code}</td>\
              </tr>",
             row_cls = row_cls,
+            attr = attr,
             gutter = gutter,
             code = esc(line),
         ));
     }
-    format!("<table class=\"diff\"><tbody>{rows}</tbody></table>")
+    let display = if file.path.is_empty() {
+        "changed file".to_string()
+    } else {
+        file.path.clone()
+    };
+    format!(
+        "<details class=\"diff-file\" data-path=\"{path}\" open>\
+           <summary class=\"diff-file__summary\">\
+             <span class=\"diff-file__path\">{path}</span>\
+             <span class=\"diff-file__stat\"><span class=\"diff-add\">+{adds}</span> <span class=\"diff-del\">-{dels}</span></span>\
+           </summary>\
+           <table class=\"diff\"><tbody>{rows}</tbody></table>\
+         </details>",
+        path = esc(&display),
+        adds = adds,
+        dels = dels,
+        rows = rows,
+    )
+}
+
+/// Extract the new-file path from a `diff --git a/x b/y` header (the `b/` side; the post-change name).
+fn path_from_diff_header(line: &str) -> String {
+    line.split_whitespace()
+        .last()
+        .map(|s| s.strip_prefix("b/").unwrap_or(s).to_string())
+        .unwrap_or_default()
+}
+
+/// Extract the new-file path from a `+++ b/path` header (ignoring `/dev/null` deletions).
+fn path_from_plus_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("+++ ")?;
+    let rest = rest.strip_prefix("b/").unwrap_or(rest).trim();
+    if rest.is_empty() || rest == "/dev/null" {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Parse the new-file starting line from a `@@ -a,b +c,d @@` hunk header (returns `c`).
+fn parse_hunk_new_start(line: &str) -> Option<i64> {
+    let plus = line.split_whitespace().find(|t| t.starts_with('+'))?;
+    plus.trim_start_matches('+')
+        .split(',')
+        .next()?
+        .parse::<i64>()
+        .ok()
 }
 
 /// Classify one diff line → (row CSS class, single-char gutter). File-header lines (`diff`,

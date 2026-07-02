@@ -9,8 +9,8 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
-use axum::Form;
+use axum::response::{IntoResponse, Response};
+use axum::{Form, Json};
 use serde::Deserialize;
 
 use crate::auth::{self, Identity};
@@ -509,13 +509,54 @@ pub async fn toggle(
     Path((owner, name, number)): Path<(String, String, i64)>,
     Form(form): Form<ToggleForm>,
 ) -> Result<Response, AppError> {
-    if !auth::verify_csrf(&headers, &form.csrf_token) {
+    apply_issue_toggle(&state, &headers, &owner, &name, number, &form).await?;
+    Ok(redirect(&format!("/r/{owner}/{name}/issues/{number}")))
+}
+
+/// JSON sibling of [`toggle`] backing the optimistic, no-reload open/close control on the issue
+/// page. Same CSRF (double-submit), same author/owner/admin gate, same audit; returns the new state
+/// plus the badge/button labels the page should show. The form route above is unchanged for no-JS
+/// clients (progressive enhancement).
+pub async fn toggle_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    Form(form): Form<ToggleForm>,
+) -> Result<Response, AppError> {
+    let next = apply_issue_toggle(&state, &headers, &owner, &name, number, &form).await?;
+    let (badge_class, badge_label, button_label, message) = if next == "closed" {
+        ("state-badge--closed", "Closed", "Reopen issue", "Issue closed")
+    } else {
+        ("state-badge--open", "Open", "Close issue", "Issue reopened")
+    };
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "state": next,
+        "badge_class": badge_class,
+        "badge_label": badge_label,
+        "button_label": button_label,
+        "message": message,
+    }))
+    .into_response())
+}
+
+/// Shared core for both issue-toggle routes: CSRF-check, load + authorize, flip the state, audit.
+/// Returns the new state (`"open"` / `"closed"`).
+async fn apply_issue_toggle(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    number: i64,
+    form: &ToggleForm,
+) -> Result<&'static str, AppError> {
+    if !auth::verify_csrf(headers, &form.csrf_token) {
         return Err(AppError::BadRequest(
             "Your session token expired. Reload the page and try again.".to_string(),
         ));
     }
-    let who = auth::identity(&headers);
-    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let who = auth::identity(headers);
+    let repo = load_visible_repo(state, &who, owner, name).await?;
 
     let issue = state
         .store
@@ -524,7 +565,7 @@ pub async fn toggle(
         .ok_or_else(|| AppError::NotFound("No such issue.".to_string()))?;
 
     // Only the issue author, the repo owner, or an estate admin may change an issue's state.
-    if !can_moderate(&repo, &issue, &who, &headers) {
+    if !can_moderate(&repo, &issue, &who, headers) {
         return Err(AppError::Forbidden(
             "Only the issue author, the repository owner, or an administrator can change this issue."
                 .to_string(),
@@ -543,7 +584,7 @@ pub async fn toggle(
         actor = who.subject,
         "issue toggled"
     );
-    Ok(redirect(&format!("/r/{owner}/{name}/issues/{number}")))
+    Ok(next)
 }
 
 // ===========================================================================
@@ -614,10 +655,21 @@ async fn render_list(
         all_count,
     );
     let filters =
-        render_metadata_filters(repo, &labels, &milestones, label_filter, milestone_filter);
+        render_metadata_filters(repo, &labels, &milestones, filter, label_filter, milestone_filter);
 
     let list = if issues.is_empty() {
-        "<li class=\"issue-item issue-item--empty\">No issues to show.</li>".to_string()
+        format!(
+            "<li class=\"issue-item issue-item--empty\">\
+               <div class=\"empty\">\
+                 <svg class=\"empty__icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 8v4M12 16h.01\"/></svg>\
+                 <div class=\"empty__title\">No issues to show</div>\
+                 <div class=\"empty__text\">Nothing matches this view yet. Open one from the form, or clear the filters.</div>\
+                 <a class=\"btn btn-secondary btn-sm\" href=\"/r/{owner}/{name}/issues\">View all issues</a>\
+               </div>\
+             </li>",
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+        )
     } else {
         issues
             .iter()
@@ -730,16 +782,18 @@ fn render_metadata_filters(
     repo: &Repo,
     labels: &[Label],
     milestones: &[Milestone],
+    filter: &str,
     label_filter: &str,
     milestone_filter: &str,
 ) -> String {
     if labels.is_empty() && milestones.is_empty() {
         return String::new();
     }
+    let chips = render_label_filter_chips(repo, labels, filter, label_filter, milestone_filter);
     let label_opts = render_label_options(labels, label_filter, "All labels");
     let milestone_opts = render_milestone_options(milestones, milestone_filter, "All milestones");
     format!(
-        r##"<form method="get" action="/r/{owner}/{name}/issues" class="compare-picker">
+        r##"{chips}<form method="get" action="/r/{owner}/{name}/issues" class="compare-picker">
   <input type="hidden" name="state" value="">
   <span class="compare-picker__label">label</span>
   <select name="label" class="compare-picker__select">{label_opts}</select>
@@ -747,10 +801,55 @@ fn render_metadata_filters(
   <select name="milestone" class="compare-picker__select">{milestone_opts}</select>
   <button class="btn btn-secondary btn-sm" type="submit">Filter</button>
 </form>"##,
+        chips = chips,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         label_opts = label_opts,
         milestone_opts = milestone_opts,
+    )
+}
+
+/// One-tap **filter chips** for the issue list: an "All" chip that clears the label filter plus one
+/// chip per label (the active label marked). Each links to the list preserving the state + milestone
+/// filters, so filtering is a single click — the `<select>` filter form below remains for no-JS/
+/// keyboard-form users.
+fn render_label_filter_chips(
+    repo: &Repo,
+    labels: &[Label],
+    filter: &str,
+    label_filter: &str,
+    milestone_filter: &str,
+) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let all_active = if label_filter.is_empty() {
+        " filter-chip--active"
+    } else {
+        ""
+    };
+    let mut chips = format!(
+        "<a class=\"filter-chip{all_active}\" href=\"{href}\">All</a>",
+        all_active = all_active,
+        href = list_url(&repo.owner_sub, &repo.name, filter, "", milestone_filter, 1),
+    );
+    for label in labels {
+        let active = if label.id == label_filter {
+            " filter-chip--active"
+        } else {
+            ""
+        };
+        chips.push_str(&format!(
+            "<a class=\"filter-chip{active}\" style=\"--label-color: #{color}\" href=\"{href}\">{name}</a>",
+            active = active,
+            color = esc(&label.color),
+            href = list_url(&repo.owner_sub, &repo.name, filter, &label.id, milestone_filter, 1),
+            name = esc(&label.name),
+        ));
+    }
+    format!(
+        "<div class=\"chip-row\" role=\"list\" aria-label=\"Filter issues by label\">{chips}</div>",
+        chips = chips,
     )
 }
 
@@ -1025,7 +1124,7 @@ fn render_detail(
         <button class="btn btn-secondary" type="submit">Save metadata</button>
       </div>
     </form>
-    <form class="inline-form" method="post" action="/r/{owner}/{name}/issues/{number}/toggle">
+    <form class="inline-form" method="post" action="/r/{owner}/{name}/issues/{number}/toggle" data-json>
       <input type="hidden" name="csrf_token" value="{csrf}">
       <button class="btn btn-secondary" type="submit">{action_label}</button>
     </form>
@@ -1046,7 +1145,7 @@ fn render_detail(
         r##"{header}
 <div class="console__head">
   <div class="repo-title">
-    <span class="state-badge {cls}">{label}</span>
+    <span class="state-badge {cls}" id="state-badge-main">{label}</span>
     <h1 class="issue-title">#{number} {title}</h1>
   </div>
   <p class="sub">opened {when} by {author}{updated}</p>

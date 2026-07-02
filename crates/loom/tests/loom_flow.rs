@@ -1611,3 +1611,50 @@ async fn smart_http_unknown_repo_is_404() {
     .await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
 }
+
+/// The additive JSON sibling of the issue open/close form backs the optimistic, no-reload toggle.
+/// It shares the CSRF + author/owner/admin gate + audit of the form route (progressive enhancement:
+/// the form route still works with JavaScript off) and returns a small JSON envelope.
+#[tokio::test]
+async fn issue_toggle_json_flips_state_with_same_csrf_gate() {
+    let app = app(temp_state());
+    create_repo(&app, "alice", "proj", "").await;
+    let loc = open_issue(&app, "alice", "alice/proj", "Flaky test", "steps").await;
+    assert_eq!(loc, "/r/alice/proj/issues/1");
+
+    // JSON toggle: 200 + JSON (not a 302), and the state really flips to closed.
+    let page = send(&app, get("/r/alice/proj/issues/1", Some("alice"))).await;
+    let csrf = page.csrf_cookie().unwrap();
+    let toggled = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/toggle.json",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(toggled.status, StatusCode::OK);
+    assert!(toggled.content_type().contains("application/json"));
+    assert!(
+        toggled.body.contains("\"state\":\"closed\""),
+        "json body: {}",
+        toggled.body
+    );
+    let after = send(&app, get("/r/alice/proj/issues/1", Some("alice"))).await;
+    assert!(after.body.contains("Closed"), "issue persisted as closed");
+
+    // Missing/blank CSRF is rejected exactly like the form route.
+    let no_csrf = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/toggle.json",
+            &[("csrf_token", "")],
+            "",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::BAD_REQUEST);
+}

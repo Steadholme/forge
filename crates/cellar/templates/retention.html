@@ -25,7 +25,7 @@
 
     {{NOTICE}}
 
-    {{PREVIEW}}
+    <div id="retention-preview">{{PREVIEW}}</div>
 
     <div class="card">
       <div class="card__head"><h2>Add a keep-rule</h2></div>
@@ -74,7 +74,7 @@
     </div>
 
     <div class="actions" style="margin-top:22px">
-      <form method="post" action="/admin/retention/preview">
+      <form method="post" action="/admin/retention/preview" data-preview>
         <input type="hidden" name="csrf_token" value="{{CSRF}}">
         <button class="btn btn-ghost" type="submit">Preview deletions</button>
       </form>
@@ -90,5 +90,6 @@
     <span>HOLDFAST · Cellar</span>
     <span>Container registry · part of the HOLDFAST estate</span>
   </footer>
+  <script>{{JS}}</script>
 </body>
 </html>

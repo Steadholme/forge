@@ -113,6 +113,12 @@ pub fn app(state: AppState) -> Router {
             "/r/{owner}/{name}/issues/{number}/toggle",
             post(handlers::issues::toggle),
         )
+        // JSON sibling of the toggle form (optimistic, no-reload open/close). Progressive
+        // enhancement: the form route above still works with JavaScript off.
+        .route(
+            "/r/{owner}/{name}/issues/{number}/toggle.json",
+            post(handlers::issues::toggle_json),
+        )
         .route("/r/{owner}/{name}/compare", get(handlers::pulls::compare))
         .route(
             "/r/{owner}/{name}/pulls",
@@ -133,6 +139,12 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/r/{owner}/{name}/pulls/{number}/inline-comment",
             post(handlers::pulls::inline_comment),
+        )
+        // JSON sibling backing the "click a diff line → comment" affordance (optimistic insert).
+        // Progressive enhancement: the standalone inline-comment form above still works with JS off.
+        .route(
+            "/r/{owner}/{name}/pulls/{number}/inline-comment.json",
+            post(handlers::pulls::inline_comment_json),
         )
         .route(
             "/r/{owner}/{name}/pulls/{number}/metadata",
