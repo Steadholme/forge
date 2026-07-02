@@ -4,9 +4,9 @@
 //! browser OIDC/cookie SSO — so Loom does its OWN HTTP Basic auth here against a Personal Access
 //! Token (username = anything, password = the PAT, verified by SHA-256 against `pats.token_hash`):
 //!
-//! - PUSH (`git-receive-pack`): ALWAYS requires a valid PAT owned by the repo owner.
+//! - PUSH (`git-receive-pack`): ALWAYS requires a valid PAT owned by the repo owner or a writer.
 //! - FETCH (`git-upload-pack`) of a PUBLIC repo: allowed anonymously.
-//! - FETCH of a PRIVATE repo: requires a valid PAT owned by the repo owner.
+//! - FETCH of a PRIVATE repo: requires a valid PAT owned by the repo owner or collaborator.
 //!
 //! Missing/invalid credentials get `401 WWW-Authenticate: Basic`; a valid token for the wrong
 //! owner gets `403`. The protocol itself is served by invoking `git http-backend` as a CGI (see
@@ -20,7 +20,7 @@ use axum::response::IntoResponse;
 
 use crate::auth;
 use crate::gitops::CgiOut;
-use crate::model::Pat;
+use crate::model::{repo_role_rank, Pat, Repo};
 use crate::webhooks;
 use crate::AppState;
 
@@ -68,15 +68,25 @@ pub async fn handle(
     let mut remote_user: Option<String> = None;
     if needs_auth {
         match resolve_pat(&state, &headers).await {
-            Some(pat) if pat.owner_sub == repo.owner_sub => {
+            Some(pat) => {
+                let actor_rank = match git_actor_rank(&state, &repo, &pat.owner_sub).await {
+                    Ok(rank) => rank,
+                    Err(e) => {
+                        tracing::error!(error = %e, "store error checking smart-http access");
+                        return text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+                    }
+                };
+                let required_rank = match op {
+                    GitOp::Fetch => repo_role_rank("read"),
+                    GitOp::Push => repo_role_rank("write"),
+                };
+                if actor_rank < required_rank {
+                    return text_response(
+                        StatusCode::FORBIDDEN,
+                        "this token cannot access this repository",
+                    );
+                }
                 remote_user = Some(pat.owner_sub.clone());
-            }
-            Some(_) => {
-                // Valid token, but it does not own this repository.
-                return text_response(
-                    StatusCode::FORBIDDEN,
-                    "this token cannot access this repository",
-                );
             }
             None => return unauthorized(),
         }
@@ -184,6 +194,23 @@ async fn resolve_pat(state: &AppState, headers: &HeaderMap) -> Option<Pat> {
     }
     let hash = auth::hash_token(&password);
     state.store.find_pat_by_hash(&hash).await.ok().flatten()
+}
+
+async fn git_actor_rank(
+    state: &AppState,
+    repo: &Repo,
+    actor_sub: &str,
+) -> Result<i64, crate::store::StoreError> {
+    if actor_sub == repo.owner_sub {
+        return Ok(repo_role_rank("admin"));
+    }
+    Ok(state
+        .store
+        .repo_collaborator_role(&repo.id, actor_sub)
+        .await?
+        .as_deref()
+        .map(repo_role_rank)
+        .unwrap_or(0))
 }
 
 /// Translate the parsed CGI output into an axum response, forwarding git's headers verbatim.

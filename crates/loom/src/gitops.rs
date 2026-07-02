@@ -13,7 +13,7 @@
 //! translate the CGI header block into an axum response.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -237,8 +237,18 @@ impl GitOps {
 
     /// Best-effort removal of a repo's on-disk directory (rollback when DB insert/`init` fails).
     pub async fn remove_repo(&self, owner: &str, name: &str) {
-        let path = self.repo_path(owner, name);
-        let _ = tokio::fs::remove_dir_all(path).await;
+        let _ = self.delete_repo_dir(owner, name).await;
+    }
+
+    /// Remove a repo's on-disk directory after validating that the computed path stays under the
+    /// configured repos root.
+    pub async fn delete_repo_dir(&self, owner: &str, name: &str) -> std::io::Result<()> {
+        let path = self.safe_repo_path(owner, name)?;
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Fork a repository by cloning the source bare repo into a new bare repo path. The caller
@@ -262,6 +272,24 @@ impl GitOps {
         self.run_git_in(&dst_str, &["config", "http.receivepack", "true"])
             .await?;
         Ok(())
+    }
+
+    fn safe_repo_path(&self, owner: &str, name: &str) -> std::io::Result<PathBuf> {
+        if !safe_path_segment(owner) || !safe_path_segment(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe repository path segment",
+            ));
+        }
+        let root = PathBuf::from(&self.repos_root);
+        let path = self.repo_path(owner, name);
+        if !path.starts_with(&root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "repository path escapes repos root",
+            ));
+        }
+        Ok(path)
     }
 
     /// Resolve the default-branch HEAD to a commit OID, or `None` when the repo has no commits
@@ -1662,6 +1690,14 @@ fn parse_cgi(raw: &[u8]) -> CgiOut {
     }
 }
 
+fn safe_path_segment(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 /// Return `(header_bytes, body_bytes)` splitting at the first CRLFCRLF or LFLF.
 fn split_headers(raw: &[u8]) -> (&[u8], &[u8]) {
     if let Some(pos) = find_subslice(raw, b"\r\n\r\n") {
@@ -1684,6 +1720,16 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_path_segment_rejects_traversal() {
+        assert!(safe_path_segment("alice"));
+        assert!(safe_path_segment("repo.name"));
+        assert!(!safe_path_segment(""));
+        assert!(!safe_path_segment(".."));
+        assert!(!safe_path_segment("."));
+        assert!(!safe_path_segment("alice/repo"));
+    }
 
     #[test]
     fn ls_tree_parses_and_orders() {

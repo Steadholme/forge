@@ -2927,6 +2927,165 @@ async fn settings_guarded_and_default_branch_validated() {
 }
 
 #[tokio::test]
+async fn settings_collaborators_and_owner_only_delete() {
+    let state = temp_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+
+    let owner_settings = send(&app, get("/r/alice/proj/settings", Some("alice"))).await;
+    assert_eq!(owner_settings.status, StatusCode::OK);
+    assert!(owner_settings.body.contains("collaborator-list"));
+    assert!(owner_settings.body.contains("danger-zone"));
+    assert!(owner_settings.body.contains("btn-delete-repo"));
+    let owner_csrf = owner_settings.csrf_cookie().expect("csrf on settings");
+
+    let bad_role = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/collaborators",
+            &[
+                ("csrf_token", &owner_csrf),
+                ("user_sub", "bob"),
+                ("role", "superuser"),
+            ],
+            &owner_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(bad_role.status, StatusCode::BAD_REQUEST);
+
+    let added = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/collaborators",
+            &[
+                ("csrf_token", &owner_csrf),
+                ("user_sub", "bob"),
+                ("role", "admin"),
+            ],
+            &owner_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(added.status, StatusCode::FOUND);
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    assert_eq!(
+        store
+            .repo_collaborator_role(&repo.id, "bob")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("admin")
+    );
+
+    let bob_settings = send(&app, get("/r/alice/proj/settings", Some("bob"))).await;
+    assert_eq!(
+        bob_settings.status,
+        StatusCode::OK,
+        "repo admin collaborator can open settings"
+    );
+    assert!(bob_settings.body.contains("Collaborators"));
+    assert!(!bob_settings.body.contains("btn-delete-repo"));
+    let bob_csrf = bob_settings.csrf_cookie().expect("csrf for bob settings");
+
+    let bob_adds_carol = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/collaborators",
+            &[
+                ("csrf_token", &bob_csrf),
+                ("user_sub", "carol"),
+                ("role", "read"),
+            ],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(bob_adds_carol.status, StatusCode::FOUND);
+
+    let owner_downgrade = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/collaborators/role",
+            &[
+                ("csrf_token", &bob_csrf),
+                ("user_sub", "alice"),
+                ("role", "read"),
+            ],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(owner_downgrade.status, StatusCode::BAD_REQUEST);
+
+    let bob_delete = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/delete",
+            &[("csrf_token", &bob_csrf), ("confirm_name", "proj")],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(bob_delete.status, StatusCode::FORBIDDEN);
+
+    let removed = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/collaborators/remove",
+            &[("csrf_token", &owner_csrf), ("user_sub", "bob")],
+            &owner_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::FOUND);
+    assert!(store
+        .repo_collaborator_role(&repo.id, "bob")
+        .await
+        .unwrap()
+        .is_none());
+    let bob_after_remove = send(&app, get("/r/alice/proj/settings", Some("bob"))).await;
+    assert_eq!(bob_after_remove.status, StatusCode::FORBIDDEN);
+
+    let mismatch = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/delete",
+            &[("csrf_token", &owner_csrf), ("confirm_name", "wrong")],
+            &owner_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(mismatch.status, StatusCode::BAD_REQUEST);
+
+    let repo_dir = git.repo_path("alice", "proj");
+    assert!(repo_dir.exists(), "bare repo exists before delete");
+    let deleted = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/delete",
+            &[("csrf_token", &owner_csrf), ("confirm_name", "proj")],
+            &owner_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::FOUND);
+    assert_eq!(deleted.location(), "/");
+    assert!(store.get_repo("alice", "proj").await.unwrap().is_none());
+    assert!(!repo_dir.exists(), "bare repo directory removed");
+}
+
+#[tokio::test]
 async fn settings_webhooks_crud_and_secret_is_not_echoed() {
     let state = temp_state();
     let store = state.store.clone();
@@ -3139,6 +3298,45 @@ async fn smart_http_private_and_pat_authorization() {
     )
     .await;
     assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    let repo = store.get_repo("alice", "sec").await.unwrap().unwrap();
+    store
+        .upsert_repo_collaborator("rc_bob", &repo.id, "bob", "read", now_secs())
+        .await
+        .unwrap();
+    let bob_read = send(
+        &app,
+        get_basic(
+            "/git/alice/sec.git/info/refs?service=git-upload-pack",
+            &bob_secret,
+        ),
+    )
+    .await;
+    assert_eq!(bob_read.status, StatusCode::OK);
+
+    let bob_read_push = send(
+        &app,
+        get_basic(
+            "/git/alice/sec.git/info/refs?service=git-receive-pack",
+            &bob_secret,
+        ),
+    )
+    .await;
+    assert_eq!(bob_read_push.status, StatusCode::FORBIDDEN);
+
+    store
+        .update_repo_collaborator_role(&repo.id, "bob", "write")
+        .await
+        .unwrap();
+    let bob_write_push = send(
+        &app,
+        get_basic(
+            "/git/alice/sec.git/info/refs?service=git-receive-pack",
+            &bob_secret,
+        ),
+    )
+    .await;
+    assert_eq!(bob_write_push.status, StatusCode::OK);
 
     // A bogus token -> 401.
     let bogus = send(

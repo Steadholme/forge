@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::AppError;
-use crate::handlers::repos::{load_visible_repo, render_repo_header};
+use crate::handlers::repos::{can_write_repo, load_visible_repo, render_repo_header};
 use crate::handlers::{
     accepts_json, esc, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
     reaction_summaries_json, redirect, render_reactions, REACTION_TARGET_COMMENT,
@@ -53,10 +53,16 @@ fn normalize_filter(raw: Option<&str>) -> &'static str {
     }
 }
 
-/// True when `who` may change an issue's state: the issue author, the repo owner, or an estate
+/// True when `who` may change issue metadata/state: the issue author, a repo writer, or an estate
 /// admin (group-based). Admin membership is read from the HMAC-verified `X-Auth-Groups` header.
-fn can_moderate(repo: &Repo, issue: &Issue, who: &Identity, headers: &HeaderMap) -> bool {
-    issue.author_sub == who.subject || repo.owner_sub == who.subject || auth::is_admin(headers)
+async fn can_moderate(
+    state: &AppState,
+    repo: &Repo,
+    issue: &Issue,
+    who: &Identity,
+    headers: &HeaderMap,
+) -> Result<bool, AppError> {
+    Ok(issue.author_sub == who.subject || can_write_repo(state, repo, who, headers).await?)
 }
 
 fn truncate_notify(s: &str, max: usize) -> String {
@@ -409,7 +415,7 @@ pub async fn detail(
         load_issue_reactions(&state, &issue, &comments, &who.subject).await?;
     let csrf = auth::new_csrf_token();
 
-    let can_toggle = can_moderate(&repo, &issue, &who, &headers);
+    let can_toggle = can_moderate(&state, &repo, &issue, &who, &headers).await?;
     let header = issue_header(&state, &repo).await;
     let body = render_detail(
         &repo,
@@ -477,7 +483,7 @@ pub async fn comment(
         let milestones = state.store.list_milestones(&repo.id).await?;
         let (issue_reactions, comment_reactions) =
             load_issue_reactions(&state, &issue, &comments, &who.subject).await?;
-        let can_toggle = can_moderate(&repo, &issue, &who, &headers);
+        let can_toggle = can_moderate(&state, &repo, &issue, &who, &headers).await?;
         let header = issue_header(&state, &repo).await;
         let body = render_detail(
             &repo,
@@ -725,7 +731,7 @@ pub async fn metadata(
         .get_issue(&repo.id, number)
         .await?
         .ok_or_else(|| AppError::NotFound("No such issue.".to_string()))?;
-    if !can_moderate(&repo, &issue, &who, &headers) {
+    if !can_moderate(&state, &repo, &issue, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the issue author, the repository owner, or an administrator can edit metadata."
                 .to_string(),
@@ -832,7 +838,7 @@ async fn apply_issue_toggle(
         .ok_or_else(|| AppError::NotFound("No such issue.".to_string()))?;
 
     // Only the issue author, the repo owner, or an estate admin may change an issue's state.
-    if !can_moderate(&repo, &issue, &who, headers) {
+    if !can_moderate(state, &repo, &issue, &who, headers).await? {
         return Err(AppError::Forbidden(
             "Only the issue author, the repository owner, or an administrator can change this issue."
                 .to_string(),

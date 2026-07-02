@@ -132,6 +132,22 @@ pub fn app(state: AppState) -> Router {
             post(handlers::settings::create_label),
         )
         .route(
+            "/r/{owner}/{name}/settings/collaborators",
+            post(handlers::settings::add_collaborator),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/collaborators/role",
+            post(handlers::settings::update_collaborator_role),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/collaborators/remove",
+            post(handlers::settings::remove_collaborator),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/delete",
+            post(handlers::settings::delete_repository),
+        )
+        .route(
             "/r/{owner}/{name}/settings/webhooks",
             post(handlers::settings::create_webhook),
         )

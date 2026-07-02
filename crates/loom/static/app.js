@@ -417,6 +417,21 @@
     });
   }
 
+  // --- Destructive confirmation gates -------------------------------------
+  function initDeleteConfirm() {
+    document.querySelectorAll("form[data-delete-confirm]").forEach(function (form) {
+      var expected = form.getAttribute("data-delete-confirm") || "";
+      var input = form.querySelector("[data-delete-confirm-input]");
+      var button = form.querySelector("[data-delete-confirm-button]");
+      if (!input || !button) return;
+      function update() {
+        button.disabled = input.value !== expected;
+      }
+      update();
+      input.addEventListener("input", update);
+    });
+  }
+
   function init() {
     initCopy();
     initSort();
@@ -426,6 +441,7 @@
     initInlineComments();
     initToggleForms();
     initCharCounters();
+    initDeleteConfirm();
   }
 
   if (document.readyState === "loading") {

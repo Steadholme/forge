@@ -33,6 +33,43 @@ pub struct Repo {
     pub created_at: i64,
 }
 
+/// A user granted explicit access to one repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoCollaborator {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id.
+    pub repo_id: String,
+    /// Collaborator subject from `X-Auth-Subject`.
+    pub user_sub: String,
+    /// One of `read`, `write`, or `admin`.
+    pub role: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+}
+
+pub const REPO_ROLE_READ: &str = "read";
+pub const REPO_ROLE_WRITE: &str = "write";
+pub const REPO_ROLE_ADMIN: &str = "admin";
+
+pub fn normalize_repo_role(raw: &str) -> Option<&'static str> {
+    match raw.trim() {
+        REPO_ROLE_READ => Some(REPO_ROLE_READ),
+        REPO_ROLE_WRITE => Some(REPO_ROLE_WRITE),
+        REPO_ROLE_ADMIN => Some(REPO_ROLE_ADMIN),
+        _ => None,
+    }
+}
+
+pub fn repo_role_rank(role: &str) -> i64 {
+    match role {
+        REPO_ROLE_ADMIN => 3,
+        REPO_ROLE_WRITE => 2,
+        REPO_ROLE_READ => 1,
+        _ => 0,
+    }
+}
+
 /// A release attached to one repository tag. Field order/types mirror the `releases` table exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {

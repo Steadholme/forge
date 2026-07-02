@@ -22,7 +22,8 @@ use thiserror::Error;
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
     CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, PrThreadResolved, Pull,
-    PullReview, PullReviewComment, Reaction, ReactionSummary, Release, Repo, Webhook,
+    PullReview, PullReviewComment, Reaction, ReactionSummary, Release, Repo, RepoCollaborator,
+    Webhook,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -68,8 +69,8 @@ pub trait Store: Send + Sync {
     /// Fetch a repo by its `(owner_sub, name)` natural key.
     async fn get_repo(&self, owner_sub: &str, name: &str) -> Result<Option<Repo>, StoreError>;
 
-    /// Repos visible to `viewer_sub`: every public repo plus the viewer's own private repos,
-    /// newest-first, capped at [`REPO_LIST_LIMIT`].
+    /// Repos visible to `viewer_sub`: every public repo plus the viewer's own private repos and
+    /// repos where the viewer is a collaborator, newest-first, capped at [`REPO_LIST_LIMIT`].
     async fn list_visible_repos(&self, viewer_sub: &str) -> Result<Vec<Repo>, StoreError>;
 
     /// Delete a repo row by id (used to roll back a half-created repo when `git init` fails).
@@ -89,6 +90,48 @@ pub trait Store: Send + Sync {
 
     /// Fetch a repo by opaque id (used for fork attribution links).
     async fn get_repo_by_id(&self, id: &str) -> Result<Option<Repo>, StoreError>;
+
+    /// Best-effort metadata cleanup for a user-requested repository delete.
+    async fn delete_repo_cascade(&self, repo_id: &str) -> Result<bool, StoreError>;
+
+    // --- repo collaborators -------------------------------------------------
+    /// All explicit collaborators on a repo, sorted by subject.
+    async fn list_repo_collaborators(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<RepoCollaborator>, StoreError>;
+
+    /// Add a collaborator or update its role. Returns the stored row.
+    async fn upsert_repo_collaborator(
+        &self,
+        id: &str,
+        repo_id: &str,
+        user_sub: &str,
+        role: &str,
+        created_at: i64,
+    ) -> Result<RepoCollaborator, StoreError>;
+
+    /// Update a collaborator role by repo + subject. Returns whether a row changed.
+    async fn update_repo_collaborator_role(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+        role: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Remove a collaborator by repo + subject. Returns whether a row was removed.
+    async fn remove_repo_collaborator(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Explicit collaborator role for one user on one repo, if present.
+    async fn repo_collaborator_role(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+    ) -> Result<Option<String>, StoreError>;
 
     // --- releases ------------------------------------------------------------
     /// Create a release. Returns `Ok(None)` when the repo already has a release for the tag.
@@ -488,6 +531,7 @@ pub trait Store: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryStore {
     repos: Mutex<Vec<Repo>>,
+    repo_collaborators: Mutex<Vec<RepoCollaborator>>,
     releases: Mutex<Vec<Release>>,
     issues: Mutex<Vec<Issue>>,
     issue_comments: Mutex<Vec<IssueComment>>,
@@ -536,9 +580,19 @@ impl Store for InMemoryStore {
 
     async fn list_visible_repos(&self, viewer_sub: &str) -> Result<Vec<Repo>, StoreError> {
         let repos = self.repos.lock().expect("repos lock poisoned");
+        let collaborators = self
+            .repo_collaborators
+            .lock()
+            .expect("repo_collaborators lock poisoned");
         let mut out: Vec<Repo> = repos
             .iter()
-            .filter(|r| !r.is_private || r.owner_sub == viewer_sub)
+            .filter(|r| {
+                !r.is_private
+                    || r.owner_sub == viewer_sub
+                    || collaborators
+                        .iter()
+                        .any(|c| c.repo_id == r.id && c.user_sub == viewer_sub)
+            })
             .cloned()
             .collect();
         out.sort_by(|a, b| {
@@ -585,6 +639,240 @@ impl Store for InMemoryStore {
     async fn get_repo_by_id(&self, id: &str) -> Result<Option<Repo>, StoreError> {
         let repos = self.repos.lock().expect("repos lock poisoned");
         Ok(repos.iter().find(|r| r.id == id).cloned())
+    }
+
+    async fn delete_repo_cascade(&self, repo_id: &str) -> Result<bool, StoreError> {
+        let removed = self.delete_repo(repo_id).await?;
+        if !removed {
+            return Ok(false);
+        }
+
+        self.repo_collaborators
+            .lock()
+            .expect("repo_collaborators lock poisoned")
+            .retain(|c| c.repo_id != repo_id);
+        self.releases
+            .lock()
+            .expect("releases lock poisoned")
+            .retain(|r| r.repo_id != repo_id);
+        self.commit_statuses
+            .lock()
+            .expect("commit_statuses lock poisoned")
+            .retain(|s| s.repo_id != repo_id);
+        self.webhooks
+            .lock()
+            .expect("webhooks lock poisoned")
+            .retain(|w| w.repo_id != repo_id);
+
+        let issue_ids: Vec<String> = {
+            let mut issues = self.issues.lock().expect("issues lock poisoned");
+            let ids = issues
+                .iter()
+                .filter(|i| i.repo_id == repo_id)
+                .map(|i| i.id.clone())
+                .collect::<Vec<_>>();
+            issues.retain(|i| i.repo_id != repo_id);
+            ids
+        };
+        let issue_comment_ids: Vec<String> = {
+            let mut comments = self
+                .issue_comments
+                .lock()
+                .expect("issue_comments lock poisoned");
+            let ids = comments
+                .iter()
+                .filter(|c| issue_ids.iter().any(|id| id == &c.issue_id))
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>();
+            comments.retain(|c| !issue_ids.iter().any(|id| id == &c.issue_id));
+            ids
+        };
+
+        let pull_ids: Vec<String> = {
+            let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
+            let ids = pulls
+                .iter()
+                .filter(|p| p.repo_id == repo_id)
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>();
+            pulls.retain(|p| p.repo_id != repo_id);
+            ids
+        };
+        let review_ids: Vec<String> = {
+            let mut reviews = self
+                .pull_reviews
+                .lock()
+                .expect("pull_reviews lock poisoned");
+            let ids = reviews
+                .iter()
+                .filter(|r| pull_ids.iter().any(|id| id == &r.pull_id))
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>();
+            reviews.retain(|r| !pull_ids.iter().any(|id| id == &r.pull_id));
+            ids
+        };
+        let review_comment_ids: Vec<String> = {
+            let mut comments = self
+                .pull_review_comments
+                .lock()
+                .expect("pull_review_comments lock poisoned");
+            let ids = comments
+                .iter()
+                .filter(|c| pull_ids.iter().any(|id| id == &c.pull_id))
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>();
+            comments.retain(|c| !pull_ids.iter().any(|id| id == &c.pull_id));
+            ids
+        };
+        self.pr_file_viewed
+            .lock()
+            .expect("pr_file_viewed lock poisoned")
+            .retain(|row| !pull_ids.iter().any(|id| id == &row.pr_id));
+        self.pr_thread_resolved
+            .lock()
+            .expect("pr_thread_resolved lock poisoned")
+            .retain(|row| !pull_ids.iter().any(|id| id == &row.pr_id));
+
+        let label_ids: Vec<String> = {
+            let mut labels = self.labels.lock().expect("labels lock poisoned");
+            let ids = labels
+                .iter()
+                .filter(|l| l.repo_id == repo_id)
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>();
+            labels.retain(|l| l.repo_id != repo_id);
+            ids
+        };
+        self.milestones
+            .lock()
+            .expect("milestones lock poisoned")
+            .retain(|m| m.repo_id != repo_id);
+        self.issue_labels
+            .lock()
+            .expect("issue_labels lock poisoned")
+            .retain(|(issue_id, label_id)| {
+                !issue_ids.iter().any(|id| id == issue_id)
+                    && !label_ids.iter().any(|id| id == label_id)
+            });
+        self.pull_labels
+            .lock()
+            .expect("pull_labels lock poisoned")
+            .retain(|(pull_id, label_id)| {
+                !pull_ids.iter().any(|id| id == pull_id)
+                    && !label_ids.iter().any(|id| id == label_id)
+            });
+
+        self.reactions
+            .lock()
+            .expect("reactions lock poisoned")
+            .retain(|r| {
+                !issue_ids.iter().any(|id| id == &r.target_id)
+                    && !issue_comment_ids.iter().any(|id| id == &r.target_id)
+                    && !pull_ids.iter().any(|id| id == &r.target_id)
+                    && !review_ids.iter().any(|id| id == &r.target_id)
+                    && !review_comment_ids.iter().any(|id| id == &r.target_id)
+            });
+
+        Ok(true)
+    }
+
+    async fn list_repo_collaborators(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<RepoCollaborator>, StoreError> {
+        let collaborators = self
+            .repo_collaborators
+            .lock()
+            .expect("repo_collaborators lock poisoned");
+        let mut out: Vec<RepoCollaborator> = collaborators
+            .iter()
+            .filter(|c| c.repo_id == repo_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.user_sub
+                .cmp(&b.user_sub)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        Ok(out)
+    }
+
+    async fn upsert_repo_collaborator(
+        &self,
+        id: &str,
+        repo_id: &str,
+        user_sub: &str,
+        role: &str,
+        created_at: i64,
+    ) -> Result<RepoCollaborator, StoreError> {
+        let mut collaborators = self
+            .repo_collaborators
+            .lock()
+            .expect("repo_collaborators lock poisoned");
+        if let Some(existing) = collaborators
+            .iter_mut()
+            .find(|c| c.repo_id == repo_id && c.user_sub == user_sub)
+        {
+            existing.role = role.to_string();
+            return Ok(existing.clone());
+        }
+        let collaborator = RepoCollaborator {
+            id: id.to_string(),
+            repo_id: repo_id.to_string(),
+            user_sub: user_sub.to_string(),
+            role: role.to_string(),
+            created_at,
+        };
+        collaborators.push(collaborator.clone());
+        Ok(collaborator)
+    }
+
+    async fn update_repo_collaborator_role(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+        role: &str,
+    ) -> Result<bool, StoreError> {
+        let mut collaborators = self
+            .repo_collaborators
+            .lock()
+            .expect("repo_collaborators lock poisoned");
+        for c in collaborators.iter_mut() {
+            if c.repo_id == repo_id && c.user_sub == user_sub {
+                c.role = role.to_string();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn remove_repo_collaborator(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+    ) -> Result<bool, StoreError> {
+        let mut collaborators = self
+            .repo_collaborators
+            .lock()
+            .expect("repo_collaborators lock poisoned");
+        let before = collaborators.len();
+        collaborators.retain(|c| !(c.repo_id == repo_id && c.user_sub == user_sub));
+        Ok(collaborators.len() != before)
+    }
+
+    async fn repo_collaborator_role(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let collaborators = self
+            .repo_collaborators
+            .lock()
+            .expect("repo_collaborators lock poisoned");
+        Ok(collaborators
+            .iter()
+            .find(|c| c.repo_id == repo_id && c.user_sub == user_sub)
+            .map(|c| c.role.clone()))
     }
 
     async fn create_release(&self, release: &Release) -> Result<Option<Release>, StoreError> {
@@ -1731,6 +2019,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 const REPO_COLS: &str = "id, owner_sub, name, description, is_private, default_branch, require_approval, required_approvals, require_code_owner_reviews, protect_default_branch, forked_from_id, created_at";
+const REPO_COLLABORATOR_COLS: &str = "id, repo_id, user_sub, role, created_at";
 const RELEASE_COLS: &str = "id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, created_by, created_at, published_at";
 const ISSUE_COLS: &str = "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
 const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
@@ -1828,6 +2117,29 @@ impl PgStore {
         .await?;
         sqlx::query(
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS forked_from_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS repo_collaborators (\
+                 id TEXT PRIMARY KEY, \
+                 repo_id TEXT NOT NULL, \
+                 user_sub TEXT NOT NULL, \
+                 role TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_collaborators_repo_user \
+             ON repo_collaborators (repo_id, user_sub)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_repo_collaborators_user \
+             ON repo_collaborators (user_sub)",
         )
         .execute(&self.pool)
         .await?;
@@ -2230,6 +2542,18 @@ impl PgStore {
         })
     }
 
+    fn repo_collaborator_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<RepoCollaborator, sqlx::Error> {
+        Ok(RepoCollaborator {
+            id: row.try_get("id")?,
+            repo_id: row.try_get("repo_id")?,
+            user_sub: row.try_get("user_sub")?,
+            role: row.try_get("role")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
     fn issue_from_row(row: &sqlx::postgres::PgRow) -> Result<Issue, sqlx::Error> {
         Ok(Issue {
             id: row.try_get("id")?,
@@ -2447,6 +2771,11 @@ impl Store for PgStore {
         let rows = sqlx::query(&format!(
             "SELECT {REPO_COLS} FROM repos \
              WHERE is_private = FALSE OR owner_sub = $1 \
+                OR EXISTS (\
+                    SELECT 1 FROM repo_collaborators \
+                    WHERE repo_collaborators.repo_id = repos.id \
+                      AND repo_collaborators.user_sub = $1\
+                ) \
              ORDER BY created_at DESC LIMIT $2"
         ))
         .bind(viewer_sub)
@@ -2505,6 +2834,172 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         row.as_ref()
             .map(Self::repo_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_repo_cascade(&self, repo_id: &str) -> Result<bool, StoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let exists = sqlx::query("SELECT id FROM repos WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        if exists.is_none() {
+            tx.rollback()
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            return Ok(false);
+        }
+
+        for sql in [
+            "DELETE FROM reactions \
+             WHERE target_id IN (SELECT id FROM issues WHERE repo_id = $1) \
+                OR target_id IN (\
+                    SELECT id FROM issue_comments \
+                    WHERE issue_id IN (SELECT id FROM issues WHERE repo_id = $1)\
+                ) \
+                OR target_id IN (SELECT id FROM pulls WHERE repo_id = $1) \
+                OR target_id IN (\
+                    SELECT id FROM pr_reviews \
+                    WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1)\
+                ) \
+                OR target_id IN (\
+                    SELECT id FROM pr_review_comments \
+                    WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1)\
+                )",
+            "DELETE FROM issue_labels \
+             WHERE issue_id IN (SELECT id FROM issues WHERE repo_id = $1) \
+                OR label_id IN (SELECT id FROM labels WHERE repo_id = $1)",
+            "DELETE FROM pull_labels \
+             WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1) \
+                OR label_id IN (SELECT id FROM labels WHERE repo_id = $1)",
+            "DELETE FROM issue_comments \
+             WHERE issue_id IN (SELECT id FROM issues WHERE repo_id = $1)",
+            "DELETE FROM pr_review_comments \
+             WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1)",
+            "DELETE FROM pr_reviews \
+             WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1)",
+            "DELETE FROM pr_file_viewed \
+             WHERE pr_id IN (SELECT id FROM pulls WHERE repo_id = $1)",
+            "DELETE FROM pr_thread_resolved \
+             WHERE pr_id IN (SELECT id FROM pulls WHERE repo_id = $1)",
+            "DELETE FROM issues WHERE repo_id = $1",
+            "DELETE FROM pulls WHERE repo_id = $1",
+            "DELETE FROM labels WHERE repo_id = $1",
+            "DELETE FROM milestones WHERE repo_id = $1",
+            "DELETE FROM releases WHERE repo_id = $1",
+            "DELETE FROM webhooks WHERE repo_id = $1",
+            "DELETE FROM commit_statuses WHERE repo_id = $1",
+            "DELETE FROM repo_collaborators WHERE repo_id = $1",
+            "DELETE FROM repos WHERE id = $1",
+        ] {
+            sqlx::query(sql)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    async fn list_repo_collaborators(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<RepoCollaborator>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {REPO_COLLABORATOR_COLS} FROM repo_collaborators \
+             WHERE repo_id = $1 ORDER BY user_sub ASC, created_at ASC"
+        ))
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::repo_collaborator_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn upsert_repo_collaborator(
+        &self,
+        id: &str,
+        repo_id: &str,
+        user_sub: &str,
+        role: &str,
+        created_at: i64,
+    ) -> Result<RepoCollaborator, StoreError> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO repo_collaborators (id, repo_id, user_sub, role, created_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (repo_id, user_sub) DO UPDATE SET role = EXCLUDED.role \
+             RETURNING {REPO_COLLABORATOR_COLS}"
+        ))
+        .bind(id)
+        .bind(repo_id)
+        .bind(user_sub)
+        .bind(role)
+        .bind(created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Self::repo_collaborator_from_row(&row).map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn update_repo_collaborator_role(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+        role: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE repo_collaborators SET role = $1 WHERE repo_id = $2 AND user_sub = $3",
+        )
+        .bind(role)
+        .bind(repo_id)
+        .bind(user_sub)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn remove_repo_collaborator(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+    ) -> Result<bool, StoreError> {
+        let result =
+            sqlx::query("DELETE FROM repo_collaborators WHERE repo_id = $1 AND user_sub = $2")
+                .bind(repo_id)
+                .bind(user_sub)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn repo_collaborator_role(
+        &self,
+        repo_id: &str,
+        user_sub: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let row =
+            sqlx::query("SELECT role FROM repo_collaborators WHERE repo_id = $1 AND user_sub = $2")
+                .bind(repo_id)
+                .bind(user_sub)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.map(|row| row.try_get("role"))
             .transpose()
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -4110,6 +4605,179 @@ mod tests {
         assert!(seen.contains(&"pub".to_string()));
         assert!(seen.contains(&"sec".to_string()));
         assert!(!seen.contains(&"vsec".to_string()));
+    }
+
+    #[tokio::test]
+    async fn collaborators_are_unique_and_make_private_repos_visible() {
+        let s = InMemoryStore::new();
+        s.create_repo(&repo("u", "sec", true, 1)).await.unwrap();
+
+        let bob_before: Vec<String> = s
+            .list_visible_repos("bob")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert!(!bob_before.contains(&"sec".to_string()));
+
+        let added = s
+            .upsert_repo_collaborator("rc1", "rp_u_sec", "bob", "read", 10)
+            .await
+            .unwrap();
+        assert_eq!(added.role, "read");
+        assert_eq!(
+            s.repo_collaborator_role("rp_u_sec", "bob")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("read")
+        );
+
+        let updated = s
+            .upsert_repo_collaborator("rc2", "rp_u_sec", "bob", "write", 20)
+            .await
+            .unwrap();
+        assert_eq!(updated.id, "rc1");
+        assert_eq!(updated.role, "write");
+        assert_eq!(
+            s.list_repo_collaborators("rp_u_sec").await.unwrap().len(),
+            1
+        );
+
+        let bob_after: Vec<String> = s
+            .list_visible_repos("bob")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert!(bob_after.contains(&"sec".to_string()));
+
+        assert!(s
+            .update_repo_collaborator_role("rp_u_sec", "bob", "admin")
+            .await
+            .unwrap());
+        assert_eq!(
+            s.repo_collaborator_role("rp_u_sec", "bob")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("admin")
+        );
+        assert!(s.remove_repo_collaborator("rp_u_sec", "bob").await.unwrap());
+        assert!(s
+            .repo_collaborator_role("rp_u_sec", "bob")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn repo_cascade_delete_cleans_repo_scoped_metadata() {
+        let s = InMemoryStore::new();
+        let repo_id = "rp_u_a";
+        s.create_repo(&repo("u", "a", false, 1)).await.unwrap();
+        s.upsert_repo_collaborator("rc1", repo_id, "bob", "admin", 2)
+            .await
+            .unwrap();
+        s.create_release(&release("rl1", repo_id, "v1", 3, false))
+            .await
+            .unwrap();
+        let issue = s
+            .create_issue("i1", repo_id, "bug", "", "u", 4)
+            .await
+            .unwrap();
+        let comment = s
+            .create_comment("c1", &issue.id, "bob", "note", 5)
+            .await
+            .unwrap();
+        s.toggle_reaction("rx1", "issue", &issue.id, "bob", "+1", 6)
+            .await
+            .unwrap();
+        s.toggle_reaction("rx2", "comment", &comment.id, "bob", "+1", 7)
+            .await
+            .unwrap();
+        let pull = s
+            .create_pull("p1", repo_id, "pr", "", "main", "feature", "u", false, 8)
+            .await
+            .unwrap();
+        s.create_pull_review("rv1", &pull.id, "bob", "approve", "", 9)
+            .await
+            .unwrap();
+        let review_comment = s
+            .create_pull_review_comment("prc1", &pull.id, "rv1", "src/lib.rs", 10, "bob", "ok", 10)
+            .await
+            .unwrap();
+        s.toggle_reaction("rx3", "comment", &review_comment.id, "bob", "+1", 11)
+            .await
+            .unwrap();
+        s.set_pr_file_viewed(&pull.id, "bob", "src/lib.rs", true, 12)
+            .await
+            .unwrap();
+        s.set_pr_thread_resolved(&pull.id, "src/lib.rs:10", true, "bob", 13)
+            .await
+            .unwrap();
+        s.create_label("lb1", repo_id, "bug", "ff0000", 14)
+            .await
+            .unwrap();
+        s.create_milestone("ms1", repo_id, "M1", "", 15)
+            .await
+            .unwrap();
+        s.create_webhook(&webhook("wh1", repo_id, "https://example.test/hook", 16))
+            .await
+            .unwrap();
+        let mut status = commit_status("ci", "success", 17);
+        status.repo_id = repo_id.to_string();
+        s.upsert_commit_status(&status).await.unwrap();
+
+        assert!(s.delete_repo_cascade(repo_id).await.unwrap());
+        assert!(!s.delete_repo_cascade(repo_id).await.unwrap());
+        assert!(s.get_repo("u", "a").await.unwrap().is_none());
+        assert!(s.list_repo_collaborators(repo_id).await.unwrap().is_empty());
+        assert!(s.list_releases_by_repo(repo_id).await.unwrap().is_empty());
+        assert!(s.list_issues(repo_id).await.unwrap().is_empty());
+        assert!(s.list_comments(&issue.id).await.unwrap().is_empty());
+        assert!(s.list_pulls(repo_id).await.unwrap().is_empty());
+        assert!(s.list_pull_reviews(&pull.id).await.unwrap().is_empty());
+        assert!(s
+            .list_pull_review_comments(&pull.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_pr_file_viewed_for_pr(&pull.id, "bob")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_pr_thread_resolved(&pull.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s.list_labels(repo_id).await.unwrap().is_empty());
+        assert!(s.list_milestones(repo_id).await.unwrap().is_empty());
+        assert!(s.list_webhooks(repo_id).await.unwrap().is_empty());
+        assert!(s
+            .list_commit_statuses(repo_id, "abc123")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_reactions_for_target("issue", &issue.id, "bob")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_reactions_for_target("comment", &comment.id, "bob")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .list_reactions_for_target("comment", &review_comment.id, "bob")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

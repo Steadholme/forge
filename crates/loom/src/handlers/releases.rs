@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::gitops::TagInfo;
-use crate::handlers::repos::{header_with_counts_for, load_visible_repo};
+use crate::handlers::repos::{can_write_repo, header_with_counts_for, load_visible_repo};
 use crate::handlers::{esc, fmt_ts, html_ok, html_with_csrf, page, redirect};
 use crate::model::{Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
@@ -21,10 +21,6 @@ use crate::{now_secs, random_alnum, AppState};
 const RELEASE_ID_LEN: usize = 16;
 const TITLE_MAX: usize = 200;
 const NOTES_MAX: usize = 20_000;
-
-fn can_write(repo: &Repo, who: &Identity, headers: &HeaderMap) -> bool {
-    repo.owner_sub == who.subject || auth::is_admin(headers)
-}
 
 // GET /r/{owner}/{name}/releases — list visible releases
 pub async fn list(
@@ -34,7 +30,7 @@ pub async fn list(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let writer = can_write(&repo, &who, &headers);
+    let writer = can_write_repo(&state, &repo, &who, &headers).await?;
     let releases = visible_releases(state.store.list_releases_by_repo(&repo.id).await?, writer);
     let header = header_with_counts_for(&state, &repo, "releases", writer).await;
     let body = format!("{header}{}", render_list(&repo, &releases, writer));
@@ -53,7 +49,7 @@ pub async fn list_json(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let writer = can_write(&repo, &who, &headers);
+    let writer = can_write_repo(&state, &repo, &who, &headers).await?;
     let releases = visible_releases(state.store.list_releases_by_repo(&repo.id).await?, writer);
     let rows = releases
         .iter()
@@ -84,7 +80,7 @@ pub async fn new_release(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_write(&repo, &who, &headers) {
+    if !can_write_repo(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can create releases.".to_string(),
         ));
@@ -135,7 +131,7 @@ pub async fn create(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_write(&repo, &who, &headers) {
+    if !can_write_repo(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can create releases.".to_string(),
         ));
@@ -216,7 +212,7 @@ pub async fn detail(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let writer = can_write(&repo, &who, &headers);
+    let writer = can_write_repo(&state, &repo, &who, &headers).await?;
     let release = state
         .store
         .get_release(&repo.id, &id)
@@ -233,7 +229,7 @@ pub async fn detail_by_tag(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let writer = can_write(&repo, &who, &headers);
+    let writer = can_write_repo(&state, &repo, &who, &headers).await?;
     let tag = tag.trim_start_matches('/');
     let release = state
         .store
@@ -263,7 +259,7 @@ pub async fn delete(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_write(&repo, &who, &headers) {
+    if !can_write_repo(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can delete releases.".to_string(),
         ));

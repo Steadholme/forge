@@ -23,7 +23,9 @@ use crate::auth::{self, Identity};
 use crate::config::{COMMIT_LIMIT, MAX_BLOB_RENDER_BYTES};
 use crate::error::AppError;
 use crate::gitops::{CommitInfo, MergeStrategy, Mergeability as GitMergeability};
-use crate::handlers::repos::{load_visible_repo, render_repo_header, validate_branch_name};
+use crate::handlers::repos::{
+    can_write_repo, load_visible_repo, render_repo_header, validate_branch_name,
+};
 use crate::handlers::{
     accepts_json, esc, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
     reaction_summaries_json, redirect, render_reactions, short_oid, REACTION_TARGET_COMMENT,
@@ -240,13 +242,13 @@ async fn load_pull_reactions(
     Ok((pull_reactions, comment_reactions))
 }
 
-/// True when `who` may merge/close a PR on `repo`: the repo owner (maintainer) or the PR author.
-fn can_gate(repo: &Repo, pull: &Pull, who: &Identity) -> bool {
-    repo.owner_sub == who.subject || pull.author_sub == who.subject
+/// True when `who` may merge/close a PR: a repo writer or the PR author.
+fn can_gate(pull: &Pull, who: &Identity, repo_writer: bool) -> bool {
+    repo_writer || pull.author_sub == who.subject
 }
 
-fn can_review(repo: &Repo, pull: &Pull, who: &Identity, headers: &HeaderMap) -> bool {
-    can_gate(repo, pull, who) || auth::is_admin(headers)
+fn can_review(pull: &Pull, who: &Identity, repo_writer: bool) -> bool {
+    can_gate(pull, who, repo_writer)
 }
 
 fn truncate_notify(s: &str, max: usize) -> String {
@@ -715,8 +717,9 @@ pub async fn merge(
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
 
+    let repo_writer = can_write_repo(&state, &repo, &who, &headers).await?;
     // Author/maintainer gate.
-    if !can_gate(&repo, &pull, &who) {
+    if !can_gate(&pull, &who, repo_writer) {
         return Err(AppError::Forbidden(
             "Only the repository owner or the pull-request author can merge this.".to_string(),
         ));
@@ -1032,7 +1035,8 @@ pub async fn review(
         .get_pull(&repo.id, number)
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
-    if !can_review(&repo, &pull, &who, &headers) {
+    let repo_writer = can_write_repo(&state, &repo, &who, &headers).await?;
+    if !can_review(&pull, &who, repo_writer) {
         return Err(AppError::Forbidden(
             "Only the repository owner, pull-request author, or an administrator can review."
                 .to_string(),
@@ -1150,7 +1154,8 @@ async fn add_inline_comment(
         .get_pull(&repo.id, number)
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
-    if !can_review(&repo, &pull, &who, headers) {
+    let repo_writer = can_write_repo(state, &repo, &who, headers).await?;
+    if !can_review(&pull, &who, repo_writer) {
         return Err(AppError::Forbidden(
             "Only the repository owner, pull-request author, or an administrator can comment."
                 .to_string(),
@@ -1534,7 +1539,8 @@ async fn apply_thread_resolution(
         .get_pull(&repo.id, number)
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
-    if !can_review(&repo, &pull, &who, headers) {
+    let repo_writer = can_write_repo(state, &repo, &who, headers).await?;
+    if !can_review(&pull, &who, repo_writer) {
         return Err(AppError::Forbidden(
             "Only the repository owner, pull-request author, or an administrator can resolve conversations."
                 .to_string(),
@@ -1610,7 +1616,8 @@ pub async fn metadata(
         .get_pull(&repo.id, number)
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
-    if !can_gate(&repo, &pull, &who) && !auth::is_admin(&headers) {
+    let repo_writer = can_write_repo(&state, &repo, &who, &headers).await?;
+    if !can_gate(&pull, &who, repo_writer) {
         return Err(AppError::Forbidden(
             "Only the repository owner, pull-request author, or an administrator can edit metadata."
                 .to_string(),
@@ -1672,7 +1679,8 @@ pub async fn toggle(
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
 
-    if !can_gate(&repo, &pull, &who) {
+    let repo_writer = can_write_repo(&state, &repo, &who, &headers).await?;
+    if !can_gate(&pull, &who, repo_writer) {
         return Err(AppError::Forbidden(
             "Only the repository owner or the pull-request author can change this.".to_string(),
         ));
@@ -1750,7 +1758,8 @@ async fn set_draft_state(
         .await?
         .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
 
-    if !can_gate(&repo, &pull, &who) {
+    let repo_writer = can_write_repo(&state, &repo, &who, &headers).await?;
+    if !can_gate(&pull, &who, repo_writer) {
         return Err(AppError::Forbidden(
             "Only the repository owner or the pull-request author can change this.".to_string(),
         ));
@@ -2309,6 +2318,9 @@ async fn render_detail(
     let review_requirements =
         evaluate_review_requirements(state, repo, pull, &summary, Some(&diff)).await;
     let review_requirements_html = render_review_requirements(&review_requirements);
+    let repo_writer = can_write_repo(state, repo, who, headers).await?;
+    let can_gate_user = can_gate(pull, who, repo_writer);
+    let can_review_user = can_review(pull, who, repo_writer);
     let reviews_card = render_reviews_card(
         repo,
         reviews,
@@ -2318,8 +2330,7 @@ async fn render_detail(
         &review_requirements_html,
         csrf,
         pull,
-        who,
-        headers,
+        can_review_user,
     );
     let mergeability = if pull.is_open() {
         Some(preflight_mergeability(state, repo, pull).await)
@@ -2329,7 +2340,7 @@ async fn render_detail(
     let mergeability_bar = mergeability
         .map(render_mergeability_bar)
         .unwrap_or_default();
-    let metadata_form = if can_gate(repo, pull, who) || auth::is_admin(headers) {
+    let metadata_form = if can_gate_user {
         let fields = render_pull_metadata_fields(
             labels,
             milestones,
@@ -2362,7 +2373,7 @@ async fn render_detail(
     };
 
     // Action strip: merge/draft + open/close, shown only to a gated user on an OPEN PR.
-    let actions = if pull.is_open() && pull.is_draft && can_gate(repo, pull, who) {
+    let actions = if pull.is_open() && pull.is_draft && can_gate_user {
         format!(
             r##"<div class="pr-actions">
   <p class="pr-status pr-status--draft">Draft pull requests cannot be merged. Mark this pull request ready for review before merging.</p>
@@ -2380,7 +2391,7 @@ async fn render_detail(
             number = pull.number,
             csrf = esc(csrf),
         )
-    } else if pull.is_open() && can_gate(repo, pull, who) {
+    } else if pull.is_open() && can_gate_user {
         let has_conflicts = matches!(mergeability, Some(PrMergeability::Conflicting));
         let review_blocked = !review_requirements.satisfied();
         let merge_button = render_merge_button(has_conflicts || review_blocked);
@@ -2420,7 +2431,7 @@ async fn render_detail(
             esc(&fmt_ts(pull.merged_at)),
             esc(&pull.base),
         )
-    } else if !pull.is_open() && can_gate(repo, pull, who) {
+    } else if !pull.is_open() && can_gate_user {
         // Closed (not merged): allow reopen.
         format!(
             r##"<p class="pr-status">This pull request is closed.</p>
@@ -3037,8 +3048,7 @@ fn render_reviews_card(
     requirements_html: &str,
     csrf: &str,
     pull: &Pull,
-    who: &Identity,
-    headers: &HeaderMap,
+    can_resolve: bool,
 ) -> String {
     let pending_count = comments.iter().filter(|comment| comment.pending).count();
     let unresolved_count = unresolved_thread_count(comments, thread_resolutions);
@@ -3069,7 +3079,6 @@ fn render_reviews_card(
             })
             .collect::<String>()
     };
-    let can_resolve = can_review(repo, pull, who, headers);
     let inline_rows = render_inline_threads(
         repo,
         comments,

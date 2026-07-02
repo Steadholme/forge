@@ -21,7 +21,7 @@ use crate::config::COMMIT_LIMIT;
 use crate::error::AppError;
 use crate::gitops::{BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, TreeEntry};
 use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
-use crate::model::{validate_owner_sub, validate_repo_name, Release, Repo};
+use crate::model::{repo_role_rank, validate_owner_sub, validate_repo_name, Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
 /// Length of a repo/issue/pat id (62-symbol alphabet).
@@ -527,12 +527,60 @@ pub async fn load_visible_repo(
     owner: &str,
     name: &str,
 ) -> Result<Repo, AppError> {
-    match state.store.get_repo(owner, name).await? {
-        Some(r) if !r.is_private || r.owner_sub == who.subject => Ok(r),
-        _ => Err(AppError::NotFound(
-            "No repository exists at that path.".to_string(),
-        )),
+    if let Some(repo) = state.store.get_repo(owner, name).await? {
+        let collaborator = state
+            .store
+            .repo_collaborator_role(&repo.id, &who.subject)
+            .await?
+            .is_some();
+        if !repo.is_private || repo.owner_sub == who.subject || collaborator {
+            return Ok(repo);
+        }
     }
+    Err(AppError::NotFound(
+        "No repository exists at that path.".to_string(),
+    ))
+}
+
+pub(crate) async fn repo_access_rank(
+    state: &AppState,
+    repo: &Repo,
+    subject: &str,
+) -> Result<i64, AppError> {
+    if repo.owner_sub == subject {
+        return Ok(repo_role_rank("admin"));
+    }
+    Ok(state
+        .store
+        .repo_collaborator_role(&repo.id, subject)
+        .await?
+        .as_deref()
+        .map(repo_role_rank)
+        .unwrap_or(0))
+}
+
+pub(crate) async fn can_write_repo(
+    state: &AppState,
+    repo: &Repo,
+    who: &Identity,
+    headers: &HeaderMap,
+) -> Result<bool, AppError> {
+    Ok(
+        repo_access_rank(state, repo, &who.subject).await? >= repo_role_rank("write")
+            || auth::is_admin(headers),
+    )
+}
+
+pub(crate) async fn can_admin_repo(
+    state: &AppState,
+    repo: &Repo,
+    who: &Identity,
+    headers: &HeaderMap,
+) -> Result<bool, AppError> {
+    Ok(
+        repo_access_rank(state, repo, &who.subject).await? >= repo_role_rank("admin")
+            || auth::is_admin(headers),
+    )
 }
 
 /// Render the repo header for the `active` tab, fetching the open issue/PR badge counts (the

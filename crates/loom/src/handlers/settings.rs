@@ -20,11 +20,14 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::AppError;
-use crate::handlers::repos::{header_with_counts, load_visible_repo, validate_branch_name};
+use crate::handlers::repos::{
+    can_admin_repo, header_with_counts, load_visible_repo, validate_branch_name,
+};
 use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect};
 use crate::model::{
-    validate_label_color, validate_label_name, validate_milestone_due, validate_milestone_title,
-    Label, Milestone, Repo, Webhook,
+    normalize_repo_role, validate_label_color, validate_label_name, validate_milestone_due,
+    validate_milestone_title, validate_owner_sub, Label, Milestone, Repo, RepoCollaborator,
+    Webhook,
 };
 use crate::webhooks::{
     normalize_event_csv, validate_webhook_url, EVENT_ISSUES, EVENT_OPTIONS, EVENT_PULL_REQUEST,
@@ -34,12 +37,19 @@ use crate::{now_secs, random_alnum, AppState};
 
 const LABEL_ID_LEN: usize = 16;
 const MILESTONE_ID_LEN: usize = 16;
+const COLLABORATOR_ID_LEN: usize = 16;
 const WEBHOOK_ID_LEN: usize = 16;
 const WEBHOOK_SECRET_CHARS: usize = 512;
 
-/// Whether `who` may edit this repo's settings: the owner, or an estate/product admin.
-fn can_edit(repo: &Repo, who: &Identity, headers: &HeaderMap) -> bool {
-    repo.owner_sub == who.subject || auth::is_admin(headers)
+/// Whether `who` may edit this repo's settings: the owner, a repo admin collaborator, or an
+/// estate/product admin.
+async fn can_edit(
+    state: &AppState,
+    repo: &Repo,
+    who: &Identity,
+    headers: &HeaderMap,
+) -> Result<bool, AppError> {
+    can_admin_repo(state, repo, who, headers).await
 }
 
 // ===========================================================================
@@ -53,13 +63,13 @@ pub async fn show(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
     }
     let csrf = auth::new_csrf_token();
-    let body = render_settings(&state, &repo, &csrf, None).await;
+    let body = render_settings(&state, &repo, &who, &csrf, None).await;
     Ok(html_with_csrf(
         StatusCode::OK,
         page(
@@ -106,7 +116,7 @@ pub async fn update(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
@@ -119,7 +129,7 @@ pub async fn update(
             Ok(n) => n,
             Err(msg) => {
                 let csrf = auth::new_csrf_token();
-                let body = render_settings(&state, &repo, &csrf, Some(&msg)).await;
+                let body = render_settings(&state, &repo, &who, &csrf, Some(&msg)).await;
                 return Ok(html_with_csrf(
                     StatusCode::BAD_REQUEST,
                     page(
@@ -142,6 +152,7 @@ pub async fn update(
         let body = render_settings(
             &state,
             &repo,
+            &who,
             &csrf,
             Some("Choose an existing branch as the default."),
         )
@@ -206,6 +217,213 @@ fn parse_required_approvals(raw: &str, legacy_require_approval: bool) -> Result<
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CollaboratorForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub user_sub: String,
+    #[serde(default)]
+    pub role: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveCollaboratorForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub user_sub: String,
+}
+
+pub async fn add_collaborator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<CollaboratorForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    if !can_edit(&state, &repo, &who, &headers).await? {
+        return Err(AppError::Forbidden(
+            "Only the repository owner, a repository admin, or an administrator can manage collaborators."
+                .to_string(),
+        ));
+    }
+    let user_sub = clean_collaborator_subject(&form.user_sub)?;
+    if user_sub == repo.owner_sub {
+        return Err(AppError::BadRequest(
+            "The repository owner already has admin access.".to_string(),
+        ));
+    }
+    let role = clean_collaborator_role(&form.role)?;
+    state
+        .store
+        .upsert_repo_collaborator(
+            &format!("rc_{}", random_alnum(COLLABORATOR_ID_LEN)),
+            &repo.id,
+            &user_sub,
+            role,
+            now_secs(),
+        )
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        actor = who.subject,
+        collaborator = user_sub,
+        role,
+        "repository collaborator upserted"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+pub async fn update_collaborator_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<CollaboratorForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    if !can_edit(&state, &repo, &who, &headers).await? {
+        return Err(AppError::Forbidden(
+            "Only the repository owner, a repository admin, or an administrator can manage collaborators."
+                .to_string(),
+        ));
+    }
+    let user_sub = clean_collaborator_subject(&form.user_sub)?;
+    if user_sub == repo.owner_sub {
+        return Err(AppError::BadRequest(
+            "The repository owner cannot be downgraded.".to_string(),
+        ));
+    }
+    let role = clean_collaborator_role(&form.role)?;
+    if !state
+        .store
+        .update_repo_collaborator_role(&repo.id, &user_sub, role)
+        .await?
+    {
+        return Err(AppError::NotFound("No such collaborator.".to_string()));
+    }
+    tracing::info!(
+        repo = repo.id,
+        actor = who.subject,
+        collaborator = user_sub,
+        role,
+        "repository collaborator role updated"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+pub async fn remove_collaborator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<RemoveCollaboratorForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    if !can_edit(&state, &repo, &who, &headers).await? {
+        return Err(AppError::Forbidden(
+            "Only the repository owner, a repository admin, or an administrator can manage collaborators."
+                .to_string(),
+        ));
+    }
+    let user_sub = clean_collaborator_subject(&form.user_sub)?;
+    if user_sub == repo.owner_sub {
+        return Err(AppError::BadRequest(
+            "The repository owner cannot be removed.".to_string(),
+        ));
+    }
+    if !state
+        .store
+        .remove_repo_collaborator(&repo.id, &user_sub)
+        .await?
+    {
+        return Err(AppError::NotFound("No such collaborator.".to_string()));
+    }
+    tracing::info!(
+        repo = repo.id,
+        actor = who.subject,
+        collaborator = user_sub,
+        "repository collaborator removed"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteRepoForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub confirm_name: String,
+}
+
+pub async fn delete_repository(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<DeleteRepoForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    if repo.owner_sub != who.subject {
+        return Err(AppError::Forbidden(
+            "Only the repository owner can delete this repository.".to_string(),
+        ));
+    }
+    if form.confirm_name.trim() != repo.name {
+        return Err(AppError::BadRequest(
+            "Repository name confirmation did not match.".to_string(),
+        ));
+    }
+    if !state.store.delete_repo_cascade(&repo.id).await? {
+        return Err(AppError::NotFound("No such repository.".to_string()));
+    }
+    if let Err(e) = state.git.delete_repo_dir(&repo.owner_sub, &repo.name).await {
+        tracing::warn!(
+            repo = repo.id,
+            owner = repo.owner_sub,
+            name = repo.name,
+            error = %e,
+            "repository metadata deleted but bare repo removal failed"
+        );
+    }
+    tracing::info!(repo = repo.id, actor = who.subject, "repository deleted");
+    Ok(redirect("/"))
+}
+
+fn clean_collaborator_subject(raw: &str) -> Result<String, AppError> {
+    let user_sub = raw.trim().chars().take(128).collect::<String>();
+    validate_owner_sub(&user_sub).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(user_sub)
+}
+
+fn clean_collaborator_role(raw: &str) -> Result<&'static str, AppError> {
+    normalize_repo_role(raw).ok_or_else(|| {
+        AppError::BadRequest("Collaborator role must be read, write, or admin.".to_string())
+    })
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LabelForm {
     #[serde(default)]
     pub csrf_token: String,
@@ -228,7 +446,7 @@ pub async fn create_label(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
@@ -288,7 +506,7 @@ pub async fn create_milestone(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
@@ -340,7 +558,7 @@ pub async fn toggle_milestone(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
@@ -397,7 +615,7 @@ pub async fn create_webhook(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
@@ -441,7 +659,7 @@ pub async fn update_webhook(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
@@ -490,7 +708,7 @@ pub async fn delete_webhook(
     }
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    if !can_edit(&repo, &who, &headers) {
+    if !can_edit(&state, &repo, &who, &headers).await? {
         return Err(AppError::Forbidden(
             "Only the repository owner or an administrator can change settings.".to_string(),
         ));
@@ -543,7 +761,13 @@ fn webhook_events_from_form(form: &WebhookForm) -> Result<String, AppError> {
 /// The settings form card (the PRG redirect re-loads the repo row, so a just-saved value renders).
 /// The default branch offers the existing branches in a select — a free-text input when the repo
 /// has no branches yet.
-async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Option<&str>) -> String {
+async fn render_settings(
+    state: &AppState,
+    repo: &Repo,
+    who: &Identity,
+    csrf: &str,
+    error: Option<&str>,
+) -> String {
     let header = header_with_counts(state, repo, "settings").await;
     let error_block = match error {
         Some(msg) => format!(
@@ -600,14 +824,21 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
         .list_milestones(&repo.id)
         .await
         .unwrap_or_default();
+    let collaborators = state
+        .store
+        .list_repo_collaborators(&repo.id)
+        .await
+        .unwrap_or_default();
     let webhooks = state
         .store
         .list_webhooks(&repo.id)
         .await
         .unwrap_or_default();
+    let collaborators_card = render_collaborators_card(repo, csrf, &collaborators);
     let labels_card = render_labels_card(repo, csrf, &labels);
     let milestones_card = render_milestones_card(state, repo, csrf, &milestones).await;
     let webhooks_card = render_webhooks_card(repo, csrf, &webhooks);
+    let danger_zone = render_danger_zone(repo, who, csrf);
 
     format!(
         r##"{header}
@@ -643,9 +874,11 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
     </form>
   </div>
 </section>
+{collaborators_card}
 {webhooks_card}
 {labels_card}
-{milestones_card}"##,
+{milestones_card}
+{danger_zone}"##,
         header = header,
         error_block = error_block,
         owner = esc(&repo.owner_sub),
@@ -656,9 +889,126 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
         required_approvals = required_approvals,
         codeowners_checked = codeowners_checked,
         protect_checked = protect_checked,
+        collaborators_card = collaborators_card,
         webhooks_card = webhooks_card,
         labels_card = labels_card,
         milestones_card = milestones_card,
+        danger_zone = danger_zone,
+    )
+}
+
+fn render_collaborators_card(
+    repo: &Repo,
+    csrf: &str,
+    collaborators: &[RepoCollaborator],
+) -> String {
+    let rows = if collaborators.is_empty() {
+        "<li class=\"collaborator-item collaborator-item--empty\">No collaborators yet.</li>"
+            .to_string()
+    } else {
+        collaborators
+            .iter()
+            .map(|collaborator| render_collaborator_item(repo, csrf, collaborator))
+            .collect::<String>()
+    };
+    let role_options = render_role_options("write");
+    format!(
+        r##"<section class="card collaborator-settings">
+  <div class="card__head"><h2>Collaborators</h2></div>
+  <div class="card__body">
+    <ul class="collaborator-list">{rows}</ul>
+    <form class="collaborator-form collaborator-form--new" method="post" action="/r/{owner}/{name}/settings/collaborators">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <div class="field">
+        <label for="collaborator-user-sub">User</label>
+        <input type="text" id="collaborator-user-sub" name="user_sub" maxlength="128" autocomplete="off" spellcheck="false" required>
+      </div>
+      <div class="field">
+        <label for="collaborator-role">Role</label>
+        <select id="collaborator-role" class="collab-role" name="role">{role_options}</select>
+      </div>
+      <div class="actions">
+        <button class="btn btn-secondary btn-add-collaborator" type="submit">Add collaborator</button>
+      </div>
+    </form>
+  </div>
+</section>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        csrf = esc(csrf),
+        rows = rows,
+        role_options = role_options,
+    )
+}
+
+fn render_collaborator_item(repo: &Repo, csrf: &str, collaborator: &RepoCollaborator) -> String {
+    let options = render_role_options(&collaborator.role);
+    format!(
+        r##"<li class="collaborator-item">
+  <div class="issue-item__head">
+    <span class="issue-item__title">{user_sub}</span>
+    <span class="state-badge collab-role">{role}</span>
+  </div>
+  <div class="issue-item__meta">Added {created}</div>
+  <form class="inline-form collaborator-role-form" method="post" action="/r/{owner}/{name}/settings/collaborators/role">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <input type="hidden" name="user_sub" value="{user_sub}">
+    <select class="collab-role" name="role">{options}</select>
+    <button class="btn btn-secondary btn-sm" type="submit">Update role</button>
+  </form>
+  <form class="inline-form collaborator-remove-form" method="post" action="/r/{owner}/{name}/settings/collaborators/remove">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <input type="hidden" name="user_sub" value="{user_sub}">
+    <button class="btn btn-ghost btn-sm btn-remove-collaborator" type="submit">Remove</button>
+  </form>
+</li>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        csrf = esc(csrf),
+        user_sub = esc(&collaborator.user_sub),
+        role = esc(&collaborator.role),
+        options = options,
+        created = esc(&fmt_ts(collaborator.created_at)),
+    )
+}
+
+fn render_role_options(selected: &str) -> String {
+    ["read", "write", "admin"]
+        .iter()
+        .map(|role| {
+            let selected_attr = if *role == selected { " selected" } else { "" };
+            format!(
+                "<option value=\"{role}\"{selected_attr}>{role}</option>",
+                role = role,
+                selected_attr = selected_attr,
+            )
+        })
+        .collect::<String>()
+}
+
+fn render_danger_zone(repo: &Repo, who: &Identity, csrf: &str) -> String {
+    if repo.owner_sub != who.subject {
+        return String::new();
+    }
+    format!(
+        r##"<section class="card danger-zone">
+  <div class="card__head"><h2>Danger Zone</h2></div>
+  <div class="card__body">
+    <form class="delete-repo-form" method="post" action="/r/{owner}/{name}/settings/delete" data-delete-confirm="{name}">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <div class="field">
+        <label for="delete-repo-confirm">Type the repository name to confirm</label>
+        <input type="text" id="delete-repo-confirm" name="confirm_name" maxlength="64" autocomplete="off" spellcheck="false" data-delete-confirm-input required>
+      </div>
+      <div class="actions">
+        <button class="btn btn-danger btn-delete-repo" type="submit" data-delete-confirm-button disabled>Delete repository</button>
+      </div>
+    </form>
+  </div>
+</section>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        csrf = esc(csrf),
     )
 }
 
