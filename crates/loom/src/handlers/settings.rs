@@ -21,15 +21,21 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::handlers::repos::{header_with_counts, load_visible_repo, validate_branch_name};
-use crate::handlers::{esc, html_with_csrf, page, redirect};
+use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect};
 use crate::model::{
     validate_label_color, validate_label_name, validate_milestone_due, validate_milestone_title,
-    Label, Milestone, Repo,
+    Label, Milestone, Repo, Webhook,
+};
+use crate::webhooks::{
+    normalize_event_csv, validate_webhook_url, EVENT_ISSUES, EVENT_OPTIONS, EVENT_PULL_REQUEST,
+    EVENT_PUSH,
 };
 use crate::{now_secs, random_alnum, AppState};
 
 const LABEL_ID_LEN: usize = 16;
 const MILESTONE_ID_LEN: usize = 16;
+const WEBHOOK_ID_LEN: usize = 16;
+const WEBHOOK_SECRET_CHARS: usize = 512;
 
 /// Whether `who` may edit this repo's settings: the owner, or an estate/product admin.
 fn can_edit(repo: &Repo, who: &Identity, headers: &HeaderMap) -> bool {
@@ -360,6 +366,176 @@ pub async fn toggle_milestone(
     Ok(redirect(&format!("/r/{owner}/{name}/settings")))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WebhookForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default)]
+    pub event_push: String,
+    #[serde(default)]
+    pub event_pull_request: String,
+    #[serde(default)]
+    pub event_issues: String,
+    #[serde(default)]
+    pub active: String,
+}
+
+pub async fn create_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<WebhookForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    if !can_edit(&repo, &who, &headers) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner or an administrator can change settings.".to_string(),
+        ));
+    }
+
+    let url = validate_webhook_url(&form.url).map_err(AppError::BadRequest)?;
+    let secret = clean_webhook_secret(&form.secret, true)?.expect("required webhook secret");
+    let events = webhook_events_from_form(&form)?;
+    let webhook = Webhook {
+        id: format!("wh_{}", random_alnum(WEBHOOK_ID_LEN)),
+        repo_id: repo.id.clone(),
+        url,
+        secret,
+        events,
+        active: form.active == "on",
+        created_at: now_secs(),
+    };
+    if !state.store.create_webhook(&webhook).await? {
+        return Err(AppError::Internal("webhook id collision".to_string()));
+    }
+    tracing::info!(
+        repo = repo.id,
+        actor = who.subject,
+        webhook = webhook.id,
+        active = webhook.active,
+        "webhook created"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+pub async fn update_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, id)): Path<(String, String, String)>,
+    Form(form): Form<WebhookForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    if !can_edit(&repo, &who, &headers) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner or an administrator can change settings.".to_string(),
+        ));
+    }
+    let existing = state
+        .store
+        .get_webhook(&repo.id, &id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such webhook.".to_string()))?;
+    let url = validate_webhook_url(&form.url).map_err(AppError::BadRequest)?;
+    let secret = match clean_webhook_secret(&form.secret, false)? {
+        Some(secret) => secret,
+        None => existing.secret,
+    };
+    let events = webhook_events_from_form(&form)?;
+    state
+        .store
+        .update_webhook(&repo.id, &id, &url, &secret, &events, form.active == "on")
+        .await?;
+    tracing::info!(
+        repo = repo.id,
+        actor = who.subject,
+        webhook = id,
+        active = form.active == "on",
+        "webhook updated"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteWebhookForm {
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+pub async fn delete_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, id)): Path<(String, String, String)>,
+    Form(form): Form<DeleteWebhookForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    if !can_edit(&repo, &who, &headers) {
+        return Err(AppError::Forbidden(
+            "Only the repository owner or an administrator can change settings.".to_string(),
+        ));
+    }
+    if !state.store.delete_webhook(&repo.id, &id).await? {
+        return Err(AppError::NotFound("No such webhook.".to_string()));
+    }
+    tracing::info!(
+        repo = repo.id,
+        actor = who.subject,
+        webhook = id,
+        "webhook deleted"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+fn clean_webhook_secret(raw: &str, required: bool) -> Result<Option<String>, AppError> {
+    let secret: String = raw.trim().chars().take(WEBHOOK_SECRET_CHARS).collect();
+    if secret.is_empty() {
+        if required {
+            Err(AppError::BadRequest(
+                "Webhook secret cannot be empty.".to_string(),
+            ))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Ok(Some(secret))
+    }
+}
+
+fn webhook_events_from_form(form: &WebhookForm) -> Result<String, AppError> {
+    let mut events = Vec::new();
+    if form.event_push == "on" {
+        events.push(EVENT_PUSH.to_string());
+    }
+    if form.event_pull_request == "on" {
+        events.push(EVENT_PULL_REQUEST.to_string());
+    }
+    if form.event_issues == "on" {
+        events.push(EVENT_ISSUES.to_string());
+    }
+    normalize_event_csv(&events).map_err(AppError::BadRequest)
+}
+
 // ===========================================================================
 // Rendering
 // ===========================================================================
@@ -424,8 +600,14 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
         .list_milestones(&repo.id)
         .await
         .unwrap_or_default();
+    let webhooks = state
+        .store
+        .list_webhooks(&repo.id)
+        .await
+        .unwrap_or_default();
     let labels_card = render_labels_card(repo, csrf, &labels);
     let milestones_card = render_milestones_card(state, repo, csrf, &milestones).await;
+    let webhooks_card = render_webhooks_card(repo, csrf, &webhooks);
 
     format!(
         r##"{header}
@@ -461,6 +643,7 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
     </form>
   </div>
 </section>
+{webhooks_card}
 {labels_card}
 {milestones_card}"##,
         header = header,
@@ -473,9 +656,153 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
         required_approvals = required_approvals,
         codeowners_checked = codeowners_checked,
         protect_checked = protect_checked,
+        webhooks_card = webhooks_card,
         labels_card = labels_card,
         milestones_card = milestones_card,
     )
+}
+
+fn render_webhooks_card(repo: &Repo, csrf: &str, webhooks: &[Webhook]) -> String {
+    let rows = if webhooks.is_empty() {
+        "<li class=\"webhook-item webhook-item--empty\">No webhooks configured.</li>".to_string()
+    } else {
+        webhooks
+            .iter()
+            .map(|webhook| render_webhook_item(repo, csrf, webhook))
+            .collect::<String>()
+    };
+    let create_events = render_webhook_event_checks("new", "push");
+    format!(
+        r##"<section class="card webhook-settings">
+  <div class="card__head"><h2>Webhooks</h2></div>
+  <div class="card__body">
+    <ul class="webhook-list">{rows}</ul>
+    <form class="webhook-form webhook-form--new" method="post" action="/r/{owner}/{name}/settings/webhooks">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <div class="field">
+        <label for="webhook-new-url">Payload URL</label>
+        <input type="url" id="webhook-new-url" name="url" maxlength="2048" placeholder="https://example.com/loom" required>
+      </div>
+      <div class="field">
+        <label for="webhook-new-secret">Secret</label>
+        <input type="password" id="webhook-new-secret" name="secret" maxlength="512" autocomplete="new-password" required>
+      </div>
+      <div class="field webhook-events">
+        <span class="field-label">Events</span>
+        {create_events}
+      </div>
+      <div class="field field--check">
+        <label class="check"><input type="checkbox" name="active" value="on" checked> Active</label>
+      </div>
+      <div class="actions">
+        <button class="btn btn-secondary btn-add-webhook" type="submit">Add webhook</button>
+      </div>
+    </form>
+  </div>
+</section>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        csrf = esc(csrf),
+        rows = rows,
+        create_events = create_events,
+    )
+}
+
+fn render_webhook_item(repo: &Repo, csrf: &str, webhook: &Webhook) -> String {
+    let active_checked = if webhook.active { " checked" } else { "" };
+    let active_label = if webhook.active { "Active" } else { "Paused" };
+    let active_class = if webhook.active {
+        "state-badge--open"
+    } else {
+        "state-badge--closed"
+    };
+    let event_checks = render_webhook_event_checks(&webhook.id, &webhook.events);
+    let event_summary = render_webhook_event_summary(&webhook.events);
+    format!(
+        r##"<li class="webhook-item">
+  <div class="issue-item__head">
+    <span class="issue-item__title">{url}</span>
+    <span class="state-badge {active_class}">{active_label}</span>
+  </div>
+  <div class="issue-item__meta">Events: {event_summary} · created {created}</div>
+  <form class="webhook-form webhook-form--edit" method="post" action="/r/{owner}/{name}/settings/webhooks/{id}/update">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <div class="field">
+      <label for="webhook-{id}-url">Payload URL</label>
+      <input type="url" id="webhook-{id}-url" name="url" maxlength="2048" value="{url}" required>
+    </div>
+    <div class="field">
+      <label for="webhook-{id}-secret">Secret</label>
+      <input type="password" id="webhook-{id}-secret" name="secret" maxlength="512" autocomplete="new-password" placeholder="Leave blank to keep existing secret">
+    </div>
+    <div class="field webhook-events">
+      <span class="field-label">Events</span>
+      {event_checks}
+    </div>
+    <div class="field field--check">
+      <label class="check"><input type="checkbox" name="active" value="on"{active_checked}> Active</label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-secondary btn-update-webhook" type="submit">Save webhook</button>
+    </div>
+  </form>
+  <form class="inline-form webhook-delete-form" method="post" action="/r/{owner}/{name}/settings/webhooks/{id}/delete">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <button class="btn btn-ghost btn-sm btn-delete-webhook" type="submit">Delete webhook</button>
+  </form>
+</li>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        id = esc(&webhook.id),
+        csrf = esc(csrf),
+        url = esc(&webhook.url),
+        active_checked = active_checked,
+        active_class = active_class,
+        active_label = active_label,
+        event_checks = event_checks,
+        event_summary = event_summary,
+        created = esc(&fmt_ts(webhook.created_at)),
+    )
+}
+
+fn render_webhook_event_checks(id: &str, events: &str) -> String {
+    EVENT_OPTIONS
+        .iter()
+        .map(|(name, label)| {
+            let checked = if event_configured(events, name) {
+                " checked"
+            } else {
+                ""
+            };
+            let input_id = format!("webhook-{id}-event-{name}");
+            let input_name = format!("event_{name}");
+            format!(
+                r#"<label class="check" for="{input_id}"><input type="checkbox" id="{input_id}" name="{input_name}" value="on"{checked}> {label}</label>"#,
+                input_id = esc(&input_id),
+                input_name = esc(&input_name),
+                checked = checked,
+                label = esc(label),
+            )
+        })
+        .collect::<String>()
+}
+
+fn render_webhook_event_summary(events: &str) -> String {
+    let labels: Vec<&str> = EVENT_OPTIONS
+        .iter()
+        .filter_map(|(name, label)| event_configured(events, name).then_some(*label))
+        .collect();
+    if labels.is_empty() {
+        "none".to_string()
+    } else {
+        labels.join(", ")
+    }
+}
+
+fn event_configured(events: &str, event: &str) -> bool {
+    events
+        .split(',')
+        .any(|configured| configured.trim() == event)
 }
 
 fn render_labels_card(repo: &Repo, csrf: &str, labels: &[Label]) -> String {

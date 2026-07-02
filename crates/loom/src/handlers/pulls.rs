@@ -29,6 +29,7 @@ use crate::model::{
     CommitStatus, Label, Milestone, PrFileViewed, PrThreadResolved, Pull, PullReview,
     PullReviewComment, Repo,
 };
+use crate::webhooks;
 use crate::{now_secs, random_alnum, AppState};
 
 const PULL_ID_LEN: usize = 16;
@@ -542,6 +543,7 @@ pub async fn create(
         "",
         &reviewer,
     );
+    webhooks::emit_pull_request(&state, &repo, "opened", &who.subject, &pull, &pull.state);
 
     // Audit: no dedicated AuditSink in this crate — tracing is the audit surface (as with repo
     // create / issue open / PAT mint).
@@ -746,8 +748,10 @@ pub async fn merge(
         .await
     {
         Ok(outcome) => {
-            let _ = state.store.merge_pull(&pull.id, now_secs()).await?;
+            let merged_at = now_secs();
+            let _ = state.store.merge_pull(&pull.id, merged_at).await?;
             close_linked_issues(&state, &repo, &closing_issues).await?;
+            webhooks::emit_pull_request(&state, &repo, "merged", &who.subject, &pull, "merged");
             tracing::info!(
                 repo = repo.id,
                 number = pull.number,
@@ -1487,6 +1491,12 @@ pub async fn toggle(
     }
     let next = if pull.is_open() { "closed" } else { "open" };
     state.store.set_pull_state(&pull.id, next).await?;
+    let action = if next == "closed" {
+        "closed"
+    } else {
+        "reopened"
+    };
+    webhooks::emit_pull_request(&state, &repo, action, &who.subject, &pull, next);
     tracing::info!(
         repo = repo.id,
         number,

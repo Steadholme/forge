@@ -21,7 +21,7 @@ use thiserror::Error;
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
     CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, PrThreadResolved, Pull,
-    PullReview, PullReviewComment, Release, Repo,
+    PullReview, PullReviewComment, Release, Repo, Webhook,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -419,6 +419,30 @@ pub trait Store: Send + Sync {
         commit_sha: &str,
     ) -> Result<Option<String>, StoreError>;
 
+    // --- webhooks ------------------------------------------------------------
+    /// All outbound webhooks on a repo, newest first.
+    async fn list_webhooks(&self, repo_id: &str) -> Result<Vec<Webhook>, StoreError>;
+
+    /// Fetch one outbound webhook by repo + id.
+    async fn get_webhook(&self, repo_id: &str, id: &str) -> Result<Option<Webhook>, StoreError>;
+
+    /// Insert an outbound webhook. Returns whether a row was inserted.
+    async fn create_webhook(&self, webhook: &Webhook) -> Result<bool, StoreError>;
+
+    /// Replace editable webhook fields by repo + id. Returns whether a row changed.
+    async fn update_webhook(
+        &self,
+        repo_id: &str,
+        id: &str,
+        url: &str,
+        secret: &str,
+        events: &str,
+        active: bool,
+    ) -> Result<bool, StoreError>;
+
+    /// Delete one outbound webhook by repo + id. Returns whether a row was removed.
+    async fn delete_webhook(&self, repo_id: &str, id: &str) -> Result<bool, StoreError>;
+
     // --- pats ----------------------------------------------------------------
     /// Insert a personal access token (only the hash is stored).
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError>;
@@ -455,6 +479,7 @@ pub struct InMemoryStore {
     pr_file_viewed: Mutex<Vec<PrFileViewed>>,
     pr_thread_resolved: Mutex<Vec<PrThreadResolved>>,
     commit_statuses: Mutex<Vec<CommitStatus>>,
+    webhooks: Mutex<Vec<Webhook>>,
     pats: Mutex<Vec<Pat>>,
 }
 
@@ -1519,6 +1544,67 @@ impl Store for InMemoryStore {
         Ok(aggregate_commit_statuses(&statuses))
     }
 
+    async fn list_webhooks(&self, repo_id: &str) -> Result<Vec<Webhook>, StoreError> {
+        let webhooks = self.webhooks.lock().expect("webhooks lock poisoned");
+        let mut out: Vec<Webhook> = webhooks
+            .iter()
+            .filter(|w| w.repo_id == repo_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    async fn get_webhook(&self, repo_id: &str, id: &str) -> Result<Option<Webhook>, StoreError> {
+        let webhooks = self.webhooks.lock().expect("webhooks lock poisoned");
+        Ok(webhooks
+            .iter()
+            .find(|w| w.repo_id == repo_id && w.id == id)
+            .cloned())
+    }
+
+    async fn create_webhook(&self, webhook: &Webhook) -> Result<bool, StoreError> {
+        let mut webhooks = self.webhooks.lock().expect("webhooks lock poisoned");
+        if webhooks.iter().any(|w| w.id == webhook.id) {
+            return Ok(false);
+        }
+        webhooks.push(webhook.clone());
+        Ok(true)
+    }
+
+    async fn update_webhook(
+        &self,
+        repo_id: &str,
+        id: &str,
+        url: &str,
+        secret: &str,
+        events: &str,
+        active: bool,
+    ) -> Result<bool, StoreError> {
+        let mut webhooks = self.webhooks.lock().expect("webhooks lock poisoned");
+        for webhook in webhooks.iter_mut() {
+            if webhook.repo_id == repo_id && webhook.id == id {
+                webhook.url = url.to_string();
+                webhook.secret = secret.to_string();
+                webhook.events = events.to_string();
+                webhook.active = active;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn delete_webhook(&self, repo_id: &str, id: &str) -> Result<bool, StoreError> {
+        let mut webhooks = self.webhooks.lock().expect("webhooks lock poisoned");
+        let before = webhooks.len();
+        webhooks.retain(|w| !(w.repo_id == repo_id && w.id == id));
+        Ok(webhooks.len() != before)
+    }
+
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError> {
         let mut pats = self.pats.lock().expect("pats lock poisoned");
         pats.push(pat.clone());
@@ -1579,6 +1665,7 @@ const PR_FILE_VIEWED_COLS: &str = "pr_id, user_sub, file_path, viewed, updated_a
 const PR_THREAD_RESOLVED_COLS: &str = "pr_id, thread_key, resolved, resolved_by, resolved_at";
 const COMMIT_STATUS_COLS: &str =
     "id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at";
+const WEBHOOK_COLS: &str = "id, repo_id, url, secret, events, active, created_at";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -1986,6 +2073,25 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS webhooks (\
+                 id TEXT PRIMARY KEY, \
+                 repo_id TEXT NOT NULL, \
+                 url TEXT NOT NULL, \
+                 secret TEXT NOT NULL DEFAULT '', \
+                 events TEXT NOT NULL DEFAULT '', \
+                 active BOOLEAN NOT NULL DEFAULT TRUE, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_webhooks_repo \
+             ON webhooks (repo_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Per-repo PR numbering uniqueness (backs the race-safe ON CONFLICT retry).
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pulls_repo_number \
@@ -2173,6 +2279,18 @@ impl PgStore {
             target_url: row.try_get("target_url")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    fn webhook_from_row(row: &sqlx::postgres::PgRow) -> Result<Webhook, sqlx::Error> {
+        Ok(Webhook {
+            id: row.try_get("id")?,
+            repo_id: row.try_get("repo_id")?,
+            url: row.try_get("url")?,
+            secret: row.try_get("secret")?,
+            events: row.try_get("events")?,
+            active: row.try_get("active")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 }
@@ -3584,6 +3702,90 @@ impl Store for PgStore {
         Ok(aggregate_commit_statuses(&statuses))
     }
 
+    async fn list_webhooks(&self, repo_id: &str) -> Result<Vec<Webhook>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {WEBHOOK_COLS} FROM webhooks \
+             WHERE repo_id = $1 ORDER BY created_at DESC, id DESC"
+        ))
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::webhook_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_webhook(&self, repo_id: &str, id: &str) -> Result<Option<Webhook>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {WEBHOOK_COLS} FROM webhooks WHERE repo_id = $1 AND id = $2"
+        ))
+        .bind(repo_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::webhook_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn create_webhook(&self, webhook: &Webhook) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "INSERT INTO webhooks (id, repo_id, url, secret, events, active, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&webhook.id)
+        .bind(&webhook.repo_id)
+        .bind(&webhook.url)
+        .bind(&webhook.secret)
+        .bind(&webhook.events)
+        .bind(webhook.active)
+        .bind(webhook.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn update_webhook(
+        &self,
+        repo_id: &str,
+        id: &str,
+        url: &str,
+        secret: &str,
+        events: &str,
+        active: bool,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE webhooks SET url = $1, secret = $2, events = $3, active = $4 \
+             WHERE repo_id = $5 AND id = $6",
+        )
+        .bind(url)
+        .bind(secret)
+        .bind(events)
+        .bind(active)
+        .bind(repo_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_webhook(&self, repo_id: &str, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM webhooks WHERE repo_id = $1 AND id = $2")
+            .bind(repo_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO pats (id, owner_sub, name, token_hash, created_at) \
@@ -3690,6 +3892,18 @@ mod tests {
         }
     }
 
+    fn webhook(id: &str, repo_id: &str, url: &str, created_at: i64) -> Webhook {
+        Webhook {
+            id: id.into(),
+            repo_id: repo_id.into(),
+            url: url.into(),
+            secret: "secret".into(),
+            events: "push,issues".into(),
+            active: true,
+            created_at,
+        }
+    }
+
     #[tokio::test]
     async fn repo_create_is_unique_per_owner_and_name() {
         let s = InMemoryStore::new();
@@ -3739,6 +3953,54 @@ mod tests {
             .update_repo_settings("nope", "x", "main", 0, false, false)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn webhooks_are_repo_scoped_and_editable() {
+        let s = InMemoryStore::new();
+        assert!(s
+            .create_webhook(&webhook("wh1", "r", "https://example.test/a", 10))
+            .await
+            .unwrap());
+        assert!(s
+            .create_webhook(&webhook("wh2", "r", "https://example.test/b", 20))
+            .await
+            .unwrap());
+        assert!(s
+            .create_webhook(&webhook("wh3", "other", "https://example.test/c", 30))
+            .await
+            .unwrap());
+
+        let listed = s.list_webhooks("r").await.unwrap();
+        assert_eq!(
+            listed.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            vec!["wh2", "wh1"]
+        );
+        assert_eq!(
+            s.get_webhook("r", "wh1").await.unwrap().unwrap().url,
+            "https://example.test/a"
+        );
+
+        assert!(s
+            .update_webhook(
+                "r",
+                "wh1",
+                "http://example.test/hook",
+                "new",
+                "pull_request",
+                false
+            )
+            .await
+            .unwrap());
+        let updated = s.get_webhook("r", "wh1").await.unwrap().unwrap();
+        assert_eq!(updated.url, "http://example.test/hook");
+        assert_eq!(updated.secret, "new");
+        assert_eq!(updated.events, "pull_request");
+        assert!(!updated.active);
+
+        assert!(!s.delete_webhook("r", "wh3").await.unwrap());
+        assert!(s.delete_webhook("r", "wh1").await.unwrap());
+        assert!(s.get_webhook("r", "wh1").await.unwrap().is_none());
     }
 
     #[tokio::test]

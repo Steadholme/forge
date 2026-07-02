@@ -45,6 +45,9 @@ hex = "0.4"
 # HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
 # primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
 hmac = "0.12"
+# Outbound repository webhooks need both http:// and https:// delivery. reqwest is kept on rustls
+# TLS so this crate still avoids OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Decode the HTTP Basic `Authorization` header on the /git/ smart-HTTP routes (username:PAT).
 # base64 0.22 matches keystone/corvid/sanctum.
 base64 = "0.22"

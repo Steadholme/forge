@@ -24,6 +24,7 @@ pub mod markdown;
 pub mod model;
 mod notify;
 pub mod store;
+mod webhooks;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -128,6 +129,18 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/r/{owner}/{name}/settings/labels",
             post(handlers::settings::create_label),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/webhooks",
+            post(handlers::settings::create_webhook),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/webhooks/{id}/update",
+            post(handlers::settings::update_webhook),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/webhooks/{id}/delete",
+            post(handlers::settings::delete_webhook),
         )
         .route(
             "/r/{owner}/{name}/settings/milestones",

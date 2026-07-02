@@ -21,6 +21,7 @@ use axum::response::IntoResponse;
 use crate::auth;
 use crate::gitops::CgiOut;
 use crate::model::Pat;
+use crate::webhooks;
 use crate::AppState;
 
 /// Which git operation a request performs (drives the auth policy).
@@ -110,8 +111,8 @@ pub async fn handle(
     if let Some(enc) = header_str(&headers, header::CONTENT_ENCODING) {
         extra.push(("HTTP_CONTENT_ENCODING".into(), enc));
     }
-    if let Some(user) = remote_user {
-        extra.push(("REMOTE_USER".into(), user));
+    if let Some(user) = remote_user.as_ref() {
+        extra.push(("REMOTE_USER".into(), user.clone()));
     }
 
     match state
@@ -119,7 +120,13 @@ pub async fn handle(
         .http_backend(&path_info, &query, &extra, body.to_vec())
         .await
     {
-        Ok(cgi) => cgi_to_response(cgi),
+        Ok(cgi) => {
+            if op == GitOp::Push && method == Method::POST && (200..300).contains(&cgi.status) {
+                let actor = remote_user.as_deref().unwrap_or(&repo.owner_sub);
+                webhooks::emit_push(&state, &repo, actor);
+            }
+            cgi_to_response(cgi)
+        }
         Err(e) => {
             tracing::error!(error = %e, repo = repo.id, "git http-backend failed");
             text_response(StatusCode::INTERNAL_SERVER_ERROR, "git backend error")

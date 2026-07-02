@@ -2700,6 +2700,120 @@ async fn settings_guarded_and_default_branch_validated() {
     );
 }
 
+#[tokio::test]
+async fn settings_webhooks_crud_and_secret_is_not_echoed() {
+    let state = temp_state();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+
+    let form_page = send(&app, get("/r/alice/proj/settings", Some("alice"))).await;
+    assert_eq!(form_page.status, StatusCode::OK);
+    assert!(form_page.body.contains("webhook-list"));
+    let csrf = form_page.csrf_cookie().expect("csrf on settings");
+
+    let bad_url = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/webhooks",
+            &[
+                ("csrf_token", &csrf),
+                ("url", "ftp://example.test/hook"),
+                ("secret", "topsecret"),
+                ("event_push", "on"),
+                ("active", "on"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(bad_url.status, StatusCode::BAD_REQUEST);
+
+    let created = send(
+        &app,
+        post_form(
+            "/r/alice/proj/settings/webhooks",
+            &[
+                ("csrf_token", &csrf),
+                ("url", "https://example.test/loom"),
+                ("secret", "topsecret"),
+                ("event_issues", "on"),
+                ("event_push", "on"),
+                ("active", "on"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+    assert_eq!(created.location(), "/r/alice/proj/settings");
+
+    let repo = store
+        .get_repo("alice", "proj")
+        .await
+        .unwrap()
+        .expect("repo exists");
+    let hooks = store.list_webhooks(&repo.id).await.unwrap();
+    assert_eq!(hooks.len(), 1);
+    let hook = hooks[0].clone();
+    assert_eq!(hook.url, "https://example.test/loom");
+    assert_eq!(hook.secret, "topsecret");
+    assert_eq!(hook.events, "push,issues");
+    assert!(hook.active);
+
+    let settings = send(&app, get("/r/alice/proj/settings", Some("alice"))).await;
+    assert!(settings.body.contains("https://example.test/loom"));
+    assert!(settings
+        .body
+        .contains("Leave blank to keep existing secret"));
+    assert!(!settings.body.contains("topsecret"));
+
+    let updated = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/settings/webhooks/{}/update", hook.id),
+            &[
+                ("csrf_token", &csrf),
+                ("url", "http://example.test/updated"),
+                ("secret", ""),
+                ("event_pull_request", "on"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::FOUND);
+    let edited = store
+        .get_webhook(&repo.id, &hook.id)
+        .await
+        .unwrap()
+        .expect("webhook exists");
+    assert_eq!(edited.url, "http://example.test/updated");
+    assert_eq!(edited.secret, "topsecret");
+    assert_eq!(edited.events, "pull_request");
+    assert!(!edited.active);
+
+    let deleted = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/settings/webhooks/{}/delete", hook.id),
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::FOUND);
+    assert!(store
+        .get_webhook(&repo.id, &hook.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 // ===========================================================================
 // git smart-HTTP: advertisement + PAT auth policy
 // ===========================================================================

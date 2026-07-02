@@ -18,6 +18,7 @@ use crate::error::AppError;
 use crate::handlers::repos::{load_visible_repo, render_repo_header};
 use crate::handlers::{esc, fmt_ts, html_with_csrf, link_issue_refs, page, redirect};
 use crate::model::{Issue, IssueComment, Label, Milestone, Repo};
+use crate::webhooks;
 use crate::{now_secs, random_alnum, AppState};
 
 const ISSUE_ID_LEN: usize = 16;
@@ -306,6 +307,7 @@ pub async fn create(
         .set_issue_metadata(&issue.id, &assignee, &milestone_id, &label_ids)
         .await?;
     notify_issue_assigned(&state, &who.subject, &assignee, &repo, &issue);
+    webhooks::emit_issue(&state, &repo, "opened", &who.subject, &issue);
 
     tracing::info!(
         repo = repo.id,
@@ -635,6 +637,12 @@ async fn apply_issue_toggle(
         .store
         .set_issue_state(&issue.id, next, now_secs())
         .await?;
+    let action = if next == "closed" {
+        "closed"
+    } else {
+        "reopened"
+    };
+    webhooks::emit_issue_state(state, &repo, action, &who.subject, &issue, next);
     tracing::info!(
         repo = repo.id,
         number,

@@ -226,6 +226,25 @@ impl Milestone {
     }
 }
 
+/// A repo-scoped outbound webhook subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Webhook {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id.
+    pub repo_id: String,
+    /// Destination URL. Only `http` and `https` schemes are accepted by the handler layer.
+    pub url: String,
+    /// Shared secret used for the HMAC-SHA256 delivery signature.
+    pub secret: String,
+    /// Comma-separated event names, e.g. `push,pull_request,issues`.
+    pub events: String,
+    /// Whether this webhook should receive deliveries.
+    pub active: bool,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+}
+
 /// A pull-request review verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullReview {
