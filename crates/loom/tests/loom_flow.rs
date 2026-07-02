@@ -2091,7 +2091,9 @@ async fn pull_review_suggestion_renders_and_applies_to_head_branch() {
     assert!(reviewed.body.contains("class=\"suggestion__old\""));
     assert!(reviewed.body.contains("- two"));
     assert!(reviewed.body.contains("+ TWO &lt;safe&gt;"));
-    assert!(reviewed.body.contains("btn-apply-suggestion"));
+    // Match the button element, not the bare class token (app.css is inlined into the
+    // page and now carries a `.btn-apply-suggestion` rule that would satisfy a substring test).
+    assert!(reviewed.body.contains(">Apply suggestion</button>"));
     let csrf = reviewed.csrf_cookie().unwrap();
     let action = first_action_with_prefix(&reviewed.body, "/r/alice/proj/pulls/1/comments/");
     assert!(action.ends_with("/suggestion/apply"));
@@ -2121,7 +2123,7 @@ async fn pull_review_suggestion_renders_and_applies_to_head_branch() {
 
     let after = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
     assert!(after.body.contains("Suggestion applied."));
-    assert!(!after.body.contains("btn-apply-suggestion"));
+    assert!(!after.body.contains(">Apply suggestion</button>"));
 }
 
 #[tokio::test]
