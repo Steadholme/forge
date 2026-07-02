@@ -38,12 +38,69 @@ const KLAXON_SOURCE: &str = "loom";
 const NOTIFY_TITLE_CHARS: usize = 96;
 const NOTIFY_BODY_CHARS: usize = 240;
 const MERGEABILITY_TIMEOUT_SECS: u64 = 3;
+const CODEOWNERS_PATHS: [&str; 3] = ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrMergeability {
     Clean,
     Conflicting,
     Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodeOwnerRule {
+    pattern: String,
+    owners: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodeOwnerFile {
+    path: String,
+    rules: Vec<CodeOwnerRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodeOwnerMatchedGroup {
+    pattern: String,
+    owners: Vec<String>,
+    paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodeOwnerEvaluation {
+    enabled: bool,
+    source_path: Option<String>,
+    matched_groups: Vec<CodeOwnerMatchedGroup>,
+    pending_groups: Vec<CodeOwnerMatchedGroup>,
+}
+
+impl CodeOwnerEvaluation {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            source_path: None,
+            matched_groups: Vec::new(),
+            pending_groups: Vec::new(),
+        }
+    }
+
+    fn satisfied(&self) -> bool {
+        !self.enabled || self.pending_groups.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewRequirements {
+    approval_count: usize,
+    required_approvals: usize,
+    approval_satisfied: bool,
+    codeowners: CodeOwnerEvaluation,
+}
+
+impl ReviewRequirements {
+    fn satisfied(&self) -> bool {
+        self.approval_satisfied && self.codeowners.satisfied()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -633,35 +690,16 @@ pub async fn merge(
             "This pull request is no longer open.".to_string(),
         ));
     }
-    if pull.is_draft {
-        let csrf = auth::new_csrf_token();
-        let header = pr_header(&state, &repo, "pulls").await;
-        let body = render_detail_with_fresh_metadata(
-            &state,
-            &repo,
-            &pull,
-            &header,
-            &who,
-            &headers,
-            &csrf,
-            Some("Draft pull requests cannot be merged. Mark this pull request ready for review before merging."),
-        )
-        .await?;
-        return Ok(html_with_csrf(
-            StatusCode::BAD_REQUEST,
-            page(
-                &format!("{owner}/{name} · PR #{number}"),
-                Some(&who.email),
-                &body,
-            ),
-            &csrf,
-        ));
-    }
     let reviews = state.store.list_pull_reviews(&pull.id).await?;
     let review_summary = review_summary(&reviews);
-    if repo.require_approval && review_summary.approvals.is_empty() {
+    let review_requirements =
+        evaluate_review_requirements(&state, &repo, &pull, &review_summary, None).await;
+    let mergeability = preflight_mergeability(&state, &repo, &pull).await;
+    let blockers = merge_blockers(&pull, &review_requirements, mergeability);
+    if !blockers.is_empty() {
         let csrf = auth::new_csrf_token();
         let header = pr_header(&state, &repo, "pulls").await;
+        let message = merge_blocker_message(&blockers);
         let body = render_detail_with_fresh_metadata(
             &state,
             &repo,
@@ -670,11 +708,16 @@ pub async fn merge(
             &who,
             &headers,
             &csrf,
-            Some("This repository requires at least one approval before merge."),
+            Some(&message),
         )
         .await?;
+        let status = if matches!(mergeability, PrMergeability::Conflicting) {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_REQUEST
+        };
         return Ok(html_with_csrf(
-            StatusCode::BAD_REQUEST,
+            status,
             page(
                 &format!("{owner}/{name} · PR #{number}"),
                 Some(&who.email),
@@ -2051,11 +2094,15 @@ async fn render_detail(
             number = pull.number,
         )),
     );
+    let review_requirements =
+        evaluate_review_requirements(state, repo, pull, &summary, Some(&diff)).await;
+    let review_requirements_html = render_review_requirements(&review_requirements);
     let reviews_card = render_reviews_card(
         repo,
         reviews,
         review_comments,
         thread_resolutions,
+        &review_requirements_html,
         csrf,
         pull,
         who,
@@ -2122,12 +2169,9 @@ async fn render_detail(
         )
     } else if pull.is_open() && can_gate(repo, pull, who) {
         let has_conflicts = matches!(mergeability, Some(PrMergeability::Conflicting));
-        let merge_button = render_merge_button(has_conflicts);
-        let merge_note = if has_conflicts {
-            "Resolve the conflicts manually before merging this pull request."
-        } else {
-            "All merge methods are enabled for this repository."
-        };
+        let review_blocked = !review_requirements.satisfied();
+        let merge_button = render_merge_button(has_conflicts || review_blocked);
+        let merge_note = render_merge_action_note(&review_requirements, has_conflicts);
         format!(
             r##"<div class="pr-actions">
   <form class="inline-form merge-strategy" method="post" action="/r/{owner}/{name}/pulls/{number}/merge">
@@ -2155,7 +2199,7 @@ async fn render_detail(
             number = pull.number,
             csrf = esc(csrf),
             merge_button = merge_button,
-            merge_note = merge_note,
+            merge_note = esc(&merge_note),
         )
     } else if pull.is_merged() {
         format!(
@@ -2384,11 +2428,398 @@ fn render_review_badges(summary: &ReviewSummary) -> String {
     out
 }
 
+fn effective_required_approvals(repo: &Repo) -> usize {
+    let required = if repo.required_approvals > 0 {
+        repo.required_approvals
+    } else if repo.require_approval {
+        1
+    } else {
+        0
+    };
+    required.max(0) as usize
+}
+
+async fn evaluate_review_requirements(
+    state: &AppState,
+    repo: &Repo,
+    pull: &Pull,
+    summary: &ReviewSummary,
+    diff: Option<&str>,
+) -> ReviewRequirements {
+    let approval_count = summary.approvals.len();
+    let required_approvals = effective_required_approvals(repo);
+    let codeowners = if repo.require_code_owner_reviews {
+        let owned_diff;
+        let diff_text = match diff {
+            Some(diff) => diff,
+            None => {
+                owned_diff = state
+                    .git
+                    .diff(&repo.owner_sub, &repo.name, &pull.base, &pull.head, false)
+                    .await
+                    .unwrap_or_default();
+                owned_diff.as_str()
+            }
+        };
+        let changed_paths = changed_paths_from_diff(diff_text);
+        evaluate_codeowners_for_pull(state, repo, pull, &changed_paths, &summary.approvals).await
+    } else {
+        CodeOwnerEvaluation::disabled()
+    };
+    ReviewRequirements {
+        approval_count,
+        required_approvals,
+        approval_satisfied: approval_count >= required_approvals,
+        codeowners,
+    }
+}
+
+async fn evaluate_codeowners_for_pull(
+    state: &AppState,
+    repo: &Repo,
+    pull: &Pull,
+    changed_paths: &[String],
+    approvals: &[String],
+) -> CodeOwnerEvaluation {
+    let Some(file) = load_codeowners_file(state, repo, &pull.base).await else {
+        return CodeOwnerEvaluation {
+            enabled: true,
+            source_path: None,
+            matched_groups: Vec::new(),
+            pending_groups: Vec::new(),
+        };
+    };
+    let (matched_groups, pending_groups) =
+        evaluate_codeowner_rules(&file.rules, changed_paths, approvals);
+    CodeOwnerEvaluation {
+        enabled: true,
+        source_path: Some(file.path),
+        matched_groups,
+        pending_groups,
+    }
+}
+
+async fn load_codeowners_file(
+    state: &AppState,
+    repo: &Repo,
+    base_branch: &str,
+) -> Option<CodeOwnerFile> {
+    let base_oid = state
+        .git
+        .branch_oid(&repo.owner_sub, &repo.name, base_branch)
+        .await?;
+    for path in CODEOWNERS_PATHS {
+        let Some(bytes) = state
+            .git
+            .read_blob(&repo.owner_sub, &repo.name, &base_oid, path)
+            .await
+        else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        return Some(CodeOwnerFile {
+            path: path.to_string(),
+            rules: parse_codeowners(&text),
+        });
+    }
+    None
+}
+
+fn parse_codeowners(text: &str) -> Vec<CodeOwnerRule> {
+    let mut rules = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(pattern) = parts.next() else {
+            continue;
+        };
+        let owners: Vec<String> = parts.filter_map(normalize_codeowner_token).collect();
+        if owners.is_empty() {
+            continue;
+        }
+        rules.push(CodeOwnerRule {
+            pattern: pattern.to_string(),
+            owners,
+        });
+    }
+    rules
+}
+
+fn normalize_codeowner_token(raw: &str) -> Option<String> {
+    let owner = raw.trim().trim_start_matches('@');
+    if owner.is_empty() {
+        return None;
+    }
+    Some(owner.to_string())
+}
+
+fn evaluate_codeowner_rules(
+    rules: &[CodeOwnerRule],
+    changed_paths: &[String],
+    approvals: &[String],
+) -> (Vec<CodeOwnerMatchedGroup>, Vec<CodeOwnerMatchedGroup>) {
+    let approval_subjects: BTreeSet<String> = approvals
+        .iter()
+        .filter_map(|approval| normalize_codeowner_token(approval))
+        .collect();
+    let mut matched_groups = Vec::new();
+    let mut pending_groups = Vec::new();
+    for rule in rules {
+        let paths: Vec<String> = changed_paths
+            .iter()
+            .filter(|path| codeowner_pattern_matches(&rule.pattern, path))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            continue;
+        }
+        let group = CodeOwnerMatchedGroup {
+            pattern: rule.pattern.clone(),
+            owners: rule.owners.clone(),
+            paths,
+        };
+        if !rule
+            .owners
+            .iter()
+            .any(|owner| approval_subjects.contains(owner))
+        {
+            pending_groups.push(group.clone());
+        }
+        matched_groups.push(group);
+    }
+    (matched_groups, pending_groups)
+}
+
+fn changed_paths_from_diff(diff: &str) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for file in parse_diff_files(diff) {
+        if !file.path.is_empty() {
+            paths.insert(file.path);
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn codeowner_pattern_matches(pattern: &str, path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+    let raw = pattern.trim();
+    if raw.is_empty() || path.is_empty() {
+        return false;
+    }
+    let anchored = raw.starts_with('/');
+    let pattern = raw.trim_start_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern.ends_with('/') {
+        let dir = pattern.trim_end_matches('/');
+        return codeowner_dir_pattern_matches(dir, path, anchored || dir.contains('/'));
+    }
+    if anchored || pattern.contains('/') {
+        return glob_match_path(pattern, path);
+    }
+    path.split('/')
+        .any(|segment| glob_match_path(pattern, segment))
+}
+
+fn codeowner_dir_pattern_matches(pattern: &str, path: &str, rooted: bool) -> bool {
+    if rooted {
+        return path == pattern
+            || path
+                .strip_prefix(pattern)
+                .map(|rest| rest.starts_with('/'))
+                .unwrap_or(false);
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    for idx in 0..parts.len() {
+        let suffix = parts[idx..].join("/");
+        if suffix == pattern
+            || suffix
+                .strip_prefix(pattern)
+                .map(|rest| rest.starts_with('/'))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn glob_match_path(pattern: &str, text: &str) -> bool {
+    glob_match_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if pattern.starts_with(b"**/") {
+        if glob_match_bytes(&pattern[3..], text) {
+            return true;
+        }
+        for idx in 0..text.len() {
+            if text[idx] == b'/' && glob_match_bytes(&pattern[3..], &text[idx + 1..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if pattern.starts_with(b"**") {
+        if glob_match_bytes(&pattern[2..], text) {
+            return true;
+        }
+        return !text.is_empty() && glob_match_bytes(pattern, &text[1..]);
+    }
+    match pattern[0] {
+        b'*' => {
+            glob_match_bytes(&pattern[1..], text)
+                || (!text.is_empty() && text[0] != b'/' && glob_match_bytes(pattern, &text[1..]))
+        }
+        b'?' => !text.is_empty() && text[0] != b'/' && glob_match_bytes(&pattern[1..], &text[1..]),
+        b => !text.is_empty() && text[0] == b && glob_match_bytes(&pattern[1..], &text[1..]),
+    }
+}
+
+fn merge_blockers(
+    pull: &Pull,
+    requirements: &ReviewRequirements,
+    mergeability: PrMergeability,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if pull.is_draft {
+        blockers.push(
+            "Draft pull requests cannot be merged. Mark this pull request ready for review before merging."
+                .to_string(),
+        );
+    }
+    blockers.extend(review_requirement_blockers(requirements));
+    if matches!(mergeability, PrMergeability::Conflicting) {
+        blockers.push(conflict_blocker_text());
+    }
+    blockers
+}
+
+fn review_requirement_blockers(requirements: &ReviewRequirements) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !requirements.approval_satisfied {
+        if requirements.required_approvals == 1 {
+            blockers
+                .push("This repository requires at least one approval before merge.".to_string());
+        } else {
+            blockers.push(format!(
+                "This repository requires {} approvals before merge; {} approvals are present.",
+                requirements.required_approvals, requirements.approval_count
+            ));
+        }
+    }
+    if requirements.codeowners.enabled && !requirements.codeowners.satisfied() {
+        blockers.push(format!(
+            "Code owner review is required from {}.",
+            pending_codeowner_groups_text(&requirements.codeowners.pending_groups)
+        ));
+    }
+    blockers
+}
+
+fn merge_blocker_message(blockers: &[String]) -> String {
+    format!("Cannot merge yet: {}", blockers.join(" "))
+}
+
+fn render_merge_action_note(requirements: &ReviewRequirements, has_conflicts: bool) -> String {
+    let mut blockers = review_requirement_blockers(requirements);
+    if has_conflicts {
+        blockers.push(conflict_blocker_text());
+    }
+    if blockers.is_empty() {
+        "All merge methods are enabled for this repository.".to_string()
+    } else {
+        blockers.join(" ")
+    }
+}
+
+fn conflict_blocker_text() -> String {
+    "Could not merge automatically: resolve the conflicts manually before merging this pull request."
+        .to_string()
+}
+
+fn render_review_requirements(requirements: &ReviewRequirements) -> String {
+    let approval_state = if requirements.approval_satisfied {
+        "approval-status--satisfied"
+    } else {
+        "approval-status--blocked"
+    };
+    let codeowners = render_codeowners_requirement(&requirements.codeowners);
+    format!(
+        r#"<div class="approval-status {approval_state}">
+  <strong>Approvals</strong>
+  <span class="approval-count">{approvals} of {required} approvals</span>
+</div>
+{codeowners}"#,
+        approval_state = approval_state,
+        approvals = requirements.approval_count,
+        required = requirements.required_approvals,
+        codeowners = codeowners,
+    )
+}
+
+fn render_codeowners_requirement(evaluation: &CodeOwnerEvaluation) -> String {
+    let state = if evaluation.satisfied() {
+        "codeowners-req--satisfied"
+    } else {
+        "codeowners-req--blocked"
+    };
+    let text = if !evaluation.enabled {
+        "Code owner reviews not required.".to_string()
+    } else if evaluation.source_path.is_none() {
+        "Code owner reviews required, but no CODEOWNERS file was found.".to_string()
+    } else if evaluation.matched_groups.is_empty() {
+        format!(
+            "Code owner reviews satisfied; no changed files match {}.",
+            evaluation.source_path.as_deref().unwrap_or("CODEOWNERS")
+        )
+    } else if evaluation.pending_groups.is_empty() {
+        format!(
+            "Code owner reviews satisfied from {}.",
+            evaluation.source_path.as_deref().unwrap_or("CODEOWNERS")
+        )
+    } else {
+        format!(
+            "Waiting for code owners: {}.",
+            pending_codeowner_groups_text(&evaluation.pending_groups)
+        )
+    };
+    format!(
+        r#"<div class="codeowners-req {state}">{text}</div>"#,
+        state = state,
+        text = esc(&text),
+    )
+}
+
+fn pending_codeowner_groups_text(groups: &[CodeOwnerMatchedGroup]) -> String {
+    groups
+        .iter()
+        .map(|group| owner_group_text(&group.owners))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn owner_group_text(owners: &[String]) -> String {
+    owners
+        .iter()
+        .map(|owner| format!("@{}", owner.trim_start_matches('@')))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
 fn render_reviews_card(
     repo: &Repo,
     reviews: &[PullReview],
     comments: &[PullReviewComment],
     thread_resolutions: &[PrThreadResolved],
+    requirements_html: &str,
     csrf: &str,
     pull: &Pull,
     who: &Identity,
@@ -2504,6 +2935,7 @@ fn render_reviews_card(
         r##"<section class="card">
   <div class="card__head"><h2>Reviews <span class="tab__count">{nreviews}</span></h2></div>
   <div class="card__body">
+    {requirements_html}
     <ul class="issue-list">{review_rows}</ul>
     <h3 class="section-subhead">Inline comments <span class="review-unresolved-count">{unresolved_count} unresolved</span></h3>
     <ul class="issue-list" id="pr-inline-thread">{inline_rows}</ul>
@@ -2511,6 +2943,7 @@ fn render_reviews_card(
   </div>
 </section>"##,
         nreviews = reviews.len(),
+        requirements_html = requirements_html,
         unresolved_count = unresolved_count,
         review_rows = review_rows,
         inline_rows = inline_rows,
@@ -3514,6 +3947,78 @@ mod tests {
     }
 
     #[test]
+    fn effective_required_approvals_keeps_legacy_boolean() {
+        let mut repo = Repo {
+            id: "r".into(),
+            owner_sub: "u".into(),
+            name: "n".into(),
+            description: String::new(),
+            is_private: false,
+            default_branch: "main".into(),
+            require_approval: true,
+            required_approvals: 0,
+            require_code_owner_reviews: false,
+            protect_default_branch: false,
+            forked_from_id: String::new(),
+            created_at: 0,
+        };
+        assert_eq!(effective_required_approvals(&repo), 1);
+        repo.required_approvals = 3;
+        assert_eq!(effective_required_approvals(&repo), 3);
+        repo.require_approval = false;
+        repo.required_approvals = 0;
+        assert_eq!(effective_required_approvals(&repo), 0);
+    }
+
+    #[test]
+    fn codeowners_parser_ignores_comments_and_requires_owners() {
+        let rules = parse_codeowners(
+            "\n\
+# ignored\n\
+*.rs @alice @bob # rust owners\n\
+docs/ @docs\n\
+missing-owner\n",
+        );
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].pattern, "*.rs");
+        assert_eq!(
+            rules[0].owners,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        assert_eq!(rules[1].pattern, "docs/");
+        assert_eq!(rules[1].owners, vec!["docs".to_string()]);
+    }
+
+    #[test]
+    fn codeowner_patterns_match_common_paths() {
+        assert!(codeowner_pattern_matches("*.rs", "src/lib.rs"));
+        assert!(codeowner_pattern_matches("/src/*.rs", "src/lib.rs"));
+        assert!(!codeowner_pattern_matches("/src/*.rs", "src/bin/main.rs"));
+        assert!(codeowner_pattern_matches("src/**", "src/bin/main.rs"));
+        assert!(codeowner_pattern_matches("docs/", "guide/docs/intro.md"));
+        assert!(codeowner_pattern_matches("/docs/", "docs/intro.md"));
+        assert!(!codeowner_pattern_matches("/docs/", "guide/docs/intro.md"));
+    }
+
+    #[test]
+    fn codeowner_evaluation_requires_each_matching_group() {
+        let rules = parse_codeowners(
+            "*.rs @alice @bob\n\
+docs/ @docs\n",
+        );
+        let changed = vec!["src/lib.rs".to_string(), "docs/intro.md".to_string()];
+        let approvals = vec!["bob".to_string()];
+        let (matched, pending) = evaluate_codeowner_rules(&rules, &changed, &approvals);
+        assert_eq!(matched.len(), 2);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].owners, vec!["docs".to_string()]);
+
+        let approvals = vec!["bob".to_string(), "docs".to_string()];
+        let (_matched, pending) = evaluate_codeowner_rules(&rules, &changed, &approvals);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn base_pick_prefers_default_then_first() {
         let repo = Repo {
             id: "r".into(),
@@ -3523,6 +4028,8 @@ mod tests {
             is_private: false,
             default_branch: "main".into(),
             require_approval: false,
+            required_approvals: 0,
+            require_code_owner_reviews: false,
             protect_default_branch: false,
             forked_from_id: String::new(),
             created_at: 0,

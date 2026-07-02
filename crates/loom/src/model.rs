@@ -18,8 +18,13 @@ pub struct Repo {
     pub is_private: bool,
     /// Default branch name (HEAD), e.g. `main`.
     pub default_branch: String,
-    /// Whether web merges require at least one PR approval.
+    /// Legacy compatibility flag for repositories that required one PR approval before the
+    /// numeric approval setting existed.
     pub require_approval: bool,
+    /// Number of latest approving reviewers required before web merge. Zero means no approval gate.
+    pub required_approvals: i64,
+    /// Whether matching CODEOWNERS groups must approve before web merge.
+    pub require_code_owner_reviews: bool,
     /// Whether direct smart-HTTP pushes to the default branch are blocked.
     pub protect_default_branch: bool,
     /// Parent repo id when this repo is a fork; empty for original repositories.

@@ -80,6 +80,10 @@ pub struct SettingsForm {
     #[serde(default)]
     pub require_approval: String,
     #[serde(default)]
+    pub required_approvals: String,
+    #[serde(default)]
+    pub require_code_owner_reviews: String,
+    #[serde(default)]
     pub protect_default_branch: String,
 }
 
@@ -104,6 +108,23 @@ pub async fn update(
 
     let description: String = form.description.trim().chars().take(500).collect();
     let default_branch = form.default_branch.trim().to_string();
+    let required_approvals =
+        match parse_required_approvals(&form.required_approvals, form.require_approval == "on") {
+            Ok(n) => n,
+            Err(msg) => {
+                let csrf = auth::new_csrf_token();
+                let body = render_settings(&state, &repo, &csrf, Some(&msg)).await;
+                return Ok(html_with_csrf(
+                    StatusCode::BAD_REQUEST,
+                    page(
+                        &format!("{owner}/{name} · Settings"),
+                        Some(&who.email),
+                        &body,
+                    ),
+                    &csrf,
+                ));
+            }
+        };
 
     // The default branch must be well-formed AND actually exist (when the repo has branches; an
     // empty repo may pre-set any valid name so the first push lands on it).
@@ -136,7 +157,8 @@ pub async fn update(
             &repo.id,
             &description,
             &default_branch,
-            form.require_approval == "on",
+            required_approvals,
+            form.require_code_owner_reviews == "on",
             form.protect_default_branch == "on",
         )
         .await?;
@@ -155,11 +177,26 @@ pub async fn update(
         repo = repo.id,
         actor = who.subject,
         default_branch = default_branch,
-        require_approval = form.require_approval == "on",
+        required_approvals = required_approvals,
+        require_code_owner_reviews = form.require_code_owner_reviews == "on",
         protect_default_branch = form.protect_default_branch == "on",
         "repository settings updated"
     );
     Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+fn parse_required_approvals(raw: &str, legacy_require_approval: bool) -> Result<i64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(if legacy_require_approval { 1 } else { 0 });
+    }
+    let parsed = trimmed
+        .parse::<i64>()
+        .map_err(|_| "Required approvals must be a number from 0 to 100.".to_string())?;
+    if !(0..=100).contains(&parsed) {
+        return Err("Required approvals must be a number from 0 to 100.".to_string());
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,7 +401,14 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
             .collect::<String>();
         format!("<select id=\"default_branch\" name=\"default_branch\">{opts}</select>")
     };
-    let require_checked = if repo.require_approval {
+    let required_approvals = if repo.required_approvals > 0 {
+        repo.required_approvals
+    } else if repo.require_approval {
+        1
+    } else {
+        0
+    };
+    let codeowners_checked = if repo.require_code_owner_reviews {
         " checked"
     } else {
         ""
@@ -402,7 +446,11 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
         <p class="hint hint--muted">What HEAD points at — new clones and the file browser use this branch.</p>
       </div>
       <div class="field field--check">
-        <label class="check"><input type="checkbox" name="require_approval" value="on"{require_checked}> Require at least one approval before web merge</label>
+        <label for="required_approvals">Required approvals before web merge</label>
+        <input class="approval-count" type="number" id="required_approvals" name="required_approvals" min="0" max="100" value="{required_approvals}">
+      </div>
+      <div class="field field--check">
+        <label class="check"><input class="codeowners-req" type="checkbox" name="require_code_owner_reviews" value="on"{codeowners_checked}> Require CODEOWNERS reviews before web merge</label>
       </div>
       <div class="field field--check">
         <label class="check"><input type="checkbox" name="protect_default_branch" value="on"{protect_checked}> Protect the default branch from direct git push</label>
@@ -422,7 +470,8 @@ async fn render_settings(state: &AppState, repo: &Repo, csrf: &str, error: Optio
         csrf = esc(csrf),
         desc = esc(&repo.description),
         branch_field = branch_field,
-        require_checked = require_checked,
+        required_approvals = required_approvals,
+        codeowners_checked = codeowners_checked,
         protect_checked = protect_checked,
         labels_card = labels_card,
         milestones_card = milestones_card,

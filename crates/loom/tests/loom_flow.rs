@@ -2824,6 +2824,7 @@ async fn smart_http_blocks_direct_push_to_protected_default_branch() {
             &repo.id,
             &repo.description,
             &repo.default_branch,
+            0,
             false,
             true
         )

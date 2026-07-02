@@ -32,6 +32,8 @@ fn repo(owner: &str, name: &str, private: bool, created: i64) -> Repo {
         is_private: private,
         default_branch: "main".to_string(),
         require_approval: false,
+        required_approvals: 0,
+        require_code_owner_reviews: false,
         protect_default_branch: false,
         forked_from_id: String::new(),
         created_at: created,
@@ -151,21 +153,23 @@ async fn pg_store_full_integration() {
 
     // Editable settings (description + default branch) via the portable UPDATE.
     assert!(store
-        .update_repo_settings(&got.id, "edited words", "develop", true, true)
+        .update_repo_settings(&got.id, "edited words", "develop", 2, true, true)
         .await
         .unwrap());
     let edited = store.get_repo("alice", "pub").await.unwrap().unwrap();
     assert_eq!(edited.description, "edited words");
     assert_eq!(edited.default_branch, "develop");
     assert!(edited.require_approval);
+    assert_eq!(edited.required_approvals, 2);
+    assert!(edited.require_code_owner_reviews);
     assert!(edited.protect_default_branch);
     assert!(!store
-        .update_repo_settings("rp_missing", "x", "main", false, false)
+        .update_repo_settings("rp_missing", "x", "main", 0, false, false)
         .await
         .unwrap());
     // Restore for the assertions below.
     assert!(store
-        .update_repo_settings(&got.id, "desc pub", "main", false, false)
+        .update_repo_settings(&got.id, "desc pub", "main", 0, false, false)
         .await
         .unwrap());
 

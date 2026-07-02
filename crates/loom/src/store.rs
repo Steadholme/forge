@@ -81,7 +81,8 @@ pub trait Store: Send + Sync {
         id: &str,
         description: &str,
         default_branch: &str,
-        require_approval: bool,
+        required_approvals: i64,
+        require_code_owner_reviews: bool,
         protect_default_branch: bool,
     ) -> Result<bool, StoreError>;
 
@@ -513,15 +514,19 @@ impl Store for InMemoryStore {
         id: &str,
         description: &str,
         default_branch: &str,
-        require_approval: bool,
+        required_approvals: i64,
+        require_code_owner_reviews: bool,
         protect_default_branch: bool,
     ) -> Result<bool, StoreError> {
+        let required_approvals = required_approvals.max(0);
         let mut repos = self.repos.lock().expect("repos lock poisoned");
         for r in repos.iter_mut() {
             if r.id == id {
                 r.description = description.to_string();
                 r.default_branch = default_branch.to_string();
-                r.require_approval = require_approval;
+                r.require_approval = required_approvals > 0;
+                r.required_approvals = required_approvals;
+                r.require_code_owner_reviews = require_code_owner_reviews;
                 r.protect_default_branch = protect_default_branch;
                 return Ok(true);
             }
@@ -1559,7 +1564,7 @@ impl Store for InMemoryStore {
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
-const REPO_COLS: &str = "id, owner_sub, name, description, is_private, default_branch, require_approval, protect_default_branch, forked_from_id, created_at";
+const REPO_COLS: &str = "id, owner_sub, name, description, is_private, default_branch, require_approval, required_approvals, require_code_owner_reviews, protect_default_branch, forked_from_id, created_at";
 const RELEASE_COLS: &str = "id, repo_id, tag_name, target_commit, title, body_md, is_prerelease, is_draft, created_by, created_at, published_at";
 const ISSUE_COLS: &str = "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
 const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
@@ -1607,6 +1612,8 @@ impl PgStore {
                  is_private BOOLEAN NOT NULL DEFAULT FALSE, \
                  default_branch TEXT NOT NULL DEFAULT 'main', \
                  require_approval BOOLEAN NOT NULL DEFAULT FALSE, \
+                 required_approvals BIGINT NOT NULL DEFAULT 0, \
+                 require_code_owner_reviews BOOLEAN NOT NULL DEFAULT FALSE, \
                  protect_default_branch BOOLEAN NOT NULL DEFAULT FALSE, \
                  forked_from_id TEXT NOT NULL DEFAULT '', \
                  created_at BIGINT NOT NULL, \
@@ -1628,6 +1635,22 @@ impl PgStore {
         .await?;
         sqlx::query(
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS require_approval BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS required_approvals BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS require_code_owner_reviews BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE repos SET required_approvals = 1 \
+             WHERE require_approval = TRUE AND required_approvals = 0",
         )
         .execute(&self.pool)
         .await?;
@@ -1989,6 +2012,8 @@ impl PgStore {
             is_private: row.try_get("is_private")?,
             default_branch: row.try_get("default_branch")?,
             require_approval: row.try_get("require_approval")?,
+            required_approvals: row.try_get("required_approvals")?,
+            require_code_owner_reviews: row.try_get("require_code_owner_reviews")?,
             protect_default_branch: row.try_get("protect_default_branch")?,
             forked_from_id: row.try_get("forked_from_id")?,
             created_at: row.try_get("created_at")?,
@@ -2158,8 +2183,9 @@ impl Store for PgStore {
         let result = sqlx::query(
             "INSERT INTO repos \
                  (id, owner_sub, name, description, is_private, default_branch, \
-                  require_approval, protect_default_branch, forked_from_id, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                  require_approval, required_approvals, require_code_owner_reviews, \
+                  protect_default_branch, forked_from_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT (owner_sub, name) DO NOTHING",
         )
         .bind(&repo.id)
@@ -2169,6 +2195,8 @@ impl Store for PgStore {
         .bind(repo.is_private)
         .bind(&repo.default_branch)
         .bind(repo.require_approval)
+        .bind(repo.required_approvals)
+        .bind(repo.require_code_owner_reviews)
         .bind(repo.protect_default_branch)
         .bind(&repo.forked_from_id)
         .bind(repo.created_at)
@@ -2224,16 +2252,21 @@ impl Store for PgStore {
         id: &str,
         description: &str,
         default_branch: &str,
-        require_approval: bool,
+        required_approvals: i64,
+        require_code_owner_reviews: bool,
         protect_default_branch: bool,
     ) -> Result<bool, StoreError> {
+        let required_approvals = required_approvals.max(0);
         let result = sqlx::query(
             "UPDATE repos SET description = $1, default_branch = $2, \
-             require_approval = $3, protect_default_branch = $4 WHERE id = $5",
+             require_approval = $3, required_approvals = $4, \
+             require_code_owner_reviews = $5, protect_default_branch = $6 WHERE id = $7",
         )
         .bind(description)
         .bind(default_branch)
-        .bind(require_approval)
+        .bind(required_approvals > 0)
+        .bind(required_approvals)
+        .bind(require_code_owner_reviews)
         .bind(protect_default_branch)
         .bind(id)
         .execute(&self.pool)
@@ -3619,6 +3652,8 @@ mod tests {
             is_private: private,
             default_branch: "main".into(),
             require_approval: false,
+            required_approvals: 0,
+            require_code_owner_reviews: false,
             protect_default_branch: false,
             forked_from_id: String::new(),
             created_at: created,
@@ -3689,17 +3724,19 @@ mod tests {
         let s = InMemoryStore::new();
         s.create_repo(&repo("u", "a", false, 1)).await.unwrap();
         assert!(s
-            .update_repo_settings("rp_u_a", "new words", "develop", true, true)
+            .update_repo_settings("rp_u_a", "new words", "develop", 2, true, true)
             .await
             .unwrap());
         let updated = s.get_repo("u", "a").await.unwrap().unwrap();
         assert_eq!(updated.description, "new words");
         assert_eq!(updated.default_branch, "develop");
         assert!(updated.require_approval);
+        assert_eq!(updated.required_approvals, 2);
+        assert!(updated.require_code_owner_reviews);
         assert!(updated.protect_default_branch);
         // Unknown id changes nothing.
         assert!(!s
-            .update_repo_settings("nope", "x", "main", false, false)
+            .update_repo_settings("nope", "x", "main", 0, false, false)
             .await
             .unwrap());
     }
