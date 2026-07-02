@@ -582,10 +582,21 @@ impl GitOps {
     /// The unified diff a commit introduced (`git show` against its first parent; a root commit
     /// diffs against the empty tree). `None` when the git invocation fails. For a merge commit
     /// git emits the combined diff, which is empty unless the merge itself changed files.
-    pub async fn commit_patch(&self, owner: &str, name: &str, commit_oid: &str) -> Option<String> {
+    pub async fn commit_patch(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+        ignore_whitespace: bool,
+    ) -> Option<String> {
         let repo = self.repo_path(owner, name);
+        let mut args = vec!["show", "--format="];
+        if ignore_whitespace {
+            args.push("-w");
+        }
+        args.push(commit_oid);
         let out = self
-            .run_git_in_capture(&repo.to_string_lossy(), &["show", "--format=", commit_oid])
+            .run_git_in_capture(&repo.to_string_lossy(), &args)
             .await
             .ok()?;
         if out.status {
@@ -739,11 +750,23 @@ impl GitOps {
 
     /// Unified diff of `base..head` (`git diff base..head`) as a UTF-8 string. `None` when the git
     /// invocation fails (e.g. a branch was deleted). An empty string means the ranges are equal.
-    pub async fn diff(&self, owner: &str, name: &str, base: &str, head: &str) -> Option<String> {
+    pub async fn diff(
+        &self,
+        owner: &str,
+        name: &str,
+        base: &str,
+        head: &str,
+        ignore_whitespace: bool,
+    ) -> Option<String> {
         let repo = self.repo_path(owner, name);
         let range = format!("refs/heads/{base}..refs/heads/{head}");
+        let mut args = vec!["diff"];
+        if ignore_whitespace {
+            args.push("-w");
+        }
+        args.push(&range);
         let out = self
-            .run_git_in_capture(&repo.to_string_lossy(), &["diff", &range])
+            .run_git_in_capture(&repo.to_string_lossy(), &args)
             .await
             .ok()?;
         if out.status {

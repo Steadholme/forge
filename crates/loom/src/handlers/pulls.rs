@@ -1,4 +1,4 @@
-//! Pull requests: branch compare (commits ahead + unified diff), the PR entity (list/detail/
+//! Pull requests: branch compare (commits ahead + diff), the PR entity (list/detail/
 //! create), and a gated server-side merge.
 //!
 //! Mounted behind the same Sluice `auth=sso` route as the rest of the web UI: the gateway injects
@@ -44,6 +44,89 @@ enum PrMergeability {
     Clean,
     Conflicting,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiffView {
+    Unified,
+    Split,
+}
+
+impl DiffView {
+    fn from_param(raw: Option<&str>) -> Self {
+        match raw.unwrap_or_default().trim() {
+            "split" => Self::Split,
+            _ => Self::Unified,
+        }
+    }
+
+    fn as_param(self) -> &'static str {
+        match self {
+            Self::Unified => "unified",
+            Self::Split => "split",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiffOptions {
+    view: DiffView,
+    ignore_whitespace: bool,
+}
+
+impl DiffOptions {
+    pub(crate) fn ignore_whitespace(self) -> bool {
+        self.ignore_whitespace
+    }
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            view: DiffView::Unified,
+            ignore_whitespace: false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DiffQuery {
+    #[serde(default)]
+    pub diff: Option<String>,
+    #[serde(default)]
+    pub w: Option<String>,
+}
+
+impl DiffQuery {
+    pub(crate) fn options(&self) -> DiffOptions {
+        DiffOptions {
+            view: DiffView::from_param(self.diff.as_deref()),
+            ignore_whitespace: truthy_query_flag(self.w.as_deref()),
+        }
+    }
+}
+
+pub(crate) struct DiffControls {
+    action: String,
+    hidden: Vec<(String, String)>,
+}
+
+impl DiffControls {
+    pub(crate) fn new(action: String) -> Self {
+        Self {
+            action,
+            hidden: Vec::new(),
+        }
+    }
+
+    fn with_hidden(mut self, name: &str, value: &str) -> Self {
+        self.hidden.push((name.to_string(), value.to_string()));
+        self
+    }
+}
+
+fn truthy_query_flag(raw: Option<&str>) -> bool {
+    matches!(raw.unwrap_or_default().trim(), "1" | "true" | "on" | "yes")
 }
 
 // ===========================================================================
@@ -167,6 +250,20 @@ pub struct CompareQuery {
     pub base: Option<String>,
     #[serde(default)]
     pub head: Option<String>,
+    #[serde(default)]
+    pub diff: Option<String>,
+    #[serde(default)]
+    pub w: Option<String>,
+}
+
+impl CompareQuery {
+    fn diff_options(&self) -> DiffOptions {
+        DiffQuery {
+            diff: self.diff.clone(),
+            w: self.w.clone(),
+        }
+        .options()
+    }
 }
 
 pub async fn compare(
@@ -181,9 +278,20 @@ pub async fn compare(
 
     let branches = state.git.branches(&repo.owner_sub, &repo.name).await;
     let base = pick_base(&repo, &branches, q.base.as_deref());
+    let diff_options = q.diff_options();
     let head = q.head.unwrap_or_default();
 
-    let body = render_compare(&state, &repo, &branches, &base, &head, &csrf, None).await;
+    let body = render_compare(
+        &state,
+        &repo,
+        &branches,
+        &base,
+        &head,
+        diff_options,
+        &csrf,
+        None,
+    )
+    .await;
     Ok(html_with_csrf(
         StatusCode::OK,
         page(
@@ -328,6 +436,7 @@ pub async fn create(
             &branches,
             &base,
             &head,
+            DiffOptions::default(),
             &csrf,
             Some("Pull request title cannot be empty."),
         )
@@ -432,6 +541,7 @@ pub async fn detail(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, name, number)): Path<(String, String, i64)>,
+    Query(q): Query<DiffQuery>,
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
@@ -465,6 +575,7 @@ pub async fn detail(
         &who,
         &headers,
         &csrf,
+        q.options(),
         None,
     )
     .await?;
@@ -697,6 +808,7 @@ async fn render_detail_with_fresh_metadata(
         who,
         headers,
         csrf,
+        DiffOptions::default(),
         error,
     )
     .await
@@ -1436,13 +1548,14 @@ fn draft_badge(pull: &Pull) -> &'static str {
 }
 
 /// The compare page: a base/head picker + (when a valid head is chosen) the commits ahead, the
-/// unified diff, and a "Create pull request" form.
+/// diff, and a "Create pull request" form.
 async fn render_compare(
     state: &AppState,
     repo: &Repo,
     branches: &[String],
     base: &str,
     head: &str,
+    diff_options: DiffOptions,
     csrf: &str,
     error: Option<&str>,
 ) -> String {
@@ -1480,12 +1593,28 @@ async fn render_compare(
             .await;
         let diff = state
             .git
-            .diff(&repo.owner_sub, &repo.name, base, head)
+            .diff(
+                &repo.owner_sub,
+                &repo.name,
+                base,
+                head,
+                diff_options.ignore_whitespace(),
+            )
             .await
             .unwrap_or_default();
 
         let commits_card = render_commits_card(&commits);
-        let diff_card = render_diff_card(&diff);
+        let diff_card = render_diff_card(
+            &diff,
+            diff_options,
+            DiffControls::new(format!(
+                "/r/{owner}/{name}/compare",
+                owner = repo.owner_sub,
+                name = repo.name,
+            ))
+            .with_hidden("base", base)
+            .with_hidden("head", head),
+        );
         let labels = state.store.list_labels(&repo.id).await.unwrap_or_default();
         let milestones = state
             .store
@@ -1538,6 +1667,7 @@ async fn render_compare(
         );
         format!("{commits_card}{diff_card}{create_form}")
     };
+    let diff_query_inputs = render_diff_query_hidden_inputs(diff_options);
 
     format!(
         r##"{header}
@@ -1545,6 +1675,7 @@ async fn render_compare(
   <div class="card__head"><h2>Compare branches</h2></div>
   <div class="card__body">
     <form method="get" action="/r/{owner}/{name}/compare" class="compare-picker">
+      {diff_query_inputs}
       <span class="compare-picker__label">base</span>
       {base_select}
       <span class="compare-picker__arrow">&larr;</span>
@@ -1557,6 +1688,7 @@ async fn render_compare(
 {comparison}"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
+        diff_query_inputs = diff_query_inputs,
     )
 }
 
@@ -1822,6 +1954,7 @@ async fn render_detail(
     who: &Identity,
     headers: &HeaderMap,
     csrf: &str,
+    diff_options: DiffOptions,
     error: Option<&str>,
 ) -> Result<String, AppError> {
     let (cls, label) = state_badge(pull);
@@ -1872,7 +2005,13 @@ async fn render_detail(
         .await;
     let diff = state
         .git
-        .diff(&repo.owner_sub, &repo.name, &pull.base, &pull.head)
+        .diff(
+            &repo.owner_sub,
+            &repo.name,
+            &pull.base,
+            &pull.head,
+            diff_options.ignore_whitespace(),
+        )
         .await
         .unwrap_or_default();
     let viewed_files = state
@@ -1898,7 +2037,20 @@ async fn render_detail(
         None => String::new(),
     };
     let commits_card = render_commits_card(&commits);
-    let diff_card = render_pr_diff_card(&diff, &viewed_files, repo, pull, csrf);
+    let diff_card = render_pr_diff_card(
+        &diff,
+        &viewed_files,
+        repo,
+        pull,
+        csrf,
+        diff_options,
+        DiffControls::new(format!(
+            "/r/{owner}/{name}/pulls/{number}",
+            owner = repo.owner_sub,
+            name = repo.name,
+            number = pull.number,
+        )),
+    );
     let reviews_card = render_reviews_card(
         repo,
         reviews,
@@ -2604,9 +2756,9 @@ fn render_commits_card(commits: &[CommitInfo]) -> String {
     )
 }
 
-/// Card rendering the unified diff as a colored, escaped table. Large diffs show a size notice.
+/// Card rendering the diff as colored, escaped tables. Large diffs show a size notice.
 /// Shared with the commit page (`pub(crate)`) — the ONE diff renderer in the crate.
-pub(crate) fn render_diff_card(diff: &str) -> String {
+pub(crate) fn render_diff_card(diff: &str, options: DiffOptions, controls: DiffControls) -> String {
     let inner = if diff.trim().is_empty() {
         "<div class=\"card__body\"><p class=\"muted\">No file changes.</p></div>".to_string()
     } else if diff.len() > MAX_BLOB_RENDER_BYTES {
@@ -2616,12 +2768,13 @@ pub(crate) fn render_diff_card(diff: &str) -> String {
     } else {
         format!(
             "<div class=\"card__body card__body--code\">{}</div>",
-            render_diff(diff)
+            render_diff_with_options(diff, options)
         )
     };
+    let controls = render_diff_controls(options, &controls);
     format!(
         r##"<section class="card">
-  <div class="card__head"><h2>Diff</h2></div>
+  <div class="card__head"><h2>Diff</h2>{controls}</div>
   {inner}
 </section>"##
     )
@@ -2633,6 +2786,8 @@ fn render_pr_diff_card(
     repo: &Repo,
     pull: &Pull,
     csrf: &str,
+    options: DiffOptions,
+    controls: DiffControls,
 ) -> String {
     let inner = if diff.trim().is_empty() {
         "<div class=\"card__body\"><p class=\"muted\">No file changes.</p></div>".to_string()
@@ -2643,15 +2798,72 @@ fn render_pr_diff_card(
     } else {
         format!(
             "<div class=\"card__body card__body--code\">{}</div>",
-            render_pr_diff(diff, viewed, repo, pull, csrf)
+            render_pr_diff(diff, viewed, repo, pull, csrf, options)
         )
     };
+    let controls = render_diff_controls(options, &controls);
     format!(
         r##"<section class="card">
-  <div class="card__head"><h2>Diff</h2></div>
+  <div class="card__head"><h2>Diff</h2>{controls}</div>
   {inner}
 </section>"##
     )
+}
+
+fn render_diff_controls(options: DiffOptions, controls: &DiffControls) -> String {
+    let unified_checked = if options.view == DiffView::Unified {
+        " checked"
+    } else {
+        ""
+    };
+    let split_checked = if options.view == DiffView::Split {
+        " checked"
+    } else {
+        ""
+    };
+    let whitespace_checked = if options.ignore_whitespace {
+        " checked"
+    } else {
+        ""
+    };
+    let hidden = controls
+        .hidden
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "<input type=\"hidden\" name=\"{name}\" value=\"{value}\">",
+                name = esc(name),
+                value = esc(value),
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"<form class="diff-toggle" method="get" action="{action}">
+  {hidden}
+  <span class="diff-toggle__views" role="radiogroup" aria-label="Diff view">
+    <label class="diff-toggle__option"><input type="radio" name="diff" value="unified"{unified_checked}> Unified</label>
+    <label class="diff-toggle__option"><input type="radio" name="diff" value="split"{split_checked}> Split</label>
+  </span>
+  <label class="diff-toggle__option diff-toggle__whitespace"><input type="checkbox" name="w" value="1"{whitespace_checked}> Ignore whitespace</label>
+  <button class="btn btn-ghost btn-sm" type="submit">Apply</button>
+</form>"#,
+        action = esc(&controls.action),
+        hidden = hidden,
+        unified_checked = unified_checked,
+        split_checked = split_checked,
+        whitespace_checked = whitespace_checked,
+    )
+}
+
+fn render_diff_query_hidden_inputs(options: DiffOptions) -> String {
+    let mut out = format!(
+        "<input type=\"hidden\" name=\"diff\" value=\"{}\">",
+        options.view.as_param()
+    );
+    if options.ignore_whitespace {
+        out.push_str("<input type=\"hidden\" name=\"w\" value=\"1\">");
+    }
+    out
 }
 
 /// One file's slice of a unified diff (its header line + body lines).
@@ -2678,10 +2890,10 @@ struct FileViewedRenderContext<'a> {
 /// table. Code rows carry `data-line` (their line number in the new file, tracked from the hunk
 /// headers) so the progressive-enhancement layer can anchor an inline comment to a line — with
 /// JavaScript off the standalone inline-comment form still works. Every byte is HTML-escaped.
-fn render_diff(diff: &str) -> String {
+fn render_diff_with_options(diff: &str, options: DiffOptions) -> String {
     let files = parse_diff_files(diff);
     let metas = diff_file_metas(&files, &BTreeMap::new());
-    render_diff_files(&files, &metas, None)
+    render_diff_files(&files, &metas, None, options)
 }
 
 fn render_pr_diff(
@@ -2690,6 +2902,7 @@ fn render_pr_diff(
     repo: &Repo,
     pull: &Pull,
     csrf: &str,
+    options: DiffOptions,
 ) -> String {
     let files = parse_diff_files(diff);
     let viewed_by_path: BTreeMap<String, bool> = viewed
@@ -2701,7 +2914,7 @@ fn render_pr_diff(
     format!(
         "<div class=\"pr-diff\">{}<div class=\"pr-diff__files\">{}</div></div>",
         render_pr_file_tree(&metas, &ctx),
-        render_diff_files(&files, &metas, Some(&ctx)),
+        render_diff_files(&files, &metas, Some(&ctx), options),
     )
 }
 
@@ -2783,12 +2996,13 @@ fn render_diff_files(
     files: &[DiffFile],
     metas: &[DiffFileMeta],
     ctx: Option<&FileViewedRenderContext<'_>>,
+    options: DiffOptions,
 ) -> String {
     let mut out = String::from(
         "<div class=\"diff-toolbar\" data-diff-toolbar></div><div class=\"diff-files\">",
     );
     for (file, meta) in files.iter().zip(metas.iter()) {
-        out.push_str(&render_diff_file(file, meta, ctx));
+        out.push_str(&render_diff_file(file, meta, ctx, options));
     }
     out.push_str("</div>");
     out
@@ -2841,36 +3055,16 @@ fn render_diff_file(
     file: &DiffFile,
     meta: &DiffFileMeta,
     ctx: Option<&FileViewedRenderContext<'_>>,
+    options: DiffOptions,
 ) -> String {
-    let mut rows = String::new();
-    let mut new_line: Option<i64> = None; // current line number in the new file (inside a hunk)
-    for line in &file.lines {
-        let (row_cls, gutter) = classify_diff_line(line);
-        let mut attr = String::new();
-        if line.starts_with("@@") {
-            new_line = parse_hunk_new_start(line);
-        } else if row_cls == "diff-row--add" {
-            if let Some(n) = new_line {
-                attr = format!(" data-line=\"{n}\"");
-                new_line = Some(n + 1);
-            }
-        } else if row_cls == "diff-row--ctx" {
-            if let Some(n) = new_line {
-                attr = format!(" data-line=\"{n}\"");
-                new_line = Some(n + 1);
-            }
-        }
-        rows.push_str(&format!(
-            "<tr class=\"diff-row {row_cls}\"{attr}>\
-               <td class=\"diff-gutter\">{gutter}</td>\
-               <td class=\"diff-code\">{code}</td>\
-             </tr>",
-            row_cls = row_cls,
-            attr = attr,
-            gutter = gutter,
-            code = esc(line),
-        ));
-    }
+    let rows = match options.view {
+        DiffView::Unified => render_unified_diff_rows(file),
+        DiffView::Split => render_split_diff_rows(file),
+    };
+    let table_class = match options.view {
+        DiffView::Unified => "diff diff--unified",
+        DiffView::Split => "diff diff--split",
+    };
     let viewed_cls = if meta.viewed {
         " diff-file--viewed"
     } else {
@@ -2897,7 +3091,7 @@ fn render_diff_file(
              <span class=\"diff-file__stat\"><span class=\"diff-add\">+{adds}</span> <span class=\"diff-del\">-{dels}</span></span>\
            </summary>\
            {controls}\
-           <table class=\"diff\"><tbody>{rows}</tbody></table>\
+           <table class=\"{table_class}\"><tbody>{rows}</tbody></table>\
          </details>",
         anchor = meta.anchor,
         viewed_cls = viewed_cls,
@@ -2907,8 +3101,219 @@ fn render_diff_file(
         adds = meta.additions,
         dels = meta.deletions,
         controls = controls,
+        table_class = table_class,
         rows = rows,
     )
+}
+
+fn render_unified_diff_rows(file: &DiffFile) -> String {
+    let mut rows = String::new();
+    let mut new_line: Option<i64> = None; // current line number in the new file (inside a hunk)
+    for line in &file.lines {
+        let (row_cls, gutter) = classify_diff_line(line);
+        let mut attr = String::new();
+        if line.starts_with("@@") {
+            new_line = parse_hunk_new_start(line);
+        } else if row_cls == "diff-row--add" {
+            if let Some(n) = new_line {
+                attr = format!(" data-line=\"{n}\"");
+                new_line = Some(n + 1);
+            }
+        } else if row_cls == "diff-row--ctx" {
+            if let Some(n) = new_line {
+                attr = format!(" data-line=\"{n}\"");
+                new_line = Some(n + 1);
+            }
+        }
+        rows.push_str(&render_unified_diff_row(
+            row_cls,
+            attr.as_str(),
+            gutter,
+            line,
+        ));
+    }
+    rows
+}
+
+fn render_unified_diff_row(row_cls: &str, attr: &str, gutter: &str, line: &str) -> String {
+    format!(
+        "<tr class=\"diff-row {row_cls}\"{attr}>\
+           <td class=\"diff-gutter\">{gutter}</td>\
+           <td class=\"diff-code\">{code}</td>\
+         </tr>",
+        row_cls = row_cls,
+        attr = attr,
+        gutter = gutter,
+        code = esc(line),
+    )
+}
+
+fn render_split_diff_rows(file: &DiffFile) -> String {
+    let mut rows = String::new();
+    let mut old_line: Option<i64> = None;
+    let mut new_line: Option<i64> = None;
+    let mut idx = 0usize;
+
+    while idx < file.lines.len() {
+        let line = &file.lines[idx];
+        let (row_cls, gutter) = classify_diff_line(line);
+        if line.starts_with("@@") {
+            old_line = parse_hunk_old_start(line);
+            new_line = parse_hunk_new_start(line);
+            rows.push_str(&render_unified_diff_row(row_cls, "", gutter, line));
+            idx += 1;
+        } else if row_cls == "diff-row--del" {
+            let del_start = idx;
+            while idx < file.lines.len()
+                && classify_diff_line(&file.lines[idx]).0 == "diff-row--del"
+            {
+                idx += 1;
+            }
+            let add_start = idx;
+            while idx < file.lines.len()
+                && classify_diff_line(&file.lines[idx]).0 == "diff-row--add"
+            {
+                idx += 1;
+            }
+            rows.push_str(&render_split_change_rows(
+                &file.lines[del_start..add_start],
+                &file.lines[add_start..idx],
+                &mut old_line,
+                &mut new_line,
+            ));
+        } else if row_cls == "diff-row--add" {
+            let add_start = idx;
+            while idx < file.lines.len()
+                && classify_diff_line(&file.lines[idx]).0 == "diff-row--add"
+            {
+                idx += 1;
+            }
+            rows.push_str(&render_split_change_rows(
+                &[],
+                &file.lines[add_start..idx],
+                &mut old_line,
+                &mut new_line,
+            ));
+        } else if row_cls == "diff-row--ctx" {
+            let old_no = old_line;
+            let new_no = new_line;
+            let attr = data_line_attr(new_no);
+            let code = context_diff_content(line);
+            rows.push_str(&render_split_diff_row(
+                "diff-row--ctx",
+                &attr,
+                old_no,
+                new_no,
+                "diff-side--old",
+                code,
+                "diff-side--new",
+                code,
+            ));
+            old_line = old_line.map(|n| n + 1);
+            new_line = new_line.map(|n| n + 1);
+            idx += 1;
+        } else {
+            rows.push_str(&render_unified_diff_row(row_cls, "", gutter, line));
+            idx += 1;
+        }
+    }
+
+    rows
+}
+
+fn render_split_change_rows(
+    deletions: &[String],
+    additions: &[String],
+    old_line: &mut Option<i64>,
+    new_line: &mut Option<i64>,
+) -> String {
+    let mut rows = String::new();
+    let count = deletions.len().max(additions.len());
+    for idx in 0..count {
+        let old_raw = deletions.get(idx).map(String::as_str);
+        let new_raw = additions.get(idx).map(String::as_str);
+        let old_no = old_raw.and(*old_line);
+        let new_no = new_raw.and(*new_line);
+        let attr = data_line_attr(new_no);
+        let row_cls = match (old_raw.is_some(), new_raw.is_some()) {
+            (true, true) => "diff-row--change",
+            (true, false) => "diff-row--del",
+            (false, true) => "diff-row--add",
+            (false, false) => "diff-row--ctx",
+        };
+        let old_cls = if old_raw.is_some() {
+            "diff-side--old diff-side--del"
+        } else {
+            "diff-side--old diff-side--empty"
+        };
+        let new_cls = if new_raw.is_some() {
+            "diff-side--new diff-side--add"
+        } else {
+            "diff-side--new diff-side--empty"
+        };
+        rows.push_str(&render_split_diff_row(
+            row_cls,
+            &attr,
+            old_no,
+            new_no,
+            old_cls,
+            old_raw.map(changed_diff_content).unwrap_or(""),
+            new_cls,
+            new_raw.map(changed_diff_content).unwrap_or(""),
+        ));
+        if old_raw.is_some() {
+            *old_line = (*old_line).map(|n| n + 1);
+        }
+        if new_raw.is_some() {
+            *new_line = (*new_line).map(|n| n + 1);
+        }
+    }
+    rows
+}
+
+fn render_split_diff_row(
+    row_cls: &str,
+    attr: &str,
+    old_no: Option<i64>,
+    new_no: Option<i64>,
+    old_cls: &str,
+    old_code: &str,
+    new_cls: &str,
+    new_code: &str,
+) -> String {
+    format!(
+        "<tr class=\"diff-row {row_cls}\"{attr}>\
+           <td class=\"diff-gutter diff-gutter--split\">\
+             <span class=\"diff-side diff-side--old\">{old_no}</span>\
+             <span class=\"diff-side diff-side--new\">{new_no}</span>\
+           </td>\
+           <td class=\"diff-code diff-code--split\">\
+             <span class=\"diff-side {old_cls}\">{old_code}</span>\
+             <span class=\"diff-side {new_cls}\">{new_code}</span>\
+           </td>\
+         </tr>",
+        row_cls = row_cls,
+        attr = attr,
+        old_no = old_no.map(|n| n.to_string()).unwrap_or_default(),
+        new_no = new_no.map(|n| n.to_string()).unwrap_or_default(),
+        old_cls = old_cls,
+        old_code = esc(old_code),
+        new_cls = new_cls,
+        new_code = esc(new_code),
+    )
+}
+
+fn data_line_attr(line: Option<i64>) -> String {
+    line.map(|n| format!(" data-line=\"{n}\""))
+        .unwrap_or_default()
+}
+
+fn context_diff_content(line: &str) -> &str {
+    line.strip_prefix(' ').unwrap_or(line)
+}
+
+fn changed_diff_content(line: &str) -> &str {
+    line.get(1..).unwrap_or("")
 }
 
 fn render_file_viewed_form(
@@ -2953,10 +3358,20 @@ fn path_from_plus_header(line: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
+/// Parse the old-file starting line from a `@@ -a,b +c,d @@` hunk header (returns `a`).
+fn parse_hunk_old_start(line: &str) -> Option<i64> {
+    parse_hunk_start(line, '-')
+}
+
 /// Parse the new-file starting line from a `@@ -a,b +c,d @@` hunk header (returns `c`).
 fn parse_hunk_new_start(line: &str) -> Option<i64> {
-    let plus = line.split_whitespace().find(|t| t.starts_with('+'))?;
-    plus.trim_start_matches('+')
+    parse_hunk_start(line, '+')
+}
+
+fn parse_hunk_start(line: &str, marker: char) -> Option<i64> {
+    let token = line.split_whitespace().find(|t| t.starts_with(marker))?;
+    token
+        .trim_start_matches(marker)
         .split(',')
         .next()?
         .parse::<i64>()
@@ -3020,10 +3435,82 @@ mod tests {
 
     #[test]
     fn diff_render_escapes_content() {
-        let html = render_diff("+<script>alert(1)</script>\n context\n");
+        let html = render_diff_with_options(
+            "+<script>alert(1)</script>\n context\n",
+            DiffOptions::default(),
+        );
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("diff-row--add"));
+    }
+
+    #[test]
+    fn diff_query_defaults_to_unified_without_whitespace_ignore() {
+        let options = DiffQuery::default().options();
+        assert_eq!(options.view, DiffView::Unified);
+        assert!(!options.ignore_whitespace());
+
+        let options = DiffQuery {
+            diff: Some("split".to_string()),
+            w: Some("1".to_string()),
+        }
+        .options();
+        assert_eq!(options.view, DiffView::Split);
+        assert!(options.ignore_whitespace());
+
+        let options = DiffQuery {
+            diff: Some("sideways".to_string()),
+            w: Some("no".to_string()),
+        }
+        .options();
+        assert_eq!(options.view, DiffView::Unified);
+        assert!(!options.ignore_whitespace());
+    }
+
+    #[test]
+    fn split_diff_render_aligns_old_and_new_sides() {
+        let diff = "diff --git a/file.txt b/file.txt\n\
+--- a/file.txt\n\
++++ b/file.txt\n\
+@@ -1,3 +1,4 @@\n\
+ one\n\
+-two\n\
++two <changed>\n\
+ three\n\
++four\n";
+        let html = render_diff_with_options(
+            diff,
+            DiffOptions {
+                view: DiffView::Split,
+                ignore_whitespace: false,
+            },
+        );
+        assert!(html.contains("class=\"diff diff--split\""));
+        assert!(html.contains("diff-side--old diff-side--del"));
+        assert!(html.contains("diff-side--new diff-side--add"));
+        assert!(html.contains("data-line=\"2\""));
+        assert!(html.contains("data-line=\"4\""));
+        assert!(html.contains("&lt;changed&gt;"));
+        assert!(!html.contains("<changed>"));
+    }
+
+    #[test]
+    fn diff_card_renders_query_controls() {
+        let html = render_diff_card(
+            "",
+            DiffOptions {
+                view: DiffView::Split,
+                ignore_whitespace: true,
+            },
+            DiffControls::new("/r/alice/proj/compare".to_string())
+                .with_hidden("base", "main")
+                .with_hidden("head", "feature"),
+        );
+        assert!(html.contains("class=\"diff-toggle\""));
+        assert!(html.contains("name=\"base\" value=\"main\""));
+        assert!(html.contains("name=\"head\" value=\"feature\""));
+        assert!(html.contains("name=\"diff\" value=\"split\" checked"));
+        assert!(html.contains("name=\"w\" value=\"1\" checked"));
     }
 
     #[test]

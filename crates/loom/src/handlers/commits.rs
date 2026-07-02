@@ -24,6 +24,7 @@ use serde::Deserialize;
 use crate::auth;
 use crate::error::AppError;
 use crate::gitops::{CommitDetail, CommitInfo};
+use crate::handlers::pulls::{DiffControls, DiffQuery};
 use crate::handlers::repos::{header_with_counts, load_visible_repo};
 use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, page, short_oid};
 use crate::model::{CommitStatus, Repo};
@@ -278,9 +279,11 @@ pub async fn detail(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, name, sha)): Path<(String, String, String)>,
+    Query(q): Query<DiffQuery>,
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let diff_options = q.options();
     if !is_hex_oid(sha.trim()) {
         return Err(AppError::BadRequest("Invalid commit id.".to_string()));
     }
@@ -300,7 +303,12 @@ pub async fn detail(
         .await;
     let patch = state
         .git
-        .commit_patch(&repo.owner_sub, &repo.name, &oid)
+        .commit_patch(
+            &repo.owner_sub,
+            &repo.name,
+            &oid,
+            diff_options.ignore_whitespace(),
+        )
         .await
         .unwrap_or_default();
     let aggregate = state
@@ -311,7 +319,14 @@ pub async fn detail(
     let header = header_with_counts(&state, &repo, "commits").await;
     let body = format!(
         "{header}{commit}",
-        commit = render_commit(&repo, &detail, &stat, &patch, aggregate.as_deref()),
+        commit = render_commit(
+            &repo,
+            &detail,
+            &stat,
+            &patch,
+            aggregate.as_deref(),
+            diff_options,
+        ),
     );
     Ok(html_ok(page(
         &format!("{owner}/{name} · {short}", short = short_oid(&oid)),
@@ -327,6 +342,7 @@ fn render_commit(
     stat: &str,
     patch: &str,
     aggregate: Option<&str>,
+    diff_options: crate::handlers::pulls::DiffOptions,
 ) -> String {
     let parents = if detail.parents.is_empty() {
         "<span class=\"muted\">none (root commit)</span>".to_string()
@@ -392,7 +408,16 @@ fn render_commit(
         parents = parents,
         stat = stat_html,
         message_block = message_block,
-        diff = crate::handlers::pulls::render_diff_card(patch),
+        diff = crate::handlers::pulls::render_diff_card(
+            patch,
+            diff_options,
+            DiffControls::new(format!(
+                "/r/{owner}/{name}/commit/{oid}",
+                owner = repo.owner_sub,
+                name = repo.name,
+                oid = detail.oid,
+            )),
+        ),
     )
 }
 
@@ -510,7 +535,7 @@ fn clean_status_request(input: StatusRequest) -> Result<CleanStatusRequest, AppE
         _ => {
             return Err(AppError::BadRequest(
                 "state must be one of pending, success, failure, error.".to_string(),
-            ))
+            ));
         }
     };
     let context = input.context.trim();

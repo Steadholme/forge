@@ -1043,6 +1043,19 @@ fn commit_files(
     }
 }
 
+fn seed_whitespace_only_change(git_dir: &str) -> String {
+    let base = commit_files(git_dir, None, "base", &[("file.txt", "one\n")]);
+    git_capture(git_dir, &["update-ref", "refs/heads/main", &base], "");
+    let feature = commit_files(
+        git_dir,
+        Some(&base),
+        "whitespace",
+        &[("file.txt", "one   \n")],
+    );
+    git_capture(git_dir, &["update-ref", "refs/heads/feature", &feature], "");
+    feature
+}
+
 async fn open_pull(
     app: &axum::Router,
     repo: &str,
@@ -1398,6 +1411,57 @@ async fn pull_request_compare_create_and_merge() {
         StatusCode::BAD_REQUEST,
         "merged PR is terminal"
     );
+}
+
+#[tokio::test]
+async fn diff_query_options_support_split_and_ignore_whitespace() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_whitespace_only_change(&git_dir);
+
+    let split = send(
+        &app,
+        get(
+            "/r/alice/proj/compare?base=main&head=feature&diff=split",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(split.status, StatusCode::OK);
+    assert!(split.body.contains("class=\"diff diff--split\""));
+    assert!(split.body.contains("diff-side--old"));
+    assert!(split.body.contains("diff-side--new"));
+    assert!(split.body.contains("name=\"diff\" value=\"split\" checked"));
+
+    let ignored = send(
+        &app,
+        get(
+            "/r/alice/proj/compare?base=main&head=feature&w=1",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(ignored.status, StatusCode::OK);
+    assert!(ignored.body.contains("No file changes."));
+    assert!(ignored.body.contains("name=\"w\" value=\"1\" checked"));
+    assert!(!ignored.body.contains("class=\"diff diff--unified\""));
+
+    let commit_ignored = send(
+        &app,
+        get(
+            &format!("/r/alice/proj/commit/{feature_oid}?w=1"),
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(commit_ignored.status, StatusCode::OK);
+    assert!(commit_ignored.body.contains("No file changes."));
+    assert!(commit_ignored
+        .body
+        .contains("name=\"w\" value=\"1\" checked"));
 }
 
 #[tokio::test]
