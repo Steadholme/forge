@@ -1662,3 +1662,127 @@ mark.code-search-hit {
   .diff-toggle__views .diff-toggle__option,
   .diff-toggle__whitespace { transition:none; }
 }
+
+
+/* =========================================================================
+   Review gate — N approvals + CODEOWNERS merge requirements
+   -------------------------------------------------------------------------
+   SSR (handlers/pulls.rs :: render_review_requirements / render_codeowners_
+   requirement) emits two consecutive status rows inside the reviews card:
+
+     <div class="approval-status approval-status--satisfied|--blocked">
+       <strong>Approvals</strong>
+       <span class="approval-count">1 of 2 approvals</span>
+     </div>
+     <div class="codeowners-req codeowners-req--satisfied|--blocked">…text…</div>
+
+   These are the merge-gate siblings of the .pr-mergeability bar above, so they
+   speak the SAME visual language: a soft state wash, a left accent rail, and a
+   masked status glyph whose SHAPE (check vs clock) carries the state alongside
+   hue and the copy — never colour alone. All colour resolves through Odyssey v2
+   semantic tokens, so dark mode follows the theme layer automatically and the
+   global prefers-reduced-motion kill-switch applies (no motion is added here).
+
+   Hue map — satisfied → --ok系 (met, green); blocked → --warn系 (WAITING on a
+   pending approval / owner, amber). --warn (not --down) keeps the recoverable
+   "not yet" gate distinct from the hard --down conflict/error bar & the
+   .alert-danger "Cannot merge yet:" notice, so two reds never stack.
+   ========================================================================= */
+
+/* Per-state knobs, themed via the modifiers below. --rq-accent drives the rail
+   + glyph, --rq-ink the state-hued chip text, --rq-soft the wash, --rq-edge the
+   hairline. Base defaults keep the cascade flat (neutral until a state lands). */
+.approval-status,
+.codeowners-req {
+  --rq-accent: var(--unknown);
+  --rq-ink: var(--ink-2);
+  --rq-soft: var(--surface-3);
+  --rq-edge: var(--border);
+  --rq-icon: none;
+  border:1px solid var(--rq-edge);
+  border-left:3px solid var(--rq-accent);
+  border-radius:var(--r-sm);
+  background:var(--rq-soft);
+}
+
+/* Status glyph — the accent colour masked through an inline SVG, so the mark is
+   a checkmark (satisfied) or a clock (waiting). Where CSS masking is unsupported
+   it degrades to a plain accent dot (border-radius:50%), still a meaningful cue. */
+.approval-status::before,
+.codeowners-req::before {
+  content:"";
+  flex:none;
+  width:16px; height:16px; margin-top:1px;
+  border-radius:50%;
+  background:var(--rq-accent);
+  -webkit-mask:var(--rq-icon) center / 16px 16px no-repeat;
+          mask:var(--rq-icon) center / 16px 16px no-repeat;
+}
+
+/* Approvals row — glyph · "Approvals" · count chip pinned to the trailing edge.
+   The label stays neutral --ink (state-independent word); the state-bearing
+   count is the chip, so hued text sits only on the white chip (safe contrast). */
+.approval-status {
+  display:flex; align-items:center; gap:10px;
+  margin:4px 0 8px;
+  padding:9px 12px;
+}
+.approval-status strong {
+  font-size:13px; font-weight:650; line-height:1.3;
+  color:var(--ink);            /* ~13:1 on every wash — label never state-hued */
+}
+
+/* "X of N approvals" — a status chip lifted off the wash on the plain --surface,
+   tabular figures so the count stays crisp and aligned as it ticks up. Hued text
+   lives here only: --accent-ink ≈ 6.5:1 / --warn-ink ≈ 5.0:1 on --surface (AA). */
+.approval-count {
+  margin-left:auto;
+  display:inline-flex; align-items:center;
+  height:22px; padding:0 10px;
+  border-radius:var(--r-pill);
+  font-size:12px; font-weight:650; letter-spacing:.01em;
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+  color:var(--rq-ink);
+  background:var(--surface);
+  border:1px solid var(--rq-edge);
+}
+
+/* Code-owner row — glyph + a single line of guidance ("Waiting for code owners:
+   …" / "…satisfied from CODEOWNERS."). Body copy stays --ink-2 (≥7:1 on every
+   wash): weakened but fully legible, letting the rail + glyph carry the state —
+   the "blocked but clear" treatment that rhymes with the dimmed merge button. */
+.codeowners-req {
+  display:flex; align-items:flex-start; gap:10px;
+  margin:0 0 4px;
+  padding:9px 12px;
+  font-size:12.5px; line-height:1.45;
+  color:var(--ink-2);
+}
+
+/* Satisfied — success family: --ok rail + check glyph over the softest green
+   wash; chip text uses the darker --accent-ink so it clears AA on white. */
+.approval-status--satisfied,
+.codeowners-req--satisfied {
+  --rq-accent: var(--ok);
+  --rq-ink: var(--accent-ink);
+  --rq-soft: var(--ok-soft);
+  --rq-edge: var(--ok-border);
+  --rq-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='m8.4 12.2 2.4 2.4 4.8-5.4'/></svg>");
+}
+
+/* Blocked — waiting family: --warn rail + clock glyph over the amber wash. Reads
+   as "pending, not now" and echoes the de-emphasised disabled merge button; the
+   distinct clock shape separates it from the .pr-mergeability conflict triangle. */
+.approval-status--blocked,
+.codeowners-req--blocked {
+  --rq-accent: var(--warn);
+  --rq-ink: var(--warn-ink);
+  --rq-soft: var(--warn-soft);
+  --rq-edge: var(--warn-border);
+  --rq-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7.6V12l3 1.8'/></svg>");
+}
+
+/* Reduced motion: no transition/animation is introduced here, so the global
+   guard needs no addition. Dark mode: every colour above resolves through the
+   shared Odyssey tokens, so it follows the theme layer with no override. */
