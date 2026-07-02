@@ -994,3 +994,29 @@ th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
     max-height:220px;                  /* internal scroll so it never dominates */
   }
 }
+
+/* --- Single-file history -------------------------------------------------- */
+/* Backend markup (render_file_history): section.card.file-history holds a
+   .card__head (breadcrumb + "History <ref>") and a
+   ul.commit-list.file-history__list of li.commit-item.file-history__item, each
+   with an <a class="commit-item__subject file-history__message"> subject, a
+   .commit-item__meta row (.oid chip + author + relative time) and a shared
+   .pager. It deliberately REUSES the .commit-item / .commit-list / .oid / .pager
+   system, so list layout, the hairline row separators (.commit-item border-top),
+   the de-emphasised --ink-3 meta and the accent .oid chip are already inherited.
+   Only the file-scoped differences live below — no re-declaring shared styles. */
+
+/* Page head: keep the file path prominent and let "History <ref>" sit at the
+   far right, so the "<path>  …  <ref>" relationship reads at a glance; wraps
+   gracefully on narrow viewports. */
+.file-history .card__head { flex-wrap:wrap; row-gap:6px; }
+.file-history .card__head .muted { margin-left:auto; }
+
+/* Subject reads as a title in strong ink (not the default accent link colour),
+   then earns accent + underline on hover/focus to signal it opens the commit.
+   Hover underline is inherited from the global a:hover rule; focus-visible gets
+   its own so keyboard users see the same affordance. The color transition is
+   neutralised automatically by the global prefers-reduced-motion guard. */
+.file-history__message { color:var(--ink); transition:color var(--dur) var(--ease); }
+.file-history__message:hover { color:var(--accent-ink); }
+.file-history__message:focus-visible { color:var(--accent-ink); text-decoration:underline; text-underline-offset:2px; }
