@@ -1177,3 +1177,104 @@ mark.code-search-hit {
   .code-search__file > h3 a,
   .code-search__line { transition:none; }
 }
+
+/* ---- PR review: resolve conversation ------------------------------------
+   Pure-CSS skin for the "Resolve conversation" surface rendered by
+   handlers/pulls.rs (render_inline_threads / render_thread_resolution_form).
+   Reuses Odyssey v2 tokens only — no new fonts/libs/links. Three ideas:
+     · a resolved thread recedes into a calm --ok strip that collapses to a
+       one-line "Resolved by …" summary — distinct at a glance from open ones;
+     · resolve/unresolve extend .btn-secondary with restrained intent;
+     · the "N unresolved" tally rides the .state-badge / .tab__count pill idiom.
+   Everything is token-based, so it follows any future dark palette for free. */
+
+/* --- Thread comment group: stack a thread's comments -------------------- */
+.thread-comments { display:flex; flex-direction:column; gap:10px; }
+.thread-comment { display:flex; flex-direction:column; gap:6px; }
+
+/* --- Resolved thread: a collapsed, --ok-tinted strip that recedes ------- */
+/* The <details> is closed by default (SSR omits `open`), so a resolved thread
+   reads as one quiet line until expanded — the primary "weakening". */
+.issue-item.thread-resolved { gap:0; }
+.thread-resolved__details {
+  border:1px solid var(--ok-border);
+  border-radius:var(--r-sm);
+  background:var(--surface);
+  overflow:hidden;
+}
+/* Summary line — the resolved header. Soft --ok wash + a checkmark say "done"
+   without shouting; the "Resolved by …" meta sits back at --ink-2. */
+.thread-summary {
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:9px 13px;
+  background:var(--ok-soft);
+  color:var(--ink-2); font-size:12px; line-height:1.4;
+  cursor:pointer; user-select:none; -webkit-user-select:none;
+  list-style:none;                       /* drop the default disclosure marker */
+  transition:background var(--dur) var(--ease);
+}
+.thread-summary::-webkit-details-marker { display:none; }
+/* Leading check — the resolved glyph, in the ok ink. */
+.thread-summary::before {
+  content:"\2713";                       /* ✓ — from the font stack, no asset */
+  display:inline-flex; align-items:center; justify-content:center;
+  flex:0 0 auto; width:16px; height:16px;
+  border-radius:var(--r-pill);
+  background:var(--ok); color:#fff;
+  font-size:10px; font-weight:700; line-height:1;
+}
+/* The anchor (path:line) stays legible; the rest of the line recedes. */
+.thread-summary > span {
+  color:var(--ink); font-weight:600;
+  font-family:var(--mono); font-size:11.5px;
+}
+/* Trailing caret — rotates open when the thread expands. */
+.thread-summary::after {
+  content:""; flex:0 0 auto; margin-left:auto;
+  width:7px; height:7px;
+  border-right:1.5px solid var(--ink-3); border-bottom:1.5px solid var(--ink-3);
+  transform:rotate(-45deg);
+  transition:transform var(--dur) var(--ease);
+}
+.thread-summary:hover { background:var(--ok-border); }
+.thread-resolved__details[open] .thread-summary {
+  border-bottom:1px solid var(--ok-border);
+}
+.thread-resolved__details[open] .thread-summary::after { transform:rotate(45deg); }
+/* Expanded body: comments + the Unresolve control, padded inside the strip. */
+.thread-resolved__details[open] .thread-comments { padding:12px 13px; }
+.thread-resolved__details[open] .thread-resolution-form { padding:0 13px 12px; }
+
+/* --- Resolution controls: keep the button compact & left-aligned -------- */
+.thread-resolution-form { align-self:flex-start; margin:0; }
+
+/* --- Resolve / Unresolve: intent layered on the .btn-secondary base ----- */
+/* Resolve is the positive, forward action — a restrained --ok lean at rest
+   that deepens into a soft ok wash on hover ("mark this done"). */
+.btn-resolve { color:var(--ok-ink); }
+.btn-resolve:hover,
+.btn-resolve:focus-visible {
+  background:var(--ok-soft); color:var(--ok-ink);
+  border-color:var(--ok-border);
+}
+/* Unresolve reopens a settled thread — stay neutral, muted-to-normal. */
+.btn-unresolve { color:var(--ink-2); }
+.btn-unresolve:hover,
+.btn-unresolve:focus-visible { color:var(--ink); }
+
+/* --- "N unresolved" tally: a neutral pill in the .tab__count idiom ------ */
+/* Rendered for the thread total (incl. "0 unresolved"), so keep it calm and
+   neutral — this is a tally, not an alarm. */
+.review-unresolved-count {
+  display:inline-flex; align-items:center;
+  margin-left:8px; vertical-align:middle;
+  padding:1px 9px; border-radius:var(--r-pill);
+  background:var(--bg-2); color:var(--ink-2);
+  font-size:11px; font-weight:700; line-height:1.5;
+}
+
+/* --- Motion: only the caret animates above; honor reduced-motion -------- */
+@media (prefers-reduced-motion:reduce) {
+  .thread-summary,
+  .thread-summary::after { transition:none; }
+}
