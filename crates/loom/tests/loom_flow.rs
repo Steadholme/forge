@@ -376,7 +376,9 @@ async fn issue_detail_comments_filter_and_admin_gate() {
         detail.body.contains("<strong>bold</strong>"),
         "issue body markdown rendered"
     );
-    assert!(detail.body.contains("Add a comment"));
+    assert!(detail
+        .body
+        .contains("<form method=\"post\" action=\"/r/alice/proj/issues/1/comment\">"));
     assert!(
         detail.body.contains("Close issue"),
         "author sees the close action"
@@ -389,7 +391,9 @@ async fn issue_detail_comments_filter_and_admin_gate() {
         "non-moderator has no close action"
     );
     assert!(
-        carol_view.body.contains("Add a comment"),
+        carol_view
+            .body
+            .contains("<textarea id=\"comment-body\" name=\"body\""),
         "any signed-in user can comment"
     );
     let carol_csrf = carol_view.csrf_cookie().expect("csrf on detail");
@@ -737,8 +741,12 @@ async fn labels_milestones_assignees_and_issue_filters() {
     assert!(by_milestone.body.contains("milestone v1"));
 
     let detail = send(&app, get("/r/alice/proj/issues/1", Some("alice"))).await;
-    assert!(detail.body.contains("Assignee: bob"));
-    assert!(detail.body.contains("Milestone: v1"));
+    assert!(detail
+        .body
+        .contains("<h3 class=\"side__label\">Assignee</h3><div class=\"side__value\">bob</div>"));
+    assert!(detail
+        .body
+        .contains("<h3 class=\"side__label\">Milestone</h3><div class=\"side__value\">v1</div>"));
     assert!(detail.body.contains("bug"));
 }
 
@@ -895,8 +903,15 @@ async fn code_search_groups_highlights_links_and_respects_visibility() {
 
     let repo_page = send(&app, get("/r/alice/docs", Some("alice"))).await;
     assert_eq!(repo_page.status, StatusCode::OK);
-    assert!(repo_page.body.contains("class=\"card code-search\""));
+    assert!(repo_page
+        .body
+        .contains("class=\"code-toolbar__q\" type=\"search\" name=\"q\""));
     assert!(repo_page.body.contains("action=\"/r/alice/docs/search\""));
+    assert!(repo_page.body.contains("<a class=\"filebox__commit-msg\""));
+    assert!(repo_page.body.contains(">seed</a>"));
+    assert!(repo_page
+        .body
+        .contains("<span class=\"tree-row__msg\"><a href=\"/r/alice/docs/commit/"));
 
     let search = send(
         &app,
@@ -1285,6 +1300,15 @@ async fn pull_request_compare_create_and_merge() {
     assert!(list.body.contains("Draft"));
     assert!(list.body.contains("assigned to bob"));
     assert!(list.body.contains("reviewer carol"));
+    assert!(list
+        .body
+        .contains("href=\"/r/alice/proj/pulls?state=open\""));
+    assert!(list
+        .body
+        .contains("href=\"/r/alice/proj/pulls?state=closed\""));
+    assert!(list.body.contains("href=\"/r/alice/proj/pulls?state=all\""));
+    let closed_list = send(&app, get("/r/alice/proj/pulls?state=closed", Some("alice"))).await;
+    assert!(!closed_list.body.contains("href=\"/r/alice/proj/pulls/1\""));
 
     // Detail shows draft state for the owner and hides the merge button.
     let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
@@ -1293,8 +1317,12 @@ async fn pull_request_compare_create_and_merge() {
     assert!(detail.body.contains("Draft pull requests cannot be merged"));
     assert!(detail.body.contains("btn-ready-review"));
     assert!(!detail.body.contains(">Convert to draft</button>"));
-    assert!(detail.body.contains("assignee bob"));
-    assert!(detail.body.contains("reviewer carol"));
+    assert!(detail
+        .body
+        .contains("<h3 class=\"side__label\">Assignee</h3><div class=\"side__value\">bob</div>"));
+    assert!(detail
+        .body
+        .contains("<h3 class=\"side__label\">Reviewers</h3><div class=\"side__value\">carol"));
     assert!(detail.body.contains("class=\"pr-filetree\""));
     assert!(detail.body.contains("Viewed 0/1"));
     assert!(detail.body.contains("href=\"#diff-file-1\""));
@@ -1471,8 +1499,12 @@ async fn pull_request_compare_create_and_merge() {
     assert_eq!(pull.reviewer_sub, "erin");
 
     let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
-    assert!(detail.body.contains("assignee dave"));
-    assert!(detail.body.contains("reviewer erin"));
+    assert!(detail
+        .body
+        .contains("<h3 class=\"side__label\">Assignee</h3><div class=\"side__value\">dave</div>"));
+    assert!(detail
+        .body
+        .contains("<h3 class=\"side__label\">Reviewers</h3><div class=\"side__value\">erin"));
     let csrf = detail.csrf_cookie().expect("csrf after metadata update");
 
     // --- gating: a non-owner, non-author cannot merge (403) ----------------
@@ -2756,8 +2788,10 @@ async fn commit_status_api_updates_json_and_ssr_checks() {
 
     let pr = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
     assert_eq!(pr.status, StatusCode::OK);
-    assert!(pr.body.contains("<h2>Checks "));
-    assert!(pr.body.contains("Head commit"));
+    assert!(pr
+        .body
+        .contains("<div class=\"merge-panel__checks-head\">Checks "));
+    assert!(pr.body.contains("<code class=\"oid\">"));
     assert!(pr.body.contains("ci/anvil"));
     assert!(pr.body.contains("test"));
     assert!(pr.body.contains("build &lt;ok&gt;"));
@@ -2810,10 +2844,11 @@ async fn branches_page_lists_branches_and_tags() {
     assert!(!page.body.contains("first release <tag>"));
     assert!(page.body.contains("v0-light"));
 
-    // The tab row is present with Branches active.
-    assert!(page
+    // The repo code toolbar links to the branches page.
+    let repo_page = send(&app, get("/r/alice/proj", Some("alice"))).await;
+    assert!(repo_page
         .body
-        .contains("tab--active\" href=\"/r/alice/proj/branches\""));
+        .contains("class=\"branchbtn\" href=\"/r/alice/proj/branches\""));
 }
 
 #[tokio::test]

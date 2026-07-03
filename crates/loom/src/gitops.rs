@@ -54,6 +54,15 @@ pub struct CommitInfo {
     pub subject: String,
 }
 
+/// Batched last-commit metadata for a tree listing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TreeLastCommits {
+    /// Latest commit touching this tree or subtree.
+    pub latest: Option<CommitInfo>,
+    /// Last commit per direct tree entry, keyed by [`TreeEntry::name`].
+    pub by_name: HashMap<String, CommitInfo>,
+}
+
 /// Full metadata for ONE commit (the commit page). Superset of [`CommitInfo`]: adds the parent
 /// OIDs and the complete message body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -464,6 +473,44 @@ impl GitOps {
             _ => return Vec::new(),
         };
         parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Latest commit touching each direct entry in one tree, using one bounded `git log`.
+    pub async fn tree_last_commits(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+        subpath: &str,
+        entry_names: &[String],
+    ) -> TreeLastCommits {
+        if !subpath.is_empty() && !is_safe_repo_path(subpath) {
+            return TreeLastCommits::default();
+        }
+        let repo = self.repo_path(owner, name);
+        let fmt = "--format=%x01%H%x1f%an%x1f%ae%x1f%at%x1f%s";
+        let mut args = vec![
+            "-c",
+            "core.quotepath=off",
+            "log",
+            "--no-renames",
+            "--max-count=400",
+            fmt,
+            "--name-only",
+            commit_oid,
+        ];
+        if !subpath.is_empty() {
+            args.push("--");
+            args.push(subpath);
+        }
+        let out = match self
+            .run_git_in_capture(&repo.to_string_lossy(), &args)
+            .await
+        {
+            Ok(out) if out.status => out,
+            _ => return TreeLastCommits::default(),
+        };
+        parse_tree_last_commits(&String::from_utf8_lossy(&out.stdout), subpath, entry_names)
     }
 
     /// Fixed-string repository code search using `git grep`.
@@ -1773,6 +1820,62 @@ fn parse_log(text: &str) -> Vec<CommitInfo> {
             time: fields[3].trim().parse::<i64>().unwrap_or(0),
             subject: fields[4].to_string(),
         });
+    }
+    out
+}
+
+fn parse_tree_last_commits(text: &str, subpath: &str, entry_names: &[String]) -> TreeLastCommits {
+    let mut out = TreeLastCommits::default();
+    let mut current: Option<CommitInfo> = None;
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(record) = line.strip_prefix('\u{1}') {
+            let fields: Vec<&str> = record.split('\u{1f}').collect();
+            if fields.len() < 5 {
+                current = None;
+                continue;
+            }
+            let commit = CommitInfo {
+                oid: fields[0].to_string(),
+                author_name: fields[1].to_string(),
+                author_email: fields[2].to_string(),
+                time: fields[3].trim().parse::<i64>().unwrap_or(0),
+                subject: fields[4].to_string(),
+            };
+            if out.latest.is_none() {
+                out.latest = Some(commit.clone());
+            }
+            current = Some(commit);
+            continue;
+        }
+
+        let Some(commit) = current.as_ref() else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let rel = if subpath.is_empty() {
+            line
+        } else {
+            let Some(rest) = line.strip_prefix(subpath) else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix('/') else {
+                continue;
+            };
+            rest
+        };
+        let Some(entry) = rel.split('/').next().filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        if out.by_name.contains_key(entry) || !entry_names.iter().any(|name| name == entry) {
+            continue;
+        }
+        out.by_name.insert(entry.to_string(), commit.clone());
+        if out.by_name.len() == entry_names.len() {
+            break;
+        }
     }
     out
 }

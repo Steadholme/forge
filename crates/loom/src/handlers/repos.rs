@@ -17,9 +17,10 @@ use axum::Form;
 use serde::Deserialize;
 
 use crate::auth::{self, Identity};
-use crate::config::COMMIT_LIMIT;
 use crate::error::AppError;
-use crate::gitops::{BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, TreeEntry};
+use crate::gitops::{
+    BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, TreeEntry, TreeLastCommits,
+};
 use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
 use crate::model::{repo_role_rank, validate_owner_sub, validate_repo_name, Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
@@ -139,8 +140,8 @@ pub async fn view(
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
     let csrf = auth::new_csrf_token();
-    let mut body = render_code_page(&state, &repo, "").await?;
-    body.push_str(&render_fork_card(&repo, &who, &csrf));
+    let fork_popover = render_fork_popover(&repo, &who, &csrf);
+    let body = render_code_page(&state, &repo, "", &fork_popover).await?;
     Ok(html_with_csrf(
         StatusCode::OK,
         page(&format!("{}/{}", owner, name), Some(&who.email), &body),
@@ -226,7 +227,7 @@ pub async fn tree(
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
     let path = clean_subpath(&path)?;
-    let body = render_code_page(&state, &repo, &path).await?;
+    let body = render_code_page(&state, &repo, &path, "").await?;
     Ok(html_ok(page(
         &format!("{}/{}", owner, name),
         Some(&who.email),
@@ -807,16 +808,16 @@ fn render_index(who: &Identity, csrf: &str, repos: &[Repo], error: Option<&str>)
     )
 }
 
-fn render_fork_card(repo: &Repo, who: &Identity, csrf: &str) -> String {
+fn render_fork_popover(repo: &Repo, who: &Identity, csrf: &str) -> String {
     let default_name = if repo.owner_sub == who.subject {
         format!("{}-fork", repo.name)
     } else {
         repo.name.clone()
     };
     format!(
-        r##"<section class="card">
-  <div class="card__head"><h2>Fork</h2></div>
-  <div class="card__body">
+        r##"<details class="popbtn popbtn--fork">
+  <summary class="btn btn-ghost btn-sm"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9"/><path d="M12 12v3"/></svg>Fork</summary>
+  <div class="popbtn__pop">
     <form method="post" action="/r/{owner}/{name}/fork">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <div class="field">
@@ -824,11 +825,11 @@ fn render_fork_card(repo: &Repo, who: &Identity, csrf: &str) -> String {
         <input type="text" id="fork-name" name="name" maxlength="64" value="{default_name}" autocomplete="off" spellcheck="false" required>
       </div>
       <div class="actions">
-        <button class="btn btn-secondary" type="submit">Fork repository</button>
+        <button class="btn btn-primary btn-sm" type="submit">Fork repository</button>
       </div>
     </form>
   </div>
-</section>"##,
+</details>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         csrf = esc(csrf),
@@ -852,12 +853,12 @@ async fn render_index_error(state: &AppState, who: &Identity, msg: &str) -> Resp
     )
 }
 
-/// Render the code page: repo header + clone box + (file browser at `subpath`) + branches +
-/// commit history (history/branches shown at the repo root).
+/// Render the code page: repo header + code toolbar + file browser at `subpath`.
 async fn render_code_page(
     state: &AppState,
     repo: &Repo,
     subpath: &str,
+    fork_popover: &str,
 ) -> Result<String, AppError> {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
@@ -876,15 +877,22 @@ async fn render_code_page(
         "code",
         parent.as_ref(),
     );
-    let search = render_code_search_form(repo, "", "HEAD", false);
 
     let head = state.git.head_commit(&repo.owner_sub, &repo.name).await;
     let Some(commit) = head else {
         // Empty repo: show how to push the first commit.
+        let toolbar = render_code_toolbar(repo, &state.config.public_base_url, None, "");
         let push = render_empty_repo(repo, &state.config.public_base_url);
-        return Ok(format!("{header}{search}{push}"));
+        return Ok(format!("{header}{toolbar}{push}"));
     };
 
+    let branch_names = state.git.branches(&repo.owner_sub, &repo.name).await;
+    let toolbar = render_code_toolbar(
+        repo,
+        &state.config.public_base_url,
+        Some(branch_names.len()),
+        fork_popover,
+    );
     let entries = state
         .git
         .list_tree(&repo.owner_sub, &repo.name, &commit, subpath)
@@ -893,7 +901,13 @@ async fn render_code_page(
         return Err(AppError::NotFound("No such directory.".to_string()));
     }
 
-    let files = render_file_browser(repo, subpath, &entries);
+    let entry_names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    let last = state
+        .git
+        .tree_last_commits(&repo.owner_sub, &repo.name, &commit, subpath, &entry_names)
+        .await;
+    let now = now_secs();
+    let files = render_file_browser(repo, subpath, &entries, &last, now);
 
     // A rendered README under the file browser at the repo root (GitHub-style), sanitised.
     let readme = if subpath.is_empty() {
@@ -907,68 +921,71 @@ async fn render_code_page(
         String::new()
     };
 
-    // History + branches only at the repo root, to keep subdirectory pages focused.
-    let extras = if subpath.is_empty() {
-        let branches = state.git.branches(&repo.owner_sub, &repo.name).await;
-        let commits = state
-            .git
-            .log(&repo.owner_sub, &repo.name, &commit, COMMIT_LIMIT)
-            .await;
-        let branch_html = branches
-            .iter()
-            .map(|b| {
-                let current = if *b == repo.default_branch {
-                    " branch-badge--default"
-                } else {
-                    ""
-                };
-                format!("<span class=\"branch-badge{current}\">{}</span>", esc(b))
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        let commit_html = if commits.is_empty() {
-            "<li class=\"commit-item commit-item--empty\">No commits.</li>".to_string()
-        } else {
-            commits
-                .iter()
-                .map(|c| {
-                    format!(
-                        "<li class=\"commit-item\">\
-                           <span class=\"commit-item__subject\">{subject}</span>\
-                           <span class=\"commit-item__meta\">\
-                             <code class=\"oid\">{oid}</code>\
-                             <span>{author}</span>\
-                             <span>{when}</span>\
-                           </span>\
-                         </li>",
-                        subject = esc(&c.subject),
-                        oid = esc(&short_oid(&c.oid)),
-                        author = esc(&c.author_name),
-                        when = esc(&fmt_ts(c.time)),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        };
+    let content = if subpath.is_empty() && !latest_release.is_empty() {
         format!(
-            r##"<div class="layout layout--repo">
-  <section class="card">
-    <div class="card__head"><h2>Recent commits</h2></div>
-    <div class="card__body"><ul class="commit-list">{commit_html}</ul></div>
-  </section>
-  <section class="card">
-    <div class="card__head"><h2>Branches</h2></div>
-    <div class="card__body"><div class="branch-row">{branch_html}</div></div>
-  </section>
+            r##"<div class="repo-layout">
+  <div class="repo-layout__main">{files}{readme}</div>
+  <aside class="side">{latest_release}</aside>
 </div>"##
         )
     } else {
-        String::new()
+        format!("{files}{readme}")
     };
 
-    Ok(format!(
-        "{header}{search}{files}{readme}{latest_release}{extras}"
-    ))
+    Ok(format!("{header}{toolbar}{content}"))
+}
+
+fn render_code_toolbar(
+    repo: &Repo,
+    base_url: &str,
+    branch_count: Option<usize>,
+    fork_popover: &str,
+) -> String {
+    let clone_url = format!(
+        "{}/git/{}/{}.git",
+        base_url.trim_end_matches('/'),
+        repo.owner_sub,
+        repo.name
+    );
+    let primary = if let Some(n_branches) = branch_count {
+        format!(
+            r##"<a class="branchbtn" href="/r/{owner}/{name}/branches">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span class="branchbtn__name">{branch}</span><span class="branchbtn__count">{n_branches}</span>
+  </a>
+  <a class="code-toolbar__link" href="/r/{owner}/{name}/commits"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Commits</a>
+  <span class="code-toolbar__spacer"></span>
+  <form class="code-toolbar__search" action="/r/{owner}/{name}/search" method="get" role="search">
+    <input class="code-toolbar__q" type="search" name="q" placeholder="Search code" aria-label="Search code">
+    <input type="hidden" name="ref" value="HEAD">
+  </form>"##,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            branch = esc(&repo.default_branch),
+            n_branches = n_branches,
+        )
+    } else {
+        r#"<span class="code-toolbar__spacer"></span>"#.to_string()
+    };
+    format!(
+        r##"<div class="code-toolbar">
+  {primary}
+  <details class="popbtn popbtn--clone">
+    <summary class="btn btn-primary btn-sm">Code<svg class="popbtn__caret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></summary>
+    <div class="popbtn__pop">
+      <div class="popbtn__label">Clone over HTTPS</div>
+      <div class="clone-row">
+        <input class="clone-row__url" type="text" readonly value="{clone_url}" onclick="this.select()">
+        <button class="btn btn-ghost btn-sm" type="button" data-copy="{clone_url}">Copy</button>
+      </div>
+      <p class="popbtn__hint">Authenticate with a <a href="/pats">personal access token</a>.</p>
+    </div>
+  </details>
+  {fork_popover}
+</div>"##,
+        primary = primary,
+        clone_url = esc(&clone_url),
+        fork_popover = fork_popover,
+    )
 }
 
 /// Render a repo-root README as sanitised markdown HTML (GitHub-style), or nothing when there is
@@ -996,7 +1013,7 @@ async fn render_readme(
     let text = String::from_utf8_lossy(&bytes);
     format!(
         r##"<section class="card">
-  <div class="card__head"><h2>{name}</h2></div>
+  <div class="card__head card__head--file"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg><span>{name}</span></div>
   <div class="card__body markdown-body">{html}</div>
 </section>"##,
         name = esc(&entry.name),
@@ -1022,55 +1039,26 @@ fn render_latest_release_card(repo: &Repo, release: &Release) -> String {
     } else {
         ""
     };
-    let summary = release_notes_summary(&release.body_md);
-    let notes = if summary.is_empty() {
-        "<p class=\"muted\">No release notes.</p>".to_string()
-    } else {
-        format!("<p class=\"release-card__summary\">{}</p>", esc(&summary))
-    };
+    let now = now_secs();
     format!(
-        r##"<section class="card release-card">
-  <div class="card__head">
-    <h2>Latest release</h2>
-    <a class="btn btn-ghost btn-sm" href="/r/{owner}/{name}/releases">All releases</a>
+        r##"<section class="side__block">
+  <h3 class="side__label">Latest release</h3>
+  <div class="side-release">
+    <a class="side-release__title" href="/r/{owner}/{name}/releases/tag/{tag}">{title}</a>
+    <div class="side-release__meta"><span class="release-tag">{tag}</span>{prerelease}</div>
+    <span class="side-release__age" title="{published_abs}">{published_rel}</span>
+    <span class="side-release__assets">0 assets</span>
   </div>
-  <div class="card__body">
-    <div class="release-card__head">
-      <div>
-        <a class="release-card__title" href="/r/{owner}/{name}/releases/tag/{tag}">{title}</a>
-        <div class="release-card__meta">
-          <span class="release-tag">{tag}</span>
-          <a href="/r/{owner}/{name}/commit/{target}"><code class="oid">{short}</code></a>
-          <span>{published}</span>
-        </div>
-      </div>
-      <div class="release-card__badges">{prerelease}</div>
-    </div>
-    {notes}
-    <div class="release-assets"><span class="release-asset muted">No assets.</span></div>
-  </div>
+  <a class="side__more" href="/r/{owner}/{name}/releases">All releases</a>
 </section>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         tag = esc(&release.tag_name),
         title = esc(&release.title),
-        target = esc(&release.target_commit),
-        short = esc(&short_oid(&release.target_commit)),
-        published = esc(&fmt_ts(release.published_at)),
+        published_abs = esc(&fmt_ts(release.published_at)),
+        published_rel = esc(&fmt_rel(now, release.published_at)),
         prerelease = prerelease,
-        notes = notes,
     )
-}
-
-fn release_notes_summary(body: &str) -> String {
-    body.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(240)
-        .collect()
 }
 
 /// Repo header: owner/name lockup, visibility badge, clone box, tab strip.
@@ -1095,7 +1083,7 @@ pub(crate) fn render_repo_header(
 
 pub(crate) fn render_repo_header_with_parent(
     repo: &Repo,
-    base_url: &str,
+    _base_url: &str,
     open_issues: i64,
     open_pulls: i64,
     release_count: i64,
@@ -1110,59 +1098,61 @@ pub(crate) fn render_repo_header_with_parent(
     let desc = if repo.description.trim().is_empty() {
         String::new()
     } else {
-        format!("<p class=\"sub\">{}</p>", esc(&repo.description))
+        format!("<p class=\"repohead__desc\">{}</p>", esc(&repo.description))
     };
     let fork_line = forked_from
         .map(|parent| {
             format!(
-                "<p class=\"sub\">Forked from <a href=\"/r/{owner}/{name}\">{owner}/{name}</a></p>",
+                "<p class=\"repohead__desc repohead__desc--fork\">Forked from <a href=\"/r/{owner}/{name}\">{owner}/{name}</a></p>",
                 owner = esc(&parent.owner_sub),
                 name = esc(&parent.name),
             )
         })
         .unwrap_or_default();
-    let clone_url = format!(
-        "{}/git/{}/{}.git",
-        base_url.trim_end_matches('/'),
-        repo.owner_sub,
-        repo.name
-    );
-    let tab = |name: &str| if active == name { " tab--active" } else { "" };
+    let tab = |is_active: bool| {
+        if is_active {
+            (" tab--active", " aria-current=\"page\"")
+        } else {
+            ("", "")
+        }
+    };
+    let (code_active, code_current) = tab(matches!(active, "code" | "commits" | "branches"));
+    let (issues_active, issues_current) = tab(active == "issues");
+    let (pulls_active, pulls_current) = tab(active == "pulls");
+    let (releases_active, releases_current) = tab(active == "releases");
+    let (settings_active, settings_current) = tab(active == "settings");
     format!(
-        r##"<div class="console__head">
-  <div class="repo-title">
-    <h1>{owner}/{name}</h1>
+        r##"<header class="repohead">
+  <div class="repohead__row">
+    <svg class="repohead__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+    <h1 class="repohead__title"><a class="repohead__owner" href="/">{owner}</a><span class="repohead__sep">/</span><a class="repohead__name" href="/r/{owner}/{name}">{name}</a></h1>
     {badge}
   </div>
   {desc}
   {fork_line}
-  <div class="clone-box">
-    <span class="clone-box__label">Clone</span>
-    <input class="clone-box__url" type="text" readonly value="{clone}" onclick="this.select()">
-  </div>
-</div>
-<nav class="tabs">
-  <a class="tab{code_active}" href="/r/{owner}/{name}">Code</a>
-  <a class="tab{commits_active}" href="/r/{owner}/{name}/commits">Commits</a>
-  <a class="tab{branches_active}" href="/r/{owner}/{name}/branches">Branches</a>
-  <a class="tab{releases_active}" href="/r/{owner}/{name}/releases">Releases <span class="tab__count">{release_count}</span></a>
-  <a class="tab{issues_active}" href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span></a>
-  <a class="tab{pulls_active}" href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span></a>
-  <a class="tab{settings_active}" href="/r/{owner}/{name}/settings">Settings</a>
+</header>
+<nav class="tabs" aria-label="Repository sections">
+  <a class="tab{code_active}"{code_current} href="/r/{owner}/{name}">Code</a>
+  <a class="tab{issues_active}"{issues_current} href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span></a>
+  <a class="tab{pulls_active}"{pulls_current} href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span></a>
+  <a class="tab{releases_active}"{releases_current} href="/r/{owner}/{name}/releases">Releases <span class="tab__count">{release_count}</span></a>
+  <a class="tab{settings_active}"{settings_current} href="/r/{owner}/{name}/settings">Settings</a>
 </nav>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         badge = badge,
         desc = desc,
         fork_line = fork_line,
-        clone = esc(&clone_url),
-        code_active = tab("code"),
-        commits_active = tab("commits"),
-        branches_active = tab("branches"),
-        releases_active = tab("releases"),
-        pulls_active = tab("pulls"),
-        issues_active = tab("issues"),
-        settings_active = tab("settings"),
+        code_active = code_active,
+        code_current = code_current,
+        releases_active = releases_active,
+        releases_current = releases_current,
+        pulls_active = pulls_active,
+        pulls_current = pulls_current,
+        issues_active = issues_active,
+        issues_current = issues_current,
+        settings_active = settings_active,
+        settings_current = settings_current,
         open_issues = open_issues,
         open_pulls = open_pulls,
         release_count = release_count,
@@ -1347,8 +1337,46 @@ fn render_empty_repo(repo: &Repo, base_url: &str) -> String {
     )
 }
 
-/// The file browser card: breadcrumb + tree/blob rows for `entries` at `subpath`.
-fn render_file_browser(repo: &Repo, subpath: &str, entries: &[TreeEntry]) -> String {
+/// The file browser card: latest commit + breadcrumb + tree/blob rows for `entries` at `subpath`.
+fn render_file_browser(
+    repo: &Repo,
+    subpath: &str,
+    entries: &[TreeEntry],
+    last: &TreeLastCommits,
+    now: i64,
+) -> String {
+    let commitbar = last
+        .latest
+        .as_ref()
+        .map(|commit| {
+            format!(
+                r##"<div class="filebox__commit">
+    <span class="filebox__commit-author">{author}</span>
+    <a class="filebox__commit-msg" href="/r/{owner}/{name}/commit/{oid}">{subject}</a>
+    <span class="filebox__commit-fill"></span>
+    <a href="/r/{owner}/{name}/commit/{oid}"><code class="oid">{short}</code></a>
+    <span class="filebox__commit-age" title="{when_abs}">{when_rel}</span>
+    <a class="filebox__commit-more" href="/r/{owner}/{name}/commits">History</a>
+  </div>"##,
+                owner = esc(&repo.owner_sub),
+                name = esc(&repo.name),
+                oid = esc(&commit.oid),
+                short = esc(&short_oid(&commit.oid)),
+                author = esc(&commit.author_name),
+                subject = esc(&commit.subject),
+                when_abs = esc(&fmt_ts(commit.time)),
+                when_rel = esc(&fmt_rel(now, commit.time)),
+            )
+        })
+        .unwrap_or_default();
+    let head = if subpath.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div class=\"card__head filebox__head\">{}</div>",
+            render_breadcrumb(repo, subpath, false)
+        )
+    };
     let rows = entries
         .iter()
         .map(|e| {
@@ -1368,32 +1396,53 @@ fn render_file_browser(repo: &Repo, subpath: &str, entries: &[TreeEntry]) -> Str
                     "file",
                 )
             };
-            let size = match e.size {
-                Some(n) if !e.is_dir() => human_size(n),
-                _ => String::new(),
-            };
+            let commit = last.by_name.get(&e.name);
+            let message = commit
+                .map(|c| {
+                    format!(
+                        "<a href=\"/r/{owner}/{name}/commit/{oid}\">{subject}</a>",
+                        owner = esc(&repo.owner_sub),
+                        name = esc(&repo.name),
+                        oid = esc(&c.oid),
+                        subject = esc(&c.subject),
+                    )
+                })
+                .unwrap_or_default();
+            let age = commit
+                .map(|c| {
+                    format!(
+                        "<span class=\"tree-row__age\" title=\"{when_abs}\">{when_rel}</span>",
+                        when_abs = esc(&fmt_ts(c.time)),
+                        when_rel = esc(&fmt_rel(now, c.time)),
+                    )
+                })
+                .unwrap_or_else(|| "<span class=\"tree-row__age\"></span>".to_string());
             format!(
                 "<li class=\"tree-row tree-row--{icon}\">\
                    <a class=\"tree-row__name\" href=\"{href}\">{name}</a>\
-                   <span class=\"tree-row__size\">{size}</span>\
+                   <span class=\"tree-row__msg\">{message}</span>\
+                   {age}\
                  </li>",
                 icon = icon,
                 href = esc(&href),
                 name = esc(&e.name),
-                size = esc(&size),
+                message = message,
+                age = age,
             )
         })
         .collect::<Vec<_>>()
         .join("");
 
     format!(
-        r##"<section class="card">
-  <div class="card__head">{breadcrumb}</div>
+        r##"<section class="card filebox">
+  {commitbar}
+  {head}
   <div class="card__body card__body--list">
     <ul class="tree-list">{rows}</ul>
   </div>
 </section>"##,
-        breadcrumb = render_breadcrumb(repo, subpath, false),
+        commitbar = commitbar,
+        head = head,
         rows = if rows.is_empty() {
             "<li class=\"tree-row tree-row--empty\">Empty directory.</li>".to_string()
         } else {

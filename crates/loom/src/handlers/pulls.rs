@@ -27,7 +27,7 @@ use crate::handlers::repos::{
     can_write_repo, load_visible_repo, render_repo_header, validate_branch_name,
 };
 use crate::handlers::{
-    accepts_json, esc, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
+    accepts_json, esc, fmt_rel, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
     reaction_summaries_json, redirect, render_reactions, short_oid, REACTION_TARGET_COMMENT,
     REACTION_TARGET_PULL,
 };
@@ -414,6 +414,8 @@ fn pick_base(repo: &Repo, branches: &[String], requested: Option<&str>) -> Strin
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
     pub milestone: Option<String>,
@@ -427,12 +429,14 @@ pub async fn list(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let state_filter = normalize_pull_state_filter(q.state.as_deref());
     let label_filter = q.label.unwrap_or_default();
     let milestone_filter = q.milestone.unwrap_or_default();
     let pulls = state
         .store
         .list_pulls_filtered(&repo.id, &label_filter, &milestone_filter)
         .await?;
+    let pulls = filter_pulls_by_state(pulls, &state_filter);
     let labels = state.store.list_labels(&repo.id).await?;
     let milestones = state.store.list_milestones(&repo.id).await?;
     let pull_labels = state.store.list_pull_labels(&repo.id).await?;
@@ -444,6 +448,7 @@ pub async fn list(
         &labels,
         &milestones,
         &pull_labels,
+        &state_filter,
         &label_filter,
         &milestone_filter,
     );
@@ -2110,10 +2115,19 @@ fn render_list(
     labels: &[Label],
     milestones: &[Milestone],
     pull_labels: &[(String, Label)],
+    state_filter: &str,
     label_filter: &str,
     milestone_filter: &str,
 ) -> String {
-    let filters = render_pr_filters(repo, labels, milestones, label_filter, milestone_filter);
+    let tabs = render_pr_state_tabs(repo, state_filter, label_filter, milestone_filter);
+    let filters = render_pr_filters(
+        repo,
+        labels,
+        milestones,
+        state_filter,
+        label_filter,
+        milestone_filter,
+    );
     let list = if pulls.is_empty() {
         format!(
             "<li class=\"pr-item pr-item--empty\">\
@@ -2142,20 +2156,38 @@ fn render_list(
     };
     format!(
         r##"{header}
-<div class="layout layout--repo">
-  <section class="card">
-    <div class="card__head">
-      <h2>Pull requests</h2>
-      <a class="btn btn-primary btn-sm" href="/r/{owner}/{name}/compare">New pull request</a>
-    </div>
-    <div class="card__body">{filters}<ul class="pr-list">{list}</ul></div>
-  </section>
-</div>"##,
+<div class="list-toolbar">
+  {tabs}
+  <span class="list-toolbar__fill"></span>
+  {filters}
+  <a class="btn btn-primary btn-sm" href="/r/{owner}/{name}/compare">New pull request</a>
+</div>
+<section class="card">
+  <div class="card__body card__body--list"><ul class="pr-list">{list}</ul></div>
+</section>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
+        tabs = tabs,
         filters = filters,
         list = list,
     )
+}
+
+fn normalize_pull_state_filter(raw: Option<&str>) -> String {
+    match raw.unwrap_or_default() {
+        "open" => "open".to_string(),
+        "closed" => "closed".to_string(),
+        "all" | "" => "all".to_string(),
+        _ => "all".to_string(),
+    }
+}
+
+fn filter_pulls_by_state(pulls: Vec<Pull>, state_filter: &str) -> Vec<Pull> {
+    match state_filter {
+        "open" => pulls.into_iter().filter(Pull::is_open).collect(),
+        "closed" => pulls.into_iter().filter(|pull| !pull.is_open()).collect(),
+        _ => pulls,
+    }
 }
 
 fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Milestone]) -> String {
@@ -2209,6 +2241,7 @@ fn render_pr_filters(
     repo: &Repo,
     labels: &[Label],
     milestones: &[Milestone],
+    state_filter: &str,
     label_filter: &str,
     milestone_filter: &str,
 ) -> String {
@@ -2217,6 +2250,7 @@ fn render_pr_filters(
     }
     format!(
         r##"<form method="get" action="/r/{owner}/{name}/pulls" class="compare-picker">
+  <input type="hidden" name="state" value="{state_filter}">
   <span class="compare-picker__label">label</span>
   <select name="label" class="compare-picker__select">{label_opts}</select>
   <span class="compare-picker__label">milestone</span>
@@ -2225,8 +2259,52 @@ fn render_pr_filters(
 </form>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
+        state_filter = esc(state_filter),
         label_opts = render_label_options(labels, label_filter, "All labels"),
         milestone_opts = render_milestone_options(milestones, milestone_filter, "All milestones"),
+    )
+}
+
+fn render_pr_state_tabs(
+    repo: &Repo,
+    state_filter: &str,
+    label_filter: &str,
+    milestone_filter: &str,
+) -> String {
+    let tab = |state: &str, label: &str| {
+        let active = if state == state_filter {
+            " tab--active"
+        } else {
+            ""
+        };
+        format!(
+            "<a class=\"tab{active}\" href=\"{href}\">{label}</a>",
+            active = active,
+            href = pulls_list_url(repo, state, label_filter, milestone_filter),
+            label = label,
+        )
+    };
+    format!(
+        "<nav class=\"tabs tabs--filter\">{}{}{}</nav>",
+        tab("open", "Open"),
+        tab("closed", "Closed"),
+        tab("all", "All"),
+    )
+}
+
+fn pulls_list_url(repo: &Repo, state: &str, label_filter: &str, milestone_filter: &str) -> String {
+    let mut q = vec![format!("state={}", esc(state))];
+    if !label_filter.is_empty() {
+        q.push(format!("label={}", esc(label_filter)));
+    }
+    if !milestone_filter.is_empty() {
+        q.push(format!("milestone={}", esc(milestone_filter)));
+    }
+    format!(
+        "/r/{}/{}/pulls?{}",
+        esc(&repo.owner_sub),
+        esc(&repo.name),
+        q.join("&")
     )
 }
 
@@ -2356,24 +2434,10 @@ async fn render_detail(
     let (cls, label) = state_badge(pull);
     let draft_badge_html = draft_badge(pull);
     let error_block = error_block(error);
+    let now = now_secs();
     let summary = review_summary(reviews);
     let review_badges = render_review_badges(&summary);
     let label_chips = render_label_chips(pull_labels);
-    let milestone = milestones
-        .iter()
-        .find(|m| m.id == pull.milestone_id)
-        .map(|m| esc(&m.title))
-        .unwrap_or_else(|| "No milestone".to_string());
-    let assignee = if pull.assignee_sub.is_empty() {
-        "Unassigned".to_string()
-    } else {
-        esc(&pull.assignee_sub)
-    };
-    let reviewer = if pull.reviewer_sub.is_empty() {
-        "No reviewer".to_string()
-    } else {
-        esc(&pull.reviewer_sub)
-    };
 
     let body_html = if pull.body.trim().is_empty() {
         "<p class=\"muted\">No description provided.</p>".to_string()
@@ -2465,7 +2529,6 @@ async fn render_detail(
         review_comments,
         comment_reactions,
         thread_resolutions,
-        &review_requirements_html,
         csrf,
         pull,
         can_review_user,
@@ -2478,7 +2541,7 @@ async fn render_detail(
     let mergeability_bar = mergeability
         .map(render_mergeability_bar)
         .unwrap_or_default();
-    let metadata_form = if can_gate_user {
+    let metadata_edit = if can_gate_user {
         let fields = render_pull_metadata_fields(
             labels,
             milestones,
@@ -2488,17 +2551,15 @@ async fn render_detail(
             pull_labels,
         );
         format!(
-            r##"<section class="card">
-  <div class="card__head"><h2>Metadata</h2></div>
-  <div class="card__body">
+            r##"<section class="side__block side__block--edit">
+  <details class="side-edit">
+    <summary class="btn btn-ghost btn-sm">Edit metadata</summary>
     <form method="post" action="/r/{owner}/{name}/pulls/{number}/metadata">
       <input type="hidden" name="csrf_token" value="{csrf}">
       {fields}
-      <div class="actions">
-        <button class="btn btn-secondary" type="submit">Save metadata</button>
-      </div>
+      <div class="actions"><button class="btn btn-secondary btn-sm" type="submit">Save metadata</button></div>
     </form>
-  </div>
+  </details>
 </section>"##,
             owner = esc(&repo.owner_sub),
             name = esc(&repo.name),
@@ -2509,6 +2570,39 @@ async fn render_detail(
     } else {
         String::new()
     };
+    let reviewer_value = if pull.reviewer_sub.is_empty() {
+        "<span class=\"side__empty\">No reviewer</span>".to_string()
+    } else {
+        esc(&pull.reviewer_sub)
+    };
+    let assignee_value = if pull.assignee_sub.is_empty() {
+        "<span class=\"side__empty\">No assignee</span>".to_string()
+    } else {
+        esc(&pull.assignee_sub)
+    };
+    let labels_value = if label_chips.is_empty() {
+        "<span class=\"side__empty\">None yet</span>".to_string()
+    } else {
+        label_chips
+    };
+    let milestone_value = milestones
+        .iter()
+        .find(|m| m.id == pull.milestone_id)
+        .map(|m| esc(&m.title))
+        .unwrap_or_else(|| "<span class=\"side__empty\">No milestone</span>".to_string());
+    let sidebar = format!(
+        r##"<section class="side__block"><h3 class="side__label">Reviewers</h3><div class="side__value">{reviewer}{review_badges}</div></section>
+<section class="side__block"><h3 class="side__label">Assignee</h3><div class="side__value">{assignee}</div></section>
+<section class="side__block"><h3 class="side__label">Labels</h3><div class="side__value label-row">{labels}</div></section>
+<section class="side__block"><h3 class="side__label">Milestone</h3><div class="side__value">{milestone}</div></section>
+{metadata_edit}"##,
+        reviewer = reviewer_value,
+        review_badges = review_badges,
+        assignee = assignee_value,
+        labels = labels_value,
+        milestone = milestone_value,
+        metadata_edit = metadata_edit,
+    );
 
     // Action strip: merge/draft + open/close, shown only to a gated user on an OPEN PR.
     let actions = if pull.is_open() && pull.is_draft && can_gate_user {
@@ -2601,35 +2695,43 @@ async fn render_detail(
         name = esc(&repo.name),
         number = pull.number,
     );
-
-    Ok(format!(
-        r##"{header}
-{pr_inline}
-<div class="console__head">
-  <div class="repo-title">
-    <span class="state-badge {cls}" id="state-badge-main">{label}</span>
-    {draft_badge_html}
-    <h1 class="pr-title">#{number} {title}</h1>
-  </div>
-  <p class="sub"><code>{head}</code> &rarr; <code>{base}</code> · opened {when} by {author} · assignee {assignee} · reviewer {reviewer} · milestone {milestone}</p>
-  <div class="label-row">{label_chips}{review_badges}</div>
-</div>
-<section class="card">
-  <div class="card__head"><h2>Description</h2></div>
-  <div class="card__body">{body_html}{pull_reactions}</div>
-</section>
-{checks_card}
-{commits_card}
-{diff_card}
-{reviews_card}
-{metadata_form}
-<section class="card">
+    let merge_panel = format!(
+        r##"<section class="card merge-panel">
   <div class="card__body">
-    {error_block}
+    {checks_card}
+    {review_requirements_html}
     {mergeability_bar}
     {actions}
   </div>
 </section>"##,
+        checks_card = checks_card,
+        review_requirements_html = review_requirements_html,
+        mergeability_bar = mergeability_bar,
+        actions = actions,
+    );
+
+    Ok(format!(
+        r##"{header}
+{pr_inline}
+<div class="detail-head">
+  <div class="detail-head__badges"><span class="state-badge {cls}" id="state-badge-main">{label}</span>{draft_badge_html}</div>
+  <h1 class="detail-head__title">{title} <span class="detail-head__number">#{number}</span></h1>
+  <p class="detail-head__meta"><code>{head}</code> &rarr; <code>{base}</code> · opened <span title="{created_abs}">{created_rel}</span> by <b>{author}</b></p>
+</div>
+{error_block}
+<div class="detail-layout">
+  <div class="detail-layout__main">
+    <section class="card comment-box">
+      <div class="comment-box__meta"><b>{author}</b> <span>opened this pull request</span> <span title="{created_abs}">{created_rel}</span></div>
+      <div class="comment-box__body">{body_html}{pull_reactions}</div>
+    </section>
+    {commits_card}
+  </div>
+  <aside class="side">{sidebar}</aside>
+</div>
+{diff_card}
+{reviews_card}
+{merge_panel}"##,
         cls = cls,
         label = label,
         draft_badge_html = draft_badge_html,
@@ -2637,22 +2739,18 @@ async fn render_detail(
         title = esc(&pull.title),
         head = esc(&pull.head),
         base = esc(&pull.base),
-        when = esc(&fmt_ts(pull.created_at)),
+        created_abs = esc(&fmt_ts(pull.created_at)),
+        created_rel = esc(&fmt_rel(now, pull.created_at)),
         author = esc(&pull.author_sub),
-        assignee = assignee,
-        reviewer = reviewer,
-        milestone = milestone,
-        label_chips = label_chips,
-        review_badges = review_badges,
         body_html = body_html,
         pull_reactions = pull_reactions,
-        checks_card = checks_card,
+        commits_card = commits_card,
         reviews_card = reviews_card,
-        metadata_form = metadata_form,
+        sidebar = sidebar,
         error_block = error_block,
-        mergeability_bar = mergeability_bar,
-        actions = actions,
         pr_inline = pr_inline,
+        diff_card = diff_card,
+        merge_panel = merge_panel,
     ))
 }
 
@@ -2736,13 +2834,10 @@ fn render_checks_card(
         })
         .collect::<String>();
     format!(
-        r##"<section class="card">
-  <div class="card__head"><h2>Checks {aggregate}</h2></div>
-  <div class="card__body">
-    <p class="muted">Head commit <code class="oid">{head}</code></p>
+        r##"<div class="merge-panel__checks">
+  <div class="merge-panel__checks-head">Checks {aggregate} <code class="oid">{head}</code></div>
     <ul class="issue-list">{rows}</ul>
-  </div>
-</section>"##,
+</div>"##,
         aggregate = aggregate_dot,
         head = esc(&short_oid(head_oid)),
         rows = rows,
@@ -3183,7 +3278,6 @@ fn render_reviews_card(
     comments: &[PullReviewComment],
     comment_reactions: &ReactionMap,
     thread_resolutions: &[PrThreadResolved],
-    requirements_html: &str,
     csrf: &str,
     pull: &Pull,
     can_resolve: bool,
@@ -3247,7 +3341,7 @@ fn render_reviews_card(
             "btn btn-primary btn-finish-review"
         };
         format!(
-            r##"<div class="layout layout--repo">
+            r##"<div class="review-forms">
   <form method="post" action="/r/{owner}/{name}/pulls/{number}/review">
     <input type="hidden" name="csrf_token" value="{csrf}">
     {pending_review}
@@ -3298,17 +3392,15 @@ fn render_reviews_card(
     };
     format!(
         r##"<section class="card">
-  <div class="card__head"><h2>Reviews <span class="tab__count">{nreviews}</span></h2></div>
+  <div class="card__head card__head--slim">Reviews <span class="tab__count">{nreviews}</span></div>
   <div class="card__body">
-    {requirements_html}
-    <ul class="issue-list">{review_rows}</ul>
+    <ul class="issue-list timeline">{review_rows}</ul>
     <h3 class="section-subhead">Inline comments <span class="review-unresolved-count">{unresolved_count} unresolved</span></h3>
-    <ul class="issue-list" id="pr-inline-thread">{inline_rows}</ul>
+    <ul class="issue-list timeline" id="pr-inline-thread">{inline_rows}</ul>
     {forms}
   </div>
 </section>"##,
         nreviews = reviews.len(),
-        requirements_html = requirements_html,
         unresolved_count = unresolved_count,
         review_rows = review_rows,
         inline_rows = inline_rows,
@@ -3631,7 +3723,7 @@ fn render_commits_card(commits: &[CommitInfo]) -> String {
     };
     format!(
         r##"<section class="card">
-  <div class="card__head"><h2>Commits <span class="tab__count">{n}</span></h2></div>
+  <div class="card__head card__head--slim">Commits <span class="tab__count">{n}</span></div>
   <div class="card__body"><ul class="commit-list">{rows}</ul></div>
 </section>"##,
         n = commits.len(),
@@ -3671,6 +3763,19 @@ fn render_pr_diff_card(
     options: DiffOptions,
     controls: DiffControls,
 ) -> String {
+    let viewed_by_path: BTreeMap<String, bool> = viewed
+        .iter()
+        .map(|row| (row.file_path.clone(), row.viewed))
+        .collect();
+    let files = if diff.trim().is_empty() || diff.len() > MAX_BLOB_RENDER_BYTES {
+        Vec::new()
+    } else {
+        parse_diff_files(diff)
+    };
+    let metas = diff_file_metas(&files, &viewed_by_path);
+    let n_files = metas.len();
+    let additions: i64 = metas.iter().map(|meta| meta.additions).sum();
+    let deletions: i64 = metas.iter().map(|meta| meta.deletions).sum();
     let inner = if diff.trim().is_empty() {
         "<div class=\"card__body\"><p class=\"muted\">No file changes.</p></div>".to_string()
     } else if diff.len() > MAX_BLOB_RENDER_BYTES {
@@ -3680,15 +3785,24 @@ fn render_pr_diff_card(
     } else {
         format!(
             "<div class=\"card__body card__body--code\">{}</div>",
-            render_pr_diff(diff, viewed, repo, pull, csrf, options)
+            render_pr_diff(&files, &metas, repo, pull, csrf, options)
         )
     };
     let controls = render_diff_controls(options, &controls);
     format!(
-        r##"<section class="card">
-  <div class="card__head"><h2>Diff</h2>{controls}</div>
+        r##"<section class="card diff-card" id="files">
+  <div class="diff-card__bar">
+    <span class="diff-card__summary"><b>{n_files} files changed</b> <span class="diff-add">+{additions}</span> <span class="diff-del">&minus;{deletions}</span></span>
+    <span class="diff-card__fill"></span>
+    {controls}
+  </div>
   {inner}
-</section>"##
+</section>"##,
+        n_files = n_files,
+        additions = additions,
+        deletions = deletions,
+        controls = controls,
+        inner = inner,
     )
 }
 
@@ -3722,11 +3836,11 @@ fn render_diff_controls(options: DiffOptions, controls: &DiffControls) -> String
     format!(
         r#"<form class="diff-toggle" method="get" action="{action}">
   {hidden}
-  <span class="diff-toggle__views" role="radiogroup" aria-label="Diff view">
-    <label class="diff-toggle__option"><input type="radio" name="diff" value="unified"{unified_checked}> Unified</label>
-    <label class="diff-toggle__option"><input type="radio" name="diff" value="split"{split_checked}> Split</label>
+  <span class="segmented" role="radiogroup" aria-label="Diff view">
+    <label class="segmented__opt"><input type="radio" name="diff" value="unified"{unified_checked}><span>Unified</span></label>
+    <label class="segmented__opt"><input type="radio" name="diff" value="split"{split_checked}><span>Split</span></label>
   </span>
-  <label class="diff-toggle__option diff-toggle__whitespace"><input type="checkbox" name="w" value="1"{whitespace_checked}> Ignore whitespace</label>
+  <label class="diff-toggle__whitespace"><input type="checkbox" name="w" value="1"{whitespace_checked}> Hide whitespace</label>
   <button class="btn btn-ghost btn-sm" type="submit">Apply</button>
 </form>"#,
         action = esc(&controls.action),
@@ -3779,24 +3893,18 @@ fn render_diff_with_options(diff: &str, options: DiffOptions) -> String {
 }
 
 fn render_pr_diff(
-    diff: &str,
-    viewed: &[PrFileViewed],
+    files: &[DiffFile],
+    metas: &[DiffFileMeta],
     repo: &Repo,
     pull: &Pull,
     csrf: &str,
     options: DiffOptions,
 ) -> String {
-    let files = parse_diff_files(diff);
-    let viewed_by_path: BTreeMap<String, bool> = viewed
-        .iter()
-        .map(|row| (row.file_path.clone(), row.viewed))
-        .collect();
-    let metas = diff_file_metas(&files, &viewed_by_path);
     let ctx = FileViewedRenderContext { repo, pull, csrf };
     format!(
         "<div class=\"pr-diff\">{}<div class=\"pr-diff__files\">{}</div></div>",
-        render_pr_file_tree(&metas, &ctx),
-        render_diff_files(&files, &metas, Some(&ctx), options),
+        render_pr_file_tree(metas, &ctx),
+        render_diff_files(files, metas, Some(&ctx), options),
     )
 }
 

@@ -19,7 +19,7 @@ use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::handlers::repos::{can_write_repo, load_visible_repo, render_repo_header};
 use crate::handlers::{
-    accepts_json, esc, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
+    accepts_json, esc, fmt_rel, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
     reaction_summaries_json, redirect, render_reactions, REACTION_TARGET_COMMENT,
     REACTION_TARGET_ISSUE,
 };
@@ -980,22 +980,17 @@ async fn render_list(
         filter_total,
     );
     let metadata_fields = render_metadata_fields(&labels, &milestones, "", "", &[]);
+    let open_attr = if error.is_some() { " open" } else { "" };
 
     format!(
         r##"{header}
-<div class="layout layout--repo">
-  <section class="card">
-    <div class="card__head"><h2>Issues</h2></div>
-    <div class="card__body">
-      {tabs}
-      {filters}
-      <ul class="issue-list">{list}</ul>
-      {pager}
-    </div>
-  </section>
-  <section class="card">
-    <div class="card__head"><h2>New issue</h2></div>
-    <div class="card__body">
+<div class="list-toolbar">
+  {tabs}
+  <span class="list-toolbar__fill"></span>
+  {filters}
+  <details class="popbtn popbtn--new"{open_attr}>
+    <summary class="btn btn-primary btn-sm">New issue</summary>
+    <div class="popbtn__pop popbtn__pop--wide">
       {error_block}
       <form method="post" action="/r/{owner}/{name}/issues">
         <input type="hidden" name="csrf_token" value="{csrf}">
@@ -1013,8 +1008,14 @@ async fn render_list(
         </div>
       </form>
     </div>
-  </section>
-</div>"##,
+  </details>
+</div>
+<section class="card">
+  <div class="card__body card__body--list">
+    <ul class="issue-list">{list}</ul>
+    {pager}
+  </div>
+</section>"##,
         header = header,
         tabs = tabs,
         filters = filters,
@@ -1022,6 +1023,7 @@ async fn render_list(
         pager = pager,
         metadata_fields = metadata_fields,
         error_block = error_block,
+        open_attr = open_attr,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         csrf = esc(csrf),
@@ -1346,6 +1348,7 @@ fn render_detail(
 ) -> String {
     let (cls, label) = state_badge(issue);
     let error_block = error_block(error);
+    let now = now_secs();
 
     let body_html = if issue.body.trim().is_empty() {
         "<p class=\"muted\">No description provided.</p>".to_string()
@@ -1357,21 +1360,30 @@ fn render_detail(
     };
 
     let updated = if issue.updated_at > issue.created_at {
-        format!(" · updated {}", esc(&fmt_ts(issue.updated_at)))
+        format!(
+            " · updated <span title=\"{}\">{}</span>",
+            esc(&fmt_ts(issue.updated_at)),
+            esc(&fmt_rel(now, issue.updated_at))
+        )
     } else {
         String::new()
     };
     let label_chips = render_label_chips(issue_labels);
-    let assignee = if issue.assignee_sub.is_empty() {
-        "Unassigned".to_string()
+    let labels_value = if label_chips.is_empty() {
+        "<span class=\"side__empty\">None yet</span>".to_string()
+    } else {
+        label_chips
+    };
+    let assignee_value = if issue.assignee_sub.is_empty() {
+        "<span class=\"side__empty\">No assignee</span>".to_string()
     } else {
         esc(&issue.assignee_sub)
     };
-    let milestone = milestones
+    let milestone_value = milestones
         .iter()
         .find(|m| m.id == issue.milestone_id)
         .map(|m| esc(&m.title))
-        .unwrap_or_else(|| "No milestone".to_string());
+        .unwrap_or_else(|| "<span class=\"side__empty\">No milestone</span>".to_string());
 
     let comment_list = if comments.is_empty() {
         "<li class=\"issue-item issue-item--empty\">No comments yet.</li>".to_string()
@@ -1398,14 +1410,7 @@ fn render_detail(
         csrf,
     );
 
-    // Moderator action: close (open issue) / reopen (closed issue). Its own <form> — NEVER nested
-    // inside the comment form (nested forms are invalid HTML).
-    let actions = if can_toggle {
-        let action_label = if issue.is_open() {
-            "Close issue"
-        } else {
-            "Reopen issue"
-        };
+    let metadata_edit = if can_toggle {
         let metadata_fields = render_metadata_fields(
             labels,
             milestones,
@@ -1414,88 +1419,111 @@ fn render_detail(
             issue_labels,
         );
         format!(
-            r##"<section class="card">
-  <div class="card__body">
+            r##"<section class="side__block side__block--edit">
+  <details class="side-edit">
+    <summary class="btn btn-ghost btn-sm">Edit details</summary>
     <form method="post" action="/r/{owner}/{name}/issues/{number}/metadata">
       <input type="hidden" name="csrf_token" value="{csrf}">
       {metadata_fields}
-      <div class="actions">
-        <button class="btn btn-secondary" type="submit">Save metadata</button>
-      </div>
+      <div class="actions"><button class="btn btn-secondary btn-sm" type="submit">Save metadata</button></div>
     </form>
-    <form class="inline-form" method="post" action="/r/{owner}/{name}/issues/{number}/toggle" data-json>
-      <input type="hidden" name="csrf_token" value="{csrf}">
-      <button class="btn btn-secondary" type="submit">{action_label}</button>
-    </form>
-  </div>
+  </details>
 </section>"##,
             owner = esc(&repo.owner_sub),
             name = esc(&repo.name),
             number = issue.number,
             csrf = esc(csrf),
             metadata_fields = metadata_fields,
+        )
+    } else {
+        String::new()
+    };
+
+    // Moderator action: close (open issue) / reopen (closed issue). Its own <form> — NEVER nested
+    // inside the comment form (nested forms are invalid HTML).
+    let toggle_form = if can_toggle {
+        let action_label = if issue.is_open() {
+            "Close issue"
+        } else {
+            "Reopen issue"
+        };
+        format!(
+            r##"<form class="inline-form composer__toggle" method="post" action="/r/{owner}/{name}/issues/{number}/toggle" data-json>
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <button class="btn btn-secondary" type="submit">{action_label}</button>
+</form>"##,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            number = issue.number,
+            csrf = esc(csrf),
             action_label = action_label,
         )
     } else {
         String::new()
     };
 
+    let sidebar = format!(
+        r##"<section class="side__block"><h3 class="side__label">Assignee</h3><div class="side__value">{assignee}</div></section>
+<section class="side__block"><h3 class="side__label">Labels</h3><div class="side__value label-row">{labels}</div></section>
+<section class="side__block"><h3 class="side__label">Milestone</h3><div class="side__value">{milestone}</div></section>
+{metadata_edit}"##,
+        assignee = assignee_value,
+        labels = labels_value,
+        milestone = milestone_value,
+        metadata_edit = metadata_edit,
+    );
+
     format!(
         r##"{header}
-<div class="console__head">
-  <div class="repo-title">
-    <span class="state-badge {cls}" id="state-badge-main">{label}</span>
-    <h1 class="issue-title">#{number} {title}</h1>
-  </div>
-  <p class="sub">opened {when} by {author}{updated}</p>
-  <p class="sub">Assignee: {assignee} · Milestone: {milestone}</p>
-  <div class="label-row">{label_chips}</div>
+<div class="detail-head">
+  <div class="detail-head__badges"><span class="state-badge {cls}" id="state-badge-main">{label}</span></div>
+  <h1 class="detail-head__title">{title} <span class="detail-head__number">#{number}</span></h1>
+  <p class="detail-head__meta">opened <span title="{created_abs}">{created_rel}</span> by <b>{author}</b>{updated}</p>
 </div>
-<section class="card">
-  <div class="card__head"><h2>Description</h2></div>
-  <div class="card__body">{body_html}{issue_reactions}</div>
-</section>
-<section class="card">
-  <div class="card__head"><h2>Comments <span class="tab__count">{ncomments}</span></h2></div>
-  <div class="card__body"><ul class="issue-list">{comment_list}</ul></div>
-</section>
-<section class="card">
-  <div class="card__head"><h2>Add a comment</h2></div>
-  <div class="card__body">
-    {error_block}
-    <form method="post" action="/r/{owner}/{name}/issues/{number}/comment">
-      <input type="hidden" name="csrf_token" value="{csrf}">
-      <div class="field">
-        <label for="comment-body">Comment</label>
-        <textarea id="comment-body" name="body" class="issue-input" placeholder="Leave a comment…" required></textarea>
+{error_block}
+<div class="detail-layout">
+  <div class="detail-layout__main">
+    <section class="card comment-box">
+      <div class="comment-box__meta"><b>{author}</b> <span>opened this issue</span> <span title="{created_abs}">{created_rel}</span></div>
+      <div class="comment-box__body">{body_html}{issue_reactions}</div>
+    </section>
+    <ul class="issue-list timeline">{comment_list}</ul>
+    <section class="card composer">
+      <div class="card__body">
+        <form method="post" action="/r/{owner}/{name}/issues/{number}/comment">
+          <input type="hidden" name="csrf_token" value="{csrf}">
+          <div class="field">
+            <label for="comment-body">Comment</label>
+            <textarea id="comment-body" name="body" class="issue-input" placeholder="Leave a comment…" required></textarea>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" type="submit">Comment</button>
+          </div>
+        </form>
+        {toggle_form}
       </div>
-      <div class="actions">
-        <button class="btn btn-primary" type="submit">Comment</button>
-      </div>
-    </form>
+    </section>
   </div>
-</section>
-{actions}"##,
+  <aside class="side">{sidebar}</aside>
+</div>"##,
         header = header,
         cls = cls,
         label = label,
         number = issue.number,
         title = esc(&issue.title),
-        when = esc(&fmt_ts(issue.created_at)),
+        created_abs = esc(&fmt_ts(issue.created_at)),
+        created_rel = esc(&fmt_rel(now, issue.created_at)),
         author = esc(&issue.author_sub),
         updated = updated,
-        assignee = assignee,
-        milestone = milestone,
-        label_chips = label_chips,
         body_html = body_html,
         issue_reactions = issue_reactions,
-        ncomments = comments.len(),
         comment_list = comment_list,
         error_block = error_block,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         csrf = esc(csrf),
-        actions = actions,
+        toggle_form = toggle_form,
+        sidebar = sidebar,
     )
 }
 
