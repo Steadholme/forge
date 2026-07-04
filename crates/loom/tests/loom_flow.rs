@@ -297,7 +297,11 @@ async fn web_create_repo_issues_and_xss_escaping() {
     assert!(filtered.body.contains("alice/proj"));
     let filtered_empty = send(&app, get("/?q=missing", Some("alice"))).await;
     assert!(filtered_empty.body.contains("No repositories matched"));
-    assert!(!filtered_empty.body.contains("repo-row__name"));
+    // Anchor to the rendered row link, not the bare class token — app.css is inlined into every
+    // page and carries a `.repo-row__name` selector that a substring test would always match.
+    assert!(!filtered_empty
+        .body
+        .contains(r#"class="repo-row__name" href="#));
 
     // Repo page: empty repo quick-start + clone URL + escaped description.
     let view = send(&app, get("/r/alice/proj", Some("alice"))).await;
@@ -3432,6 +3436,170 @@ async fn settings_webhooks_crud_and_secret_is_not_echoed() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn deploy_flow_short_circuits_without_siteflow_base_url() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "site", "").await;
+
+    let git_dir = git.repo_path("alice", "site").to_string_lossy().to_string();
+    seed_repo(&git_dir, "main", &[("index.html", "<h1>hi</h1>\n")]);
+    let head = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+
+    let repo_page = send(&app, get("/r/alice/site", Some("alice"))).await;
+    assert_eq!(repo_page.status, StatusCode::OK);
+    assert!(repo_page.body.contains("deploy-trigger"));
+    assert!(repo_page.body.contains(r#"action="/r/alice/site/deploy""#));
+    let csrf = repo_page.csrf_cookie().expect("csrf on repo page");
+
+    let submitted = send(
+        &app,
+        post_form(
+            "/r/alice/site/deploy",
+            &[("csrf_token", &csrf), ("output_directory", "public")],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(submitted.status, StatusCode::FOUND);
+    assert_eq!(submitted.location(), "/r/alice/site/settings");
+
+    let repo = store
+        .get_repo("alice", "site")
+        .await
+        .unwrap()
+        .expect("repo exists");
+    let deploy = store
+        .get_deploy(&repo.id)
+        .await
+        .unwrap()
+        .expect("deploy metadata exists");
+    assert_eq!(deploy.siteflow_slug, "alice-site");
+    assert_eq!(deploy.siteflow_project_id, "");
+    assert_eq!(deploy.deploy_hook_token, "");
+    assert_eq!(deploy.production_branch, "main");
+    assert_eq!(deploy.output_directory, "public");
+    assert_eq!(deploy.framework, "static");
+    assert_eq!(deploy.last_deployed_sha, head);
+    assert!(deploy.last_build_job_id.starts_with("local_"));
+    assert_eq!(
+        deploy.preview_url,
+        "https://alice-site.sites.holdfast.internal"
+    );
+
+    let settings = send(&app, get("/r/alice/site/settings", Some("alice"))).await;
+    assert_eq!(settings.status, StatusCode::OK);
+    assert!(settings.body.contains("deploy-card"));
+    assert!(settings.body.contains(&deploy.last_build_job_id));
+    assert!(settings
+        .body
+        .contains("https://alice-site.sites.holdfast.internal"));
+    assert!(!settings.body.contains("deploy_hook_token"));
+
+    let status = send(&app, get("/r/alice/site/deploy/status", Some("alice"))).await;
+    assert_eq!(status.status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&status.body).unwrap();
+    assert_eq!(parsed["configured"], true);
+    assert_eq!(parsed["buildJobId"], deploy.last_build_job_id);
+    assert_eq!(parsed["lastDeployedSha"], deploy.last_deployed_sha);
+}
+
+#[tokio::test]
+async fn deploy_settings_save_gate_and_disconnect() {
+    let state = temp_state();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "site", "").await;
+
+    let settings = send(&app, get("/r/alice/site/settings", Some("alice"))).await;
+    assert_eq!(settings.status, StatusCode::OK);
+    assert!(settings.body.contains("deploy-card"));
+    let csrf = settings.csrf_cookie().expect("csrf on settings");
+
+    let forbidden = send(
+        &app,
+        post_form(
+            "/r/alice/site/settings/deploy",
+            &[
+                ("csrf_token", &csrf),
+                ("production_branch", "main"),
+                ("output_directory", "dist"),
+                ("framework", "static"),
+                ("auto_deploy", "on"),
+                ("action", "save"),
+            ],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    let saved = send(
+        &app,
+        post_form(
+            "/r/alice/site/settings/deploy",
+            &[
+                ("csrf_token", &csrf),
+                ("production_branch", "main"),
+                ("output_directory", "dist"),
+                ("framework", "static"),
+                ("auto_deploy", "on"),
+                ("action", "save"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::FOUND);
+    let repo = store
+        .get_repo("alice", "site")
+        .await
+        .unwrap()
+        .expect("repo exists");
+    let deploy = store.get_deploy(&repo.id).await.unwrap().unwrap();
+    assert_eq!(deploy.output_directory, "dist");
+    assert!(deploy.auto_deploy);
+    assert_eq!(deploy.deploy_hook_token, "");
+
+    let wrong_confirm = send(
+        &app,
+        post_form(
+            "/r/alice/site/settings/deploy",
+            &[
+                ("csrf_token", &csrf),
+                ("action", "disconnect"),
+                ("confirm_name", "nope"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(wrong_confirm.status, StatusCode::BAD_REQUEST);
+
+    let disconnected = send(
+        &app,
+        post_form(
+            "/r/alice/site/settings/deploy",
+            &[
+                ("csrf_token", &csrf),
+                ("action", "disconnect"),
+                ("confirm_name", "site"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(disconnected.status, StatusCode::FOUND);
+    assert!(store.get_deploy(&repo.id).await.unwrap().is_none());
 }
 
 // ===========================================================================

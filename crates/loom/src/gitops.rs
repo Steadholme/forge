@@ -327,6 +327,21 @@ impl GitOps {
         }
     }
 
+    /// Resolve a local branch head to a commit OID, or `None` when the branch has no commit.
+    pub async fn branch_head_commit(
+        &self,
+        owner: &str,
+        name: &str,
+        branch: &str,
+    ) -> Option<String> {
+        let path = self.repo_path(owner, name);
+        self.rev(
+            &path.to_string_lossy(),
+            &format!("refs/heads/{branch}^{{commit}}"),
+        )
+        .await
+    }
+
     /// Author time of the default-branch HEAD commit, or `None` for an empty repository.
     pub async fn head_commit_time(&self, owner: &str, name: &str) -> Option<i64> {
         let head = self.head_commit(owner, name).await?;

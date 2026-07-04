@@ -78,6 +78,14 @@ pub fn app(state: AppState) -> Router {
         .route("/r/{owner}/{name}", get(handlers::repos::view))
         .route("/r/{owner}/{name}/fork", post(handlers::repos::fork))
         .route(
+            "/r/{owner}/{name}/deploy",
+            post(handlers::deploy::deploy_now),
+        )
+        .route(
+            "/r/{owner}/{name}/deploy/status",
+            get(handlers::deploy::status_json),
+        )
+        .route(
             "/r/{owner}/{name}/search",
             get(handlers::repos::code_search),
         )
@@ -129,6 +137,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/r/{owner}/{name}/settings",
             get(handlers::settings::show).post(handlers::settings::update),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/deploy",
+            post(handlers::deploy::update_settings),
         )
         .route(
             "/r/{owner}/{name}/settings/labels",

@@ -20,6 +20,7 @@
 
 pub mod branches;
 pub mod commits;
+pub mod deploy;
 pub mod health;
 pub mod issues;
 pub mod pats;

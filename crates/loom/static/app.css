@@ -2782,3 +2782,106 @@ h3 { font-size:14px; }
   .commit-row__subject, .sha-group__oid, .sha-group__copy,
   .issue-item__title, .pr-item__title { transition:none; }
 }
+
+
+/* ==========================================================================
+   Deploy (SiteFlow) — visual layer only
+   --------------------------------------------------------------------------
+   Backend markup (crates/loom/src/handlers/deploy.rs) ships two entry points:
+
+     code-toolbar:  details.popbtn.popbtn--deploy.deploy-trigger
+                      > summary.btn.btn-ghost.btn-sm (glyph svg) + .popbtn__pop
+                    | button.btn…deploy-trigger--disabled  (private-repo stub)
+     settings:      section.card.deploy-card
+                      .card__head > h2 + span.deploy-status--{s}[data-poll]
+                      .card__body > .deploy-summary
+                                      (.deploy-preview-url + .deploy-build-id)
+                                  + form.deploy-form   (.field/.check/.actions)
+                                  + form.deploy-disconnect-form  (destructive)
+
+   Everything rides the existing kit: the trigger IS a stock .btn-ghost.btn-sm
+   inside the popbtn popover system (Code/Fork family), the card is a stock
+   .card, the form is stock .field/.check/.actions, and the destructive tail
+   draws only from the shared --down family (.danger-zone / .btn-delete-webhook
+   tokens). Tokens only — no raw hex, no new keyframes — so the global
+   reduced-motion guard and the token theme layer apply with no extra rule.
+   ========================================================================== */
+
+/* 1. Trigger — the summary already sits in the fork/clone family via
+   .btn-ghost.btn-sm and inherits the .popbtn[open] highlight; only the glyph
+   drops to the toolbar's --ink-3 icon tier (same as .branchbtn svg /
+   .code-toolbar__link), returning to full ink while the popover is open.
+   The private-repo stub keeps the stock .btn[disabled] fade — a resting
+   Deploy never signals danger, and the title attribute carries the reason. */
+.deploy-trigger > summary svg { color:var(--ink-3); }
+.deploy-trigger[open] > summary svg { color:var(--ink); }
+
+/* 2. Status — a pill in the .state-badge recipe (11px / 600 / --r-pill) that
+   app.js data-poll rewrites wholesale, so every state rule rides the base
+   class + modifier only. Lifecycle hues map onto the shared state families:
+   queued waits in neutral grey, building runs on the --info blue, ready lands
+   on the --ok green, failed drops to the --down red; the label text always
+   carries the meaning alongside the hue (never colour alone). A leading
+   currentColor dot reuses the .dot idiom; not_configured and any unknown
+   label rest on the neutral base. In the card head the badge is pushed to
+   the trailing edge, mirroring .webhook-item's state badge. */
+.deploy-status { display:inline-flex; align-items:center; gap:6px;
+  padding:2px 10px; border-radius:var(--r-pill);
+  font-size:11px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
+  background:var(--bg-2); color:var(--ink-2); border:1px solid var(--border); }
+.deploy-status::before { content:""; flex:none; width:6px; height:6px;
+  border-radius:50%; background:currentColor; }
+.deploy-card .card__head .deploy-status { margin-left:auto; }
+
+.deploy-status--queued   { background:var(--bg-2);        color:var(--ink-2);     border-color:var(--border); }
+.deploy-status--building { background:var(--info-soft);   color:var(--info-ink);  border-color:var(--info-border); }
+.deploy-status--ready    { background:var(--ok-soft);     color:var(--ok-ink);    border-color:var(--ok-border); }
+.deploy-status--failed   { background:var(--down-soft);   color:var(--down-ink);  border-color:var(--down-border); }
+
+/* 3. Summary — preview URL + build id as one quiet inset strip (the
+   .webhook-item surface recipe) ahead of the config form. The preview URL is
+   deliberately not a link this phase: mono, muted ink, dashed underline (the
+   "pending" cue from the .webhook-item--empty idiom), select-all for the
+   data-copy flow, and cursor:help pointing at the title note ("internal
+   placeholder; independent domain pending"). "Build:" stays a sans label and
+   only the <code> job id drops to a neutral mono chip — .oid's link-blue is
+   avoided on purpose so nothing in the strip promises a click. */
+.deploy-summary { display:flex; flex-direction:column; gap:8px;
+  margin-bottom:16px; padding:12px 14px;
+  background:var(--surface-2); border:1px solid var(--border);
+  border-radius:var(--r-sm); }
+.deploy-preview-url { font-family:var(--mono); font-size:12.5px; line-height:1.5;
+  color:var(--ink-3); word-break:break-all;
+  user-select:all; -webkit-user-select:all; cursor:help;
+  text-decoration:underline dashed; text-decoration-color:var(--border-2);
+  text-underline-offset:3px; }
+.deploy-build-id { font-size:12px; color:var(--ink-2); }
+.deploy-build-id code { font-family:var(--mono); font-size:11.5px; color:var(--ink-2);
+  padding:1px 6px; background:var(--surface-3); border:1px solid var(--hairline);
+  border-radius:var(--r-xs); word-break:break-all; }
+
+/* private-repo note leads the body; cancel its top-of-flow .hint--muted
+   margin so the card opens on the note, not on dead air */
+.deploy-card .card__body > .hint--muted:first-child { margin:0 0 14px; }
+
+/* 4. Auto-deploy toggle — the stock .check row lays it out; the control's
+   size + accent are pinned on the hook itself so the checkbox stays a
+   16px --accent control even if the shared .check input base shifts. */
+.deploy-auto-toggle { flex:none; width:16px; height:16px; margin:0;
+  accent-color:var(--accent); }
+
+/* 5. Disconnect — the destructive tail of the card, set apart by a hairline
+   and coloured only from the shared --down family (the same tokens
+   .card.danger-zone and .btn-delete-webhook already use — no new colour).
+   The label takes --down-ink so the danger region reads before any control
+   does; the confirm input takes the --mono face so the typed name checks
+   character-for-character (mirrors .delete-repo-form); and the button — a
+   stock disabled ghost until data-delete-confirm arms it — borrows the red
+   wash on hover only, so a resting or un-armed Disconnect never looks hot. */
+.deploy-disconnect-form { margin-top:20px; padding-top:16px;
+  border-top:1px solid var(--hairline); }
+.deploy-disconnect-form .field > label { color:var(--down-ink); }
+.deploy-disconnect-form input[type=text] { font-family:var(--mono); font-size:13px;
+  max-width:340px; }
+.deploy-disconnect-form .btn:not([disabled]):hover {
+  color:var(--down-ink); border-color:var(--down-border); background:var(--down-soft); }

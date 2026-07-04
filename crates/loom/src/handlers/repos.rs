@@ -165,7 +165,12 @@ pub async fn view(
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
     let csrf = auth::new_csrf_token();
     let fork_popover = render_fork_popover(&repo, &who, &csrf);
-    let body = render_code_page(&state, &repo, "", &fork_popover).await?;
+    let toolbar_actions = format!(
+        "{}{}",
+        crate::handlers::deploy::render_deploy_button(&repo, &csrf),
+        fork_popover
+    );
+    let body = render_code_page(&state, &repo, "", &toolbar_actions).await?;
     Ok(html_with_csrf(
         StatusCode::OK,
         page(&format!("{}/{}", owner, name), Some(&who.email), &body),
@@ -1040,7 +1045,7 @@ async fn render_code_page(
             "code",
             parent.as_ref(),
         );
-        let toolbar = render_code_toolbar(repo, &state.config.public_base_url, None, "");
+        let toolbar = render_code_toolbar(repo, &state.config.public_base_url, None, fork_popover);
         let push = render_empty_repo(repo, &state.config.public_base_url);
         return Ok(format!("{header}{toolbar}{push}"));
     };

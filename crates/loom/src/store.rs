@@ -23,7 +23,7 @@ use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
     CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, PrThreadResolved, Pull,
     PullReview, PullReviewComment, Reaction, ReactionSummary, Release, Repo, RepoCollaborator,
-    Webhook,
+    RepoDeploy, Webhook,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -519,6 +519,16 @@ pub trait Store: Send + Sync {
     /// Delete one outbound webhook by repo + id. Returns whether a row was removed.
     async fn delete_webhook(&self, repo_id: &str, id: &str) -> Result<bool, StoreError>;
 
+    // --- SiteFlow deploy metadata ------------------------------------------
+    /// Fetch the SiteFlow deployment metadata for one repository.
+    async fn get_deploy(&self, repo_id: &str) -> Result<Option<RepoDeploy>, StoreError>;
+
+    /// Insert or replace deployment metadata for one repository.
+    async fn upsert_deploy(&self, deploy: &RepoDeploy) -> Result<RepoDeploy, StoreError>;
+
+    /// Delete deployment metadata for one repository. Returns whether a row was removed.
+    async fn delete_deploy(&self, repo_id: &str) -> Result<bool, StoreError>;
+
     // --- pats ----------------------------------------------------------------
     /// Insert a personal access token (only the hash is stored).
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError>;
@@ -558,6 +568,7 @@ pub struct InMemoryStore {
     pr_thread_resolved: Mutex<Vec<PrThreadResolved>>,
     commit_statuses: Mutex<Vec<CommitStatus>>,
     webhooks: Mutex<Vec<Webhook>>,
+    deploys: Mutex<Vec<RepoDeploy>>,
     pats: Mutex<Vec<Pat>>,
 }
 
@@ -674,6 +685,10 @@ impl Store for InMemoryStore {
             .lock()
             .expect("webhooks lock poisoned")
             .retain(|w| w.repo_id != repo_id);
+        self.deploys
+            .lock()
+            .expect("deploys lock poisoned")
+            .retain(|d| d.repo_id != repo_id);
 
         let issue_ids: Vec<String> = {
             let mut issues = self.issues.lock().expect("issues lock poisoned");
@@ -2024,6 +2039,28 @@ impl Store for InMemoryStore {
         Ok(webhooks.len() != before)
     }
 
+    async fn get_deploy(&self, repo_id: &str) -> Result<Option<RepoDeploy>, StoreError> {
+        let deploys = self.deploys.lock().expect("deploys lock poisoned");
+        Ok(deploys.iter().find(|d| d.repo_id == repo_id).cloned())
+    }
+
+    async fn upsert_deploy(&self, deploy: &RepoDeploy) -> Result<RepoDeploy, StoreError> {
+        let mut deploys = self.deploys.lock().expect("deploys lock poisoned");
+        if let Some(existing) = deploys.iter_mut().find(|d| d.repo_id == deploy.repo_id) {
+            *existing = deploy.clone();
+            return Ok(existing.clone());
+        }
+        deploys.push(deploy.clone());
+        Ok(deploy.clone())
+    }
+
+    async fn delete_deploy(&self, repo_id: &str) -> Result<bool, StoreError> {
+        let mut deploys = self.deploys.lock().expect("deploys lock poisoned");
+        let before = deploys.len();
+        deploys.retain(|d| d.repo_id != repo_id);
+        Ok(deploys.len() != before)
+    }
+
     async fn create_pat(&self, pat: &Pat) -> Result<(), StoreError> {
         let mut pats = self.pats.lock().expect("pats lock poisoned");
         pats.push(pat.clone());
@@ -2086,6 +2123,7 @@ const PR_THREAD_RESOLVED_COLS: &str = "pr_id, thread_key, resolved, resolved_by,
 const COMMIT_STATUS_COLS: &str =
     "id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at";
 const WEBHOOK_COLS: &str = "id, repo_id, url, secret, events, active, created_at";
+const DEPLOY_COLS: &str = "id, repo_id, siteflow_slug, siteflow_project_id, deploy_hook_token, deploy_hook_url, production_branch, output_directory, framework, auto_deploy, last_build_job_id, preview_url, last_deployed_sha, created_at, updated_at";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -2577,6 +2615,33 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS repo_deploy (\
+                 id TEXT PRIMARY KEY, \
+                 repo_id TEXT NOT NULL, \
+                 siteflow_slug TEXT NOT NULL DEFAULT '', \
+                 siteflow_project_id TEXT NOT NULL DEFAULT '', \
+                 deploy_hook_token TEXT NOT NULL DEFAULT '', \
+                 deploy_hook_url TEXT NOT NULL DEFAULT '', \
+                 production_branch TEXT NOT NULL DEFAULT 'main', \
+                 output_directory TEXT NOT NULL DEFAULT '.', \
+                 framework TEXT NOT NULL DEFAULT 'static', \
+                 auto_deploy BOOLEAN NOT NULL DEFAULT FALSE, \
+                 last_build_job_id TEXT NOT NULL DEFAULT '', \
+                 preview_url TEXT NOT NULL DEFAULT '', \
+                 last_deployed_sha TEXT NOT NULL DEFAULT '', \
+                 created_at BIGINT NOT NULL, \
+                 updated_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_deploy_repo \
+             ON repo_deploy (repo_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Per-repo PR numbering uniqueness (backs the race-safe ON CONFLICT retry).
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pulls_repo_number \
@@ -2793,6 +2858,26 @@ impl PgStore {
             created_at: row.try_get("created_at")?,
         })
     }
+
+    fn deploy_from_row(row: &sqlx::postgres::PgRow) -> Result<RepoDeploy, sqlx::Error> {
+        Ok(RepoDeploy {
+            id: row.try_get("id")?,
+            repo_id: row.try_get("repo_id")?,
+            siteflow_slug: row.try_get("siteflow_slug")?,
+            siteflow_project_id: row.try_get("siteflow_project_id")?,
+            deploy_hook_token: row.try_get("deploy_hook_token")?,
+            deploy_hook_url: row.try_get("deploy_hook_url")?,
+            production_branch: row.try_get("production_branch")?,
+            output_directory: row.try_get("output_directory")?,
+            framework: row.try_get("framework")?,
+            auto_deploy: row.try_get("auto_deploy")?,
+            last_build_job_id: row.try_get("last_build_job_id")?,
+            preview_url: row.try_get("preview_url")?,
+            last_deployed_sha: row.try_get("last_deployed_sha")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
 }
 
 #[async_trait]
@@ -2966,6 +3051,7 @@ impl Store for PgStore {
             "DELETE FROM milestones WHERE repo_id = $1",
             "DELETE FROM releases WHERE repo_id = $1",
             "DELETE FROM webhooks WHERE repo_id = $1",
+            "DELETE FROM repo_deploy WHERE repo_id = $1",
             "DELETE FROM commit_statuses WHERE repo_id = $1",
             "DELETE FROM repo_collaborators WHERE repo_id = $1",
             "DELETE FROM repos WHERE id = $1",
@@ -4565,6 +4651,72 @@ impl Store for PgStore {
         let result = sqlx::query("DELETE FROM webhooks WHERE repo_id = $1 AND id = $2")
             .bind(repo_id)
             .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn get_deploy(&self, repo_id: &str) -> Result<Option<RepoDeploy>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {DEPLOY_COLS} FROM repo_deploy WHERE repo_id = $1"
+        ))
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::deploy_from_row)
+            .transpose()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn upsert_deploy(&self, deploy: &RepoDeploy) -> Result<RepoDeploy, StoreError> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO repo_deploy \
+                 (id, repo_id, siteflow_slug, siteflow_project_id, deploy_hook_token, \
+                  deploy_hook_url, production_branch, output_directory, framework, auto_deploy, \
+                  last_build_job_id, preview_url, last_deployed_sha, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+             ON CONFLICT (repo_id) DO UPDATE SET \
+                 siteflow_slug = $3, \
+                 siteflow_project_id = $4, \
+                 deploy_hook_token = $5, \
+                 deploy_hook_url = $6, \
+                 production_branch = $7, \
+                 output_directory = $8, \
+                 framework = $9, \
+                 auto_deploy = $10, \
+                 last_build_job_id = $11, \
+                 preview_url = $12, \
+                 last_deployed_sha = $13, \
+                 updated_at = $15 \
+             RETURNING {DEPLOY_COLS}"
+        ))
+        .bind(&deploy.id)
+        .bind(&deploy.repo_id)
+        .bind(&deploy.siteflow_slug)
+        .bind(&deploy.siteflow_project_id)
+        .bind(&deploy.deploy_hook_token)
+        .bind(&deploy.deploy_hook_url)
+        .bind(&deploy.production_branch)
+        .bind(&deploy.output_directory)
+        .bind(&deploy.framework)
+        .bind(deploy.auto_deploy)
+        .bind(&deploy.last_build_job_id)
+        .bind(&deploy.preview_url)
+        .bind(&deploy.last_deployed_sha)
+        .bind(deploy.created_at)
+        .bind(deploy.updated_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Self::deploy_from_row(&row).map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_deploy(&self, repo_id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM repo_deploy WHERE repo_id = $1")
+            .bind(repo_id)
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;

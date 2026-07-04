@@ -14,6 +14,12 @@ pub const DEFAULT_LOOM_DATA: &str = "/data";
 /// Default public base URL, used to render the `git clone` URL on the repo page.
 pub const DEFAULT_PUBLIC_BASE_URL: &str = "https://git.w33d.xyz";
 
+/// Default clone base URL passed to SiteFlow project repository metadata.
+pub const DEFAULT_SITEFLOW_LOOM_CLONE_BASE_URL: &str = "https://git.w33d.xyz/git";
+
+/// Default placeholder domain for SiteFlow preview URLs. This must not be under `w33d.xyz`.
+pub const DEFAULT_SITEFLOW_BASE_DOMAIN: &str = "sites.holdfast.internal";
+
 /// Default path to the `git http-backend` CGI (Debian `git` package location).
 pub const DEFAULT_GIT_HTTP_BACKEND: &str = "/usr/lib/git-core/git-http-backend";
 
@@ -44,6 +50,16 @@ pub struct Config {
     pub git_bin: String,
     /// Bearer token accepted by the internal commit-status write API (`LOOM_STATUS_TOKEN`).
     pub status_token: String,
+    /// Internal SiteFlow control-plane URL (`SITEFLOW_CTRL_URL`). Empty disables outbound calls.
+    pub siteflow_base_url: String,
+    /// Bearer token for Loom -> SiteFlow machine calls (`SITEFLOW_API_TOKEN`).
+    pub siteflow_api_token: String,
+    /// Clone URL base passed to SiteFlow (`SITEFLOW_LOOM_CLONE_BASE_URL`).
+    pub siteflow_clone_base_url: String,
+    /// Base domain used to render placeholder preview URLs (`SITEFLOW_BASE_DOMAIN`).
+    pub siteflow_base_domain: String,
+    /// Default auto-deploy setting for newly saved deploy configs.
+    pub auto_deploy_default: bool,
 }
 
 impl Config {
@@ -56,6 +72,11 @@ impl Config {
             git_http_backend: DEFAULT_GIT_HTTP_BACKEND.to_string(),
             git_bin: DEFAULT_GIT_BIN.to_string(),
             status_token: String::new(),
+            siteflow_base_url: String::new(),
+            siteflow_api_token: String::new(),
+            siteflow_clone_base_url: DEFAULT_SITEFLOW_LOOM_CLONE_BASE_URL.to_string(),
+            siteflow_base_domain: DEFAULT_SITEFLOW_BASE_DOMAIN.to_string(),
+            auto_deploy_default: false,
         }
     }
 
@@ -80,6 +101,21 @@ impl Config {
         if let Some(v) = env_nonempty("LOOM_STATUS_TOKEN") {
             config.status_token = v;
         }
+        if let Some(v) = env_nonempty("SITEFLOW_CTRL_URL") {
+            config.siteflow_base_url = v;
+        }
+        if let Some(v) = env_nonempty("SITEFLOW_API_TOKEN") {
+            config.siteflow_api_token = v;
+        }
+        if let Some(v) = env_nonempty("SITEFLOW_LOOM_CLONE_BASE_URL") {
+            config.siteflow_clone_base_url = v;
+        }
+        if let Some(v) = env_nonempty("SITEFLOW_BASE_DOMAIN") {
+            config.siteflow_base_domain = v;
+        }
+        if let Some(v) = env_nonempty("SITEFLOW_AUTO_DEPLOY_DEFAULT") {
+            config.auto_deploy_default = parse_bool(&v);
+        }
         config
     }
 
@@ -102,4 +138,11 @@ fn env_nonempty(key: &str) -> Option<String> {
         Ok(v) if !v.is_empty() => Some(v),
         _ => None,
     }
+}
+
+fn parse_bool(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

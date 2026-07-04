@@ -834,10 +834,13 @@ async fn render_settings(
         .list_webhooks(&repo.id)
         .await
         .unwrap_or_default();
+    let deploy = state.store.get_deploy(&repo.id).await.unwrap_or_default();
     let collaborators_card = render_collaborators_card(repo, csrf, &collaborators);
     let labels_card = render_labels_card(repo, csrf, &labels);
     let milestones_card = render_milestones_card(state, repo, csrf, &milestones).await;
     let webhooks_card = render_webhooks_card(repo, csrf, &webhooks);
+    let deploy_card =
+        crate::handlers::deploy::render_deploy_card(state, repo, csrf, deploy.as_ref());
     let danger_zone = render_danger_zone(repo, who, csrf);
 
     format!(
@@ -876,6 +879,7 @@ async fn render_settings(
 </section>
 {collaborators_card}
 {webhooks_card}
+{deploy_card}
 {labels_card}
 {milestones_card}
 {danger_zone}"##,
@@ -891,6 +895,7 @@ async fn render_settings(
         protect_checked = protect_checked,
         collaborators_card = collaborators_card,
         webhooks_card = webhooks_card,
+        deploy_card = deploy_card,
         labels_card = labels_card,
         milestones_card = milestones_card,
         danger_zone = danger_zone,

@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use loom::model::{CommitStatus, Pat, Release, Repo};
+use loom::model::{CommitStatus, Pat, Release, Repo, RepoDeploy};
 use loom::now_secs;
 use loom::store::{PgStore, Store};
 use sqlx::postgres::PgPoolOptions;
@@ -70,6 +70,26 @@ fn release(id: &str, repo_id: &str, tag: &str, created_at: i64, draft: bool) -> 
     }
 }
 
+fn deploy(repo_id: &str, output_directory: &str, auto_deploy: bool, updated_at: i64) -> RepoDeploy {
+    RepoDeploy {
+        id: "rd1".to_string(),
+        repo_id: repo_id.to_string(),
+        siteflow_slug: "alice-pub".to_string(),
+        siteflow_project_id: "project_alice_pub".to_string(),
+        deploy_hook_token: "hook-secret".to_string(),
+        deploy_hook_url: "https://siteflow.test/hook".to_string(),
+        production_branch: "main".to_string(),
+        output_directory: output_directory.to_string(),
+        framework: "static".to_string(),
+        auto_deploy,
+        last_build_job_id: "job1".to_string(),
+        preview_url: "https://alice-pub.sites.holdfast.internal".to_string(),
+        last_deployed_sha: "abc123".to_string(),
+        created_at: 1,
+        updated_at,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_store_full_integration() {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
@@ -101,6 +121,7 @@ async fn pg_store_full_integration() {
         "pr_reviews",
         "pr_thread_resolved",
         "pr_file_viewed",
+        "repo_deploy",
         "commit_statuses",
         "releases",
         "issues",
@@ -276,6 +297,21 @@ async fn pg_store_full_integration() {
         .map(|s| s.context)
         .collect();
     assert_eq!(contexts, vec!["ci/anvil", "test"]);
+
+    assert!(store.get_deploy(&repo_id).await.unwrap().is_none());
+    let saved_deploy = store
+        .upsert_deploy(&deploy(&repo_id, ".", false, now + 13))
+        .await
+        .unwrap();
+    assert_eq!(saved_deploy.siteflow_project_id, "project_alice_pub");
+    assert_eq!(saved_deploy.output_directory, ".");
+    let edited_deploy = store
+        .upsert_deploy(&deploy(&repo_id, "dist", true, now + 14))
+        .await
+        .unwrap();
+    assert_eq!(edited_deploy.output_directory, "dist");
+    assert!(edited_deploy.auto_deploy);
+    assert_eq!(edited_deploy.updated_at, now + 14);
 
     let i1 = store
         .create_issue("is1", &repo_id, "first", "body", "alice", now)

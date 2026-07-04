@@ -307,6 +307,41 @@ pub struct Webhook {
     pub created_at: i64,
 }
 
+/// SiteFlow deployment metadata for one repository. Field order/types mirror `repo_deploy`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoDeploy {
+    /// Random opaque id (primary key).
+    pub id: String,
+    /// Owning repository id. Unique; one deployment config per repository.
+    pub repo_id: String,
+    /// SiteFlow project slug, derived from owner/name for display and createProject idempotency.
+    pub siteflow_slug: String,
+    /// SiteFlow project id returned by `POST /api/projects`. This is not the slug.
+    pub siteflow_project_id: String,
+    /// Deploy hook token. Stored for server-side trigger only; never rendered.
+    pub deploy_hook_token: String,
+    /// Deploy hook URL. Stored for diagnostics/server use only; never rendered.
+    pub deploy_hook_url: String,
+    /// Branch used for production deploys.
+    pub production_branch: String,
+    /// Static build output directory sent to SiteFlow.
+    pub output_directory: String,
+    /// SiteFlow framework. Currently only `static`.
+    pub framework: String,
+    /// Whether pushes to the production branch should trigger deployment.
+    pub auto_deploy: bool,
+    /// Last SiteFlow build job id returned by a trigger.
+    pub last_build_job_id: String,
+    /// Placeholder preview URL on the SiteFlow base domain.
+    pub preview_url: String,
+    /// Last commit SHA submitted to SiteFlow.
+    pub last_deployed_sha: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
+    /// Last update time, epoch seconds.
+    pub updated_at: i64,
+}
+
 /// A pull-request review verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullReview {

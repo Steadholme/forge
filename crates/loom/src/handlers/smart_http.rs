@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 
 use crate::auth;
 use crate::gitops::CgiOut;
+use crate::handlers::deploy;
 use crate::model::{repo_role_rank, Pat, Repo};
 use crate::webhooks;
 use crate::AppState;
@@ -134,6 +135,7 @@ pub async fn handle(
             if op == GitOp::Push && method == Method::POST && (200..300).contains(&cgi.status) {
                 let actor = remote_user.as_deref().unwrap_or(&repo.owner_sub);
                 webhooks::emit_push(&state, &repo, actor);
+                deploy::emit_auto_deploy(&state, &repo, actor, &body);
             }
             cgi_to_response(cgi)
         }
