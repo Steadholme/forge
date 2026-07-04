@@ -259,8 +259,8 @@ async fn open_issue(
 
 /// Create a repo through the web flow; returns nothing (assertions inline).
 async fn create_repo(app: &axum::Router, subject: &str, name: &str, visibility: &str) {
-    let page = send(app, get("/", Some(subject))).await;
-    let csrf = page.csrf_cookie().expect("csrf on GET /");
+    let page = send(app, get("/new", Some(subject))).await;
+    let csrf = page.csrf_cookie().expect("csrf on GET /new");
     let created = send(
         app,
         post_form(
@@ -286,6 +286,18 @@ async fn web_create_repo_issues_and_xss_escaping() {
     let app = app(temp_state());
 
     create_repo(&app, "alice", "proj", "").await;
+
+    let home = send(&app, get("/", Some("alice"))).await;
+    assert_eq!(home.status, StatusCode::OK);
+    assert!(home
+        .body
+        .contains(r#"class="repo-row__name" href="/r/alice/proj""#));
+    assert!(home.body.contains(r#"name="q" value="""#));
+    let filtered = send(&app, get("/?q=proj", Some("alice"))).await;
+    assert!(filtered.body.contains("alice/proj"));
+    let filtered_empty = send(&app, get("/?q=missing", Some("alice"))).await;
+    assert!(filtered_empty.body.contains("No repositories matched"));
+    assert!(!filtered_empty.body.contains("repo-row__name"));
 
     // Repo page: empty repo quick-start + clone URL + escaped description.
     let view = send(&app, get("/r/alice/proj", Some("alice"))).await;
@@ -315,6 +327,10 @@ async fn web_create_repo_issues_and_xss_escaping() {
     .await;
     assert_eq!(dup.status, StatusCode::BAD_REQUEST);
     assert!(dup.body.contains("already have a repository"));
+    assert!(dup.body.contains(r#"class="new-repo-form""#));
+    assert!(dup.body.contains(
+        r#"name="name" maxlength="64" autocomplete="off" spellcheck="false" required value="proj""#
+    ));
 
     // --- issues -----------------------------------------------------------
     let issues_page = send(&app, get("/r/alice/proj/issues", Some("alice"))).await;
@@ -337,7 +353,9 @@ async fn web_create_repo_issues_and_xss_escaping() {
 
     let list = send(&app, get("/r/alice/proj/issues", Some("alice"))).await;
     assert!(list.body.contains("#1"));
-    assert!(list.body.contains("Open"));
+    assert!(list
+        .body
+        .contains(r#"class="state-ico state-ico--open" title="Open""#));
     // Script payload is escaped, not live.
     assert!(!list.body.contains("<script>alert(1)</script>"));
     assert!(list.body.contains("&lt;script&gt;"));
@@ -356,7 +374,9 @@ async fn web_create_repo_issues_and_xss_escaping() {
     .await;
     assert_eq!(toggled.status, StatusCode::FOUND);
     let after = send(&app, get("/r/alice/proj/issues", Some("alice"))).await;
-    assert!(after.body.contains("Closed"));
+    assert!(after
+        .body
+        .contains(r#"class="state-ico state-ico--closed" title="Closed""#));
 }
 
 #[tokio::test]
@@ -372,6 +392,9 @@ async fn issue_detail_comments_filter_and_admin_gate() {
     let detail = send(&app, get(&loc, Some("bob"))).await;
     assert_eq!(detail.status, StatusCode::OK);
     assert!(detail.body.contains("#1"));
+    assert!(detail
+        .body
+        .contains(r#"class="detail-head detail-head--issue""#));
     assert!(
         detail.body.contains("<strong>bold</strong>"),
         "issue body markdown rendered"
@@ -1295,7 +1318,9 @@ async fn pull_request_compare_create_and_merge() {
     // List shows the open draft PR.
     let list = send(&app, get("/r/alice/proj/pulls", Some("alice"))).await;
     assert!(list.body.contains("#1"));
-    assert!(list.body.contains("Open"));
+    assert!(list
+        .body
+        .contains(r#"class="state-ico state-ico--draft" title="Open""#));
     assert!(list.body.contains("pr-draft-badge"));
     assert!(list.body.contains("Draft"));
     assert!(list.body.contains("assigned to bob"));
@@ -1313,6 +1338,9 @@ async fn pull_request_compare_create_and_merge() {
     // Detail shows draft state for the owner and hides the merge button.
     let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
     assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail
+        .body
+        .contains(r#"class="detail-head detail-head--pr""#));
     assert!(!detail.body.contains("Merge pull request"));
     assert!(detail.body.contains("Draft pull requests cannot be merged"));
     assert!(detail.body.contains("btn-ready-review"));
@@ -2417,6 +2445,9 @@ async fn commit_history_keyset_pagination() {
     // last shown commit (commit-006 = oids[5]).
     let p1 = send(&app, get("/r/alice/hist/commits", Some("alice"))).await;
     assert_eq!(p1.status, StatusCode::OK);
+    assert!(p1.body.contains(r#"class="commits-head""#));
+    assert!(p1.body.contains(r#"class="commit-group__date""#));
+    assert!(!p1.body.contains(r#"<table class="data">"#));
     assert!(p1.body.contains("commit-055"));
     assert!(p1.body.contains("commit-006"));
     assert!(!p1.body.contains("commit-005"), "page 1 stops at 50 rows");
@@ -2429,6 +2460,23 @@ async fn commit_history_keyset_pagination() {
     assert!(p1
         .body
         .contains(&format!("/r/alice/hist/commit/{}", oids[54])));
+    assert!(p1.body.contains(&format!("data-copy=\"{}\"", oids[54])));
+    assert!(p1
+        .body
+        .contains(&format!("/r/alice/hist/tree/{}", oids[54])));
+    let tree_at_commit = send(
+        &app,
+        get(&format!("/r/alice/hist/tree/{}", oids[54]), Some("alice")),
+    )
+    .await;
+    assert_eq!(tree_at_commit.status, StatusCode::OK);
+    assert!(tree_at_commit.body.contains(&format!(
+        "href=\"/r/alice/hist/blob/{}/file.txt\"",
+        oids[54]
+    )));
+    assert!(!tree_at_commit
+        .body
+        .contains(r#"<details class="popbtn popbtn--clone">"#));
 
     // Page 2 (keyset): the remaining 5, no further Older link, and a Newest rewind.
     let p2 = send(

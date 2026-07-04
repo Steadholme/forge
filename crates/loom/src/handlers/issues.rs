@@ -20,7 +20,7 @@ use crate::error::AppError;
 use crate::handlers::repos::{can_write_repo, load_visible_repo, render_repo_header};
 use crate::handlers::{
     accepts_json, esc, fmt_rel, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
-    reaction_summaries_json, redirect, render_reactions, REACTION_TARGET_COMMENT,
+    reaction_summaries_json, redirect, render_reactions, state_icon, REACTION_TARGET_COMMENT,
     REACTION_TARGET_ISSUE,
 };
 use crate::model::{Issue, IssueComment, Label, Milestone, ReactionSummary, Repo};
@@ -984,11 +984,10 @@ async fn render_list(
 
     format!(
         r##"{header}
-<div class="list-toolbar">
-  {tabs}
-  <span class="list-toolbar__fill"></span>
-  {filters}
-  <details class="popbtn popbtn--new"{open_attr}>
+	<div class="list-toolbar">
+	  <span class="list-toolbar__fill"></span>
+	  {filters}
+	  <details class="popbtn popbtn--new"{open_attr}>
     <summary class="btn btn-primary btn-sm">New issue</summary>
     <div class="popbtn__pop popbtn__pop--wide">
       {error_block}
@@ -1008,12 +1007,13 @@ async fn render_list(
         </div>
       </form>
     </div>
-  </details>
-</div>
-<section class="card">
-  <div class="card__body card__body--list">
-    <ul class="issue-list">{list}</ul>
-    {pager}
+	  </details>
+	</div>
+	<section class="card">
+	  <div class="card__head card__head--list">{tabs}</div>
+	  <div class="card__body card__body--list">
+	    <ul class="issue-list">{list}</ul>
+	    {pager}
   </div>
 </section>"##,
         header = header,
@@ -1244,7 +1244,12 @@ fn render_issue_row(
     labels: &[Label],
     milestones: &[Milestone],
 ) -> String {
-    let (state_class, state_label) = state_badge(issue);
+    let (_, state_label) = state_badge(issue);
+    let (icon_class, icon_kind) = if issue.is_open() {
+        ("state-ico--open", "issue-open")
+    } else {
+        ("state-ico--closed", "issue-closed")
+    };
     let label_chips = render_label_chips(labels);
     let assignee = if issue.assignee_sub.is_empty() {
         String::new()
@@ -1258,17 +1263,20 @@ fn render_issue_row(
         .unwrap_or_default();
     format!(
         r##"<li class="issue-item">
-  <div class="issue-item__head">
-    <span class="state-badge {state_class}">{state_label}</span>
-    <a class="issue-item__title" href="/r/{owner}/{name}/issues/{number}">#{number} {title}</a>
-  </div>
-  <div class="label-row">{label_chips}</div>
-  <div class="issue-item__meta">
-    <span>opened {when} by {author}{assignee}{milestone}</span>
+  <span class="state-ico {icon_class}" title="{state_label}">{icon}</span>
+  <div class="issue-item__main">
+    <div class="issue-item__head">
+      <a class="issue-item__title" href="/r/{owner}/{name}/issues/{number}">#{number} {title}</a>
+    </div>
+    <div class="label-row">{label_chips}</div>
+    <div class="issue-item__meta">
+      <span>opened {when} by {author}{assignee}{milestone}</span>
+    </div>
   </div>
 </li>"##,
-        state_class = state_class,
+        icon_class = icon_class,
         state_label = state_label,
+        icon = state_icon(icon_kind),
         number = issue.number,
         title = esc(&issue.title),
         label_chips = label_chips,
@@ -1475,7 +1483,7 @@ fn render_detail(
 
     format!(
         r##"{header}
-<div class="detail-head">
+<div class="detail-head detail-head--issue">
   <div class="detail-head__badges"><span class="state-badge {cls}" id="state-badge-main">{label}</span></div>
   <h1 class="detail-head__title">{title} <span class="detail-head__number">#{number}</span></h1>
   <p class="detail-head__meta">opened <span title="{created_abs}">{created_rel}</span> by <b>{author}</b>{updated}</p>

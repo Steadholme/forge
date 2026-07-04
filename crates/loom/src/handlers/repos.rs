@@ -19,7 +19,8 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::gitops::{
-    BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, TreeEntry, TreeLastCommits,
+    BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, LanguageStat, TreeEntry,
+    TreeLastCommits,
 };
 use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
 use crate::model::{repo_role_rank, validate_owner_sub, validate_repo_name, Release, Repo};
@@ -36,18 +37,44 @@ const CODE_SEARCH_QUERY_MAX_CHARS: usize = 128;
 // GET / — repo list + create form
 // ===========================================================================
 
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Debug, Deserialize)]
+pub struct IndexQuery {
+    #[serde(default)]
+    pub q: String,
+}
+
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<IndexQuery>,
+) -> Response {
     let who = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
-    let repos = state
+    let mut repos = state
         .store
         .list_visible_repos(&who.subject)
         .await
         .unwrap_or_default();
-    let body = render_index(&who, &csrf, &repos, None);
+    let query = q.q.trim().to_string();
+    if !query.is_empty() {
+        repos.retain(|repo| repo_matches_query(repo, &query));
+    }
+    let rows = repo_rows(&state, repos).await;
+    let body = render_index(&who, &rows, &query);
     html_with_csrf(
         StatusCode::OK,
         page("Repositories", Some(&who.email), &body),
+        &csrf,
+    )
+}
+
+pub async fn new_page(State(_state): State<AppState>, headers: HeaderMap) -> Response {
+    let who = auth::identity(&headers);
+    let csrf = auth::new_csrf_token();
+    let body = render_new(&csrf, None, "", "", "main", false);
+    html_with_csrf(
+        StatusCode::OK,
+        page("Create repository", Some(&who.email), &body),
         &csrf,
     )
 }
@@ -82,11 +109,11 @@ pub async fn create(
 
     let name = form.name.trim().to_string();
     if let Err(msg) = validate_repo_name(&name) {
-        return Ok(render_index_error(&state, &who, msg).await);
+        return Ok(render_new_error(&who, msg, &form).await);
     }
     let default_branch = normalize_branch(&form.default_branch);
     if let Err(msg) = validate_branch_name(&default_branch) {
-        return Ok(render_index_error(&state, &who, msg).await);
+        return Ok(render_new_error(&who, msg, &form).await);
     }
     let is_private = matches!(form.visibility.as_str(), "private");
 
@@ -106,12 +133,9 @@ pub async fn create(
     };
 
     if !state.store.create_repo(&repo).await? {
-        return Ok(render_index_error(
-            &state,
-            &who,
-            "You already have a repository with that name.",
-        )
-        .await);
+        return Ok(
+            render_new_error(&who, "You already have a repository with that name.", &form).await,
+        );
     }
 
     // Create the bare repo on disk; on failure roll back the metadata row so the two stay in sync.
@@ -226,8 +250,8 @@ pub async fn tree(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let path = clean_subpath(&path)?;
-    let body = render_code_page(&state, &repo, &path, "").await?;
+    let (commit, path, pinned) = resolve_tree_target(&state, &repo, &path).await?;
+    let body = render_code_page_at_commit(&state, &repo, &path, "", &commit, pinned).await?;
     Ok(html_ok(page(
         &format!("{}/{}", owner, name),
         Some(&who.email),
@@ -246,7 +270,7 @@ pub async fn blob(
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
-    let (commit, path) = resolve_blob_target(&state, &repo, &path).await?;
+    let (commit, path, pinned) = resolve_blob_target(&state, &repo, &path).await?;
     let bytes = state
         .git
         .read_blob(&repo.owner_sub, &repo.name, &commit, &path)
@@ -269,6 +293,7 @@ pub async fn blob(
         &commit,
         &path,
         &bytes,
+        pinned,
     );
     Ok(html_ok(page(
         &format!("{}/{}", owner, name),
@@ -649,7 +674,7 @@ async fn resolve_blob_target(
     state: &AppState,
     repo: &Repo,
     raw_path: &str,
-) -> Result<(String, String), AppError> {
+) -> Result<(String, String, bool), AppError> {
     let clean = clean_subpath(raw_path)?;
     if let Some((maybe_oid, rest)) = clean.split_once('/') {
         if is_full_oid(maybe_oid) {
@@ -659,7 +684,7 @@ async fn resolve_blob_target(
                 .resolve_commit(&repo.owner_sub, &repo.name, maybe_oid)
                 .await
                 .ok_or_else(|| AppError::NotFound("No such commit.".to_string()))?;
-            return Ok((commit, path));
+            return Ok((commit, path, true));
         }
     }
 
@@ -668,7 +693,41 @@ async fn resolve_blob_target(
         .head_commit(&repo.owner_sub, &repo.name)
         .await
         .ok_or_else(|| AppError::NotFound("This repository has no commits yet.".to_string()))?;
-    Ok((commit, clean))
+    Ok((commit, clean, false))
+}
+
+async fn resolve_tree_target(
+    state: &AppState,
+    repo: &Repo,
+    raw_path: &str,
+) -> Result<(String, String, bool), AppError> {
+    let clean = clean_subpath(raw_path)?;
+    if is_full_oid(&clean) {
+        let commit = state
+            .git
+            .resolve_commit(&repo.owner_sub, &repo.name, &clean)
+            .await
+            .ok_or_else(|| AppError::NotFound("No such commit.".to_string()))?;
+        return Ok((commit, String::new(), true));
+    }
+    if let Some((maybe_oid, rest)) = clean.split_once('/') {
+        if is_full_oid(maybe_oid) {
+            let subpath = clean_subpath(rest)?;
+            let commit = state
+                .git
+                .resolve_commit(&repo.owner_sub, &repo.name, maybe_oid)
+                .await
+                .ok_or_else(|| AppError::NotFound("No such commit.".to_string()))?;
+            return Ok((commit, subpath, true));
+        }
+    }
+
+    let commit = state
+        .git
+        .head_commit(&repo.owner_sub, &repo.name)
+        .await
+        .ok_or_else(|| AppError::NotFound("This repository has no commits yet.".to_string()))?;
+    Ok((commit, clean, false))
 }
 
 fn normalize_search_ref(ref_name: &str) -> String {
@@ -716,95 +775,190 @@ fn is_full_oid(s: &str) -> bool {
 // Rendering
 // ===========================================================================
 
-fn render_index(who: &Identity, csrf: &str, repos: &[Repo], error: Option<&str>) -> String {
-    let error_block = match error {
-        Some(msg) => format!(
-            "<div class=\"alert alert-danger\" role=\"alert\">{}</div>",
-            esc(msg)
-        ),
-        None => String::new(),
-    };
-    let list = if repos.is_empty() {
-        "<li class=\"repo-item repo-item--empty\">No repositories yet. Create your first one.</li>"
-            .to_string()
+struct RepoRow {
+    repo: Repo,
+    head_time: Option<i64>,
+    language: Option<LanguageStat>,
+}
+
+impl RepoRow {
+    fn sort_time(&self) -> i64 {
+        self.head_time.unwrap_or(self.repo.created_at)
+    }
+}
+
+fn repo_matches_query(repo: &Repo, query: &str) -> bool {
+    let needle = query.to_lowercase();
+    repo.owner_sub.to_lowercase().contains(&needle)
+        || repo.name.to_lowercase().contains(&needle)
+        || repo.description.to_lowercase().contains(&needle)
+}
+
+async fn repo_rows(state: &AppState, repos: Vec<Repo>) -> Vec<RepoRow> {
+    let mut rows = Vec::with_capacity(repos.len());
+    for (idx, repo) in repos.into_iter().enumerate() {
+        let (head_time, language) = if idx < 50 {
+            (
+                state
+                    .git
+                    .head_commit_time(&repo.owner_sub, &repo.name)
+                    .await,
+                state
+                    .git
+                    .dominant_language(&repo.owner_sub, &repo.name)
+                    .await,
+            )
+        } else {
+            (None, None)
+        };
+        rows.push(RepoRow {
+            repo,
+            head_time,
+            language,
+        });
+    }
+
+    let head_len = rows.len().min(50);
+    rows[..head_len].sort_by(|a, b| {
+        b.sort_time()
+            .cmp(&a.sort_time())
+            .then_with(|| b.repo.created_at.cmp(&a.repo.created_at))
+            .then_with(|| b.repo.id.cmp(&a.repo.id))
+    });
+    rows
+}
+
+fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
+    let now = now_secs();
+    let list = if rows.is_empty() {
+        let title = if q.trim().is_empty() {
+            "No repositories yet".to_string()
+        } else {
+            format!("No repositories matched &ldquo;{}&rdquo;", esc(q))
+        };
+        let cta = if q.trim().is_empty() {
+            "<a class=\"btn btn-primary\" href=\"/new\">New repository</a>"
+        } else {
+            ""
+        };
+        let text = if q.trim().is_empty() {
+            "Create your first repository to get started."
+        } else {
+            "Try a different repository filter."
+        };
+        format!(
+            r##"<div class="repo-rows__empty"><div class="empty"><svg class="empty__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><div class="empty__title">{title}</div><p class="empty__text">{text}</p>{cta}</div></div>"##,
+            title = title,
+            text = text,
+            cta = cta,
+        )
     } else {
-        repos
+        let items = rows
             .iter()
-            .map(|r| {
-                let badge = if r.is_private {
-                    "<span class=\"vis-badge vis-badge--private\">Private</span>"
+            .map(|row| {
+                let r = &row.repo;
+                let chip = if r.is_private {
+                    "<span class=\"vis-chip\">Private</span>"
                 } else {
-                    "<span class=\"vis-badge\">Public</span>"
+                    "<span class=\"vis-chip\">Public</span>"
                 };
                 let desc = if r.description.trim().is_empty() {
                     String::new()
                 } else {
-                    format!("<p class=\"repo-item__desc\">{}</p>", esc(&r.description))
+                    format!("<p class=\"repo-row__desc\">{}</p>", esc(&r.description))
+                };
+                let lang = row
+                    .language
+                    .map(|language| {
+                        format!(
+                            "<span class=\"lang-dot\" style=\"--lang-color:#{color}\" aria-hidden=\"true\"></span><span>{name}</span><span class=\"repo-row__dot\" aria-hidden=\"true\">&middot;</span>",
+                            color = language.color,
+                            name = esc(language.name),
+                        )
+                    })
+                    .unwrap_or_default();
+                let (time_label, time_abs, time_rel) = match row.head_time {
+                    Some(t) => ("Updated", fmt_ts(t), fmt_rel(now, t)),
+                    None => ("Created", fmt_ts(r.created_at), fmt_rel(now, r.created_at)),
                 };
                 format!(
-                    "<li class=\"repo-item\">\
-                       <div class=\"repo-item__head\">\
-                         <a class=\"repo-item__name\" href=\"/r/{owner}/{name}\">{owner_e}/{name_e}</a>\
-                         {badge}\
-                       </div>\
-                       {desc}\
-                       <span class=\"repo-item__meta\">created {created}</span>\
-                     </li>",
+                    r##"<li class="repo-row">
+  <div class="repo-row__title">
+    <a class="repo-row__name" href="/r/{owner}/{name}">{owner_e}/{name_e}</a>
+    {chip}
+  </div>
+  {desc}
+  <div class="repo-row__meta">{lang}<span title="{time_abs}">{time_label} {time_rel}</span></div>
+</li>"##,
                     owner = esc(&r.owner_sub),
                     name = esc(&r.name),
                     owner_e = esc(&r.owner_sub),
                     name_e = esc(&r.name),
-                    created = esc(&fmt_ts(r.created_at)),
+                    chip = chip,
+                    desc = desc,
+                    lang = lang,
+                    time_abs = esc(&time_abs),
+                    time_label = time_label,
+                    time_rel = esc(&time_rel),
                 )
             })
-            .collect::<Vec<_>>()
-            .join("")
+            .collect::<String>();
+        format!("<ul class=\"repo-rows\">{items}</ul>")
     };
 
     format!(
-        r##"<div class="console__head">
-  <h1>Repositories</h1>
-  <p class="sub">Self-hosted git for the estate. Clone over HTTPS with a personal access token; browse here with single sign-on as {email}.</p>
+        r##"<div class="console__head console__head--row">
+  <div><h1>Repositories</h1><p class="sub">Self-hosted git for the estate. Clone over HTTPS with a personal access token; browse here with single sign-on as {email}.</p></div>
+  <a class="btn btn-primary" href="/new">New repository</a>
 </div>
-<div class="layout">
-  <section class="card">
-    <div class="card__head"><h2>All repositories</h2></div>
-    <div class="card__body">
-      <ul class="repo-list">{list}</ul>
-    </div>
-  </section>
-  <section class="card">
-    <div class="card__head"><h2>New repository</h2></div>
-    <div class="card__body">
-      {error_block}
-      <form method="post" action="/new">
-        <input type="hidden" name="csrf_token" value="{csrf}">
-        <div class="field">
-          <label for="name">Name</label>
-          <input type="text" id="name" name="name" maxlength="64" placeholder="e.g. holdfast-infra" autocomplete="off" spellcheck="false" required>
-        </div>
-        <div class="field">
-          <label for="description">Description</label>
-          <input type="text" id="description" name="description" maxlength="500" placeholder="Optional one-line summary">
-        </div>
-        <div class="field">
-          <label for="default_branch">Default branch</label>
-          <input type="text" id="default_branch" name="default_branch" maxlength="64" value="main" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field field--check">
-          <label class="check"><input type="checkbox" name="visibility" value="private"> Private (only you can see and clone)</label>
-        </div>
-        <div class="actions">
-          <button class="btn btn-primary" type="submit">Create repository</button>
-        </div>
-      </form>
-    </div>
-  </section>
-</div>"##,
+<form class="repo-filter" method="get" action="/">
+  <input class="input repo-filter__q" type="search" name="q" value="{q}" placeholder="Find a repository&hellip;" aria-label="Filter repositories">
+</form>
+{list}"##,
         email = esc(&who.email),
+        q = esc(q),
         list = list,
+    )
+}
+
+fn render_new(
+    csrf: &str,
+    error: Option<&str>,
+    name: &str,
+    description: &str,
+    default_branch: &str,
+    private: bool,
+) -> String {
+    let error_block = error
+        .map(|msg| {
+            format!(
+                "<div class=\"alert alert-danger\" role=\"alert\">{}</div>",
+                esc(msg)
+            )
+        })
+        .unwrap_or_default();
+    let checked = if private { " checked" } else { "" };
+    format!(
+        r##"<div class="console__head"><h1>Create a new repository</h1><p class="sub">A repository contains your project's files and history.</p></div>
+{error_block}
+<form class="new-repo-form" method="post" action="/new">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <div class="form-section">
+    <div class="field"><label class="label" for="nr-name">Repository name</label><input class="input" type="text" id="nr-name" name="name" maxlength="64" autocomplete="off" spellcheck="false" required value="{name}"></div>
+    <div class="field"><label class="label" for="nr-desc">Description <span class="hint--muted">(optional)</span></label><input class="input" type="text" id="nr-desc" name="description" maxlength="500" value="{description}"></div>
+  </div>
+  <div class="form-section">
+    <div class="field"><label class="label" for="nr-branch">Default branch</label><input class="input" type="text" id="nr-branch" name="default_branch" maxlength="64" autocomplete="off" spellcheck="false" value="{default_branch}"></div>
+    <div class="field field--check"><label class="check"><input type="checkbox" name="visibility" value="private"{checked}> Private repository</label></div>
+  </div>
+  <div class="actions"><button class="btn btn-primary" type="submit">Create repository</button></div>
+</form>"##,
         error_block = error_block,
         csrf = esc(csrf),
+        name = esc(name),
+        description = esc(description),
+        default_branch = esc(default_branch),
+        checked = checked,
     )
 }
 
@@ -837,18 +991,25 @@ fn render_fork_popover(repo: &Repo, who: &Identity, csrf: &str) -> String {
     )
 }
 
-/// Re-render the index with an inline error + a fresh CSRF token (validation failures on create).
-async fn render_index_error(state: &AppState, who: &Identity, msg: &str) -> Response {
+/// Re-render the create page with an inline error + a fresh CSRF token.
+async fn render_new_error(who: &Identity, msg: &str, form: &CreateForm) -> Response {
     let csrf = auth::new_csrf_token();
-    let repos = state
-        .store
-        .list_visible_repos(&who.subject)
-        .await
-        .unwrap_or_default();
-    let body = render_index(who, &csrf, &repos, Some(msg));
+    let branch = if form.default_branch.trim().is_empty() {
+        "main"
+    } else {
+        form.default_branch.trim()
+    };
+    let body = render_new(
+        &csrf,
+        Some(msg),
+        form.name.trim(),
+        form.description.trim(),
+        branch,
+        matches!(form.visibility.as_str(), "private"),
+    );
     html_with_csrf(
         StatusCode::BAD_REQUEST,
-        page("Repositories", Some(&who.email), &body),
+        page("Create repository", Some(&who.email), &body),
         &csrf,
     )
 }
@@ -859,6 +1020,40 @@ async fn render_code_page(
     repo: &Repo,
     subpath: &str,
     fork_popover: &str,
+) -> Result<String, AppError> {
+    let commit = state.git.head_commit(&repo.owner_sub, &repo.name).await;
+    let Some(commit) = commit else {
+        let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
+        let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
+        let release_count = state
+            .store
+            .release_count(&repo.id, false)
+            .await
+            .unwrap_or(0);
+        let parent = fork_parent(state, repo).await;
+        let header = render_repo_header_with_parent(
+            repo,
+            &state.config.public_base_url,
+            open_issues,
+            open_pulls,
+            release_count,
+            "code",
+            parent.as_ref(),
+        );
+        let toolbar = render_code_toolbar(repo, &state.config.public_base_url, None, "");
+        let push = render_empty_repo(repo, &state.config.public_base_url);
+        return Ok(format!("{header}{toolbar}{push}"));
+    };
+    render_code_page_at_commit(state, repo, subpath, fork_popover, &commit, false).await
+}
+
+async fn render_code_page_at_commit(
+    state: &AppState,
+    repo: &Repo,
+    subpath: &str,
+    fork_popover: &str,
+    commit: &str,
+    pinned: bool,
 ) -> Result<String, AppError> {
     let open_issues = state.store.open_issue_count(&repo.id).await.unwrap_or(0);
     let open_pulls = state.store.open_pull_count(&repo.id).await.unwrap_or(0);
@@ -878,24 +1073,20 @@ async fn render_code_page(
         parent.as_ref(),
     );
 
-    let head = state.git.head_commit(&repo.owner_sub, &repo.name).await;
-    let Some(commit) = head else {
-        // Empty repo: show how to push the first commit.
-        let toolbar = render_code_toolbar(repo, &state.config.public_base_url, None, "");
-        let push = render_empty_repo(repo, &state.config.public_base_url);
-        return Ok(format!("{header}{toolbar}{push}"));
-    };
-
     let branch_names = state.git.branches(&repo.owner_sub, &repo.name).await;
-    let toolbar = render_code_toolbar(
-        repo,
-        &state.config.public_base_url,
-        Some(branch_names.len()),
-        fork_popover,
-    );
+    let toolbar = if pinned {
+        render_code_toolbar_at_commit(repo, commit)
+    } else {
+        render_code_toolbar(
+            repo,
+            &state.config.public_base_url,
+            Some(branch_names.len()),
+            fork_popover,
+        )
+    };
     let entries = state
         .git
-        .list_tree(&repo.owner_sub, &repo.name, &commit, subpath)
+        .list_tree(&repo.owner_sub, &repo.name, commit, subpath)
         .await;
     if !subpath.is_empty() && entries.is_empty() {
         return Err(AppError::NotFound("No such directory.".to_string()));
@@ -904,14 +1095,15 @@ async fn render_code_page(
     let entry_names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
     let last = state
         .git
-        .tree_last_commits(&repo.owner_sub, &repo.name, &commit, subpath, &entry_names)
+        .tree_last_commits(&repo.owner_sub, &repo.name, commit, subpath, &entry_names)
         .await;
     let now = now_secs();
-    let files = render_file_browser(repo, subpath, &entries, &last, now);
+    let commit_prefix = pinned.then_some(commit);
+    let files = render_file_browser(repo, subpath, &entries, &last, now, commit_prefix);
 
     // A rendered README under the file browser at the repo root (GitHub-style), sanitised.
     let readme = if subpath.is_empty() {
-        render_readme(state, repo, &commit, &entries).await
+        render_readme(state, repo, commit, &entries).await
     } else {
         String::new()
     };
@@ -985,6 +1177,26 @@ fn render_code_toolbar(
         primary = primary,
         clone_url = esc(&clone_url),
         fork_popover = fork_popover,
+    )
+}
+
+fn render_code_toolbar_at_commit(repo: &Repo, commit: &str) -> String {
+    format!(
+        r##"<div class="code-toolbar code-toolbar--pinned">
+  <a class="branchbtn" href="/r/{owner}/{name}/commit/{commit}">
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M1.75 3.5a.75.75 0 0 0 0 1.5h8.69L7.22 8.22a.75.75 0 1 0 1.06 1.06l4.5-4.5a.75.75 0 0 0 0-1.06l-4.5-4.5a.75.75 0 0 0-1.06 1.06L10.44 3.5H1.75Zm12.5 7.5H5.56l3.22-3.22a.75.75 0 1 0-1.06-1.06l-4.5 4.5a.75.75 0 0 0 0 1.06l4.5 4.5a.75.75 0 1 0 1.06-1.06L5.56 12.5h8.69a.75.75 0 0 0 0-1.5Z"/></svg><span class="branchbtn__name">{short}</span>
+  </a>
+  <a class="code-toolbar__link" href="/r/{owner}/{name}/commits"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Commits</a>
+  <span class="code-toolbar__spacer"></span>
+  <form class="code-toolbar__search" action="/r/{owner}/{name}/search" method="get" role="search">
+    <input class="code-toolbar__q" type="search" name="q" placeholder="Search code" aria-label="Search code">
+    <input type="hidden" name="ref" value="{commit}">
+  </form>
+</div>"##,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        commit = esc(commit),
+        short = esc(&short_oid(commit)),
     )
 }
 
@@ -1344,6 +1556,7 @@ fn render_file_browser(
     entries: &[TreeEntry],
     last: &TreeLastCommits,
     now: i64,
+    commit_prefix: Option<&str>,
 ) -> String {
     let commitbar = last
         .latest
@@ -1374,7 +1587,7 @@ fn render_file_browser(
     } else {
         format!(
             "<div class=\"card__head filebox__head\">{}</div>",
-            render_breadcrumb(repo, subpath, false)
+            render_breadcrumb_at(repo, subpath, false, commit_prefix)
         )
     };
     let rows = entries
@@ -1386,15 +1599,9 @@ fn render_file_browser(
                 format!("{subpath}/{}", e.name)
             };
             let (href, icon) = if e.is_dir() {
-                (
-                    format!("/r/{}/{}/tree/{}", repo.owner_sub, repo.name, child),
-                    "dir",
-                )
+                (tree_href(repo, &child, commit_prefix), "dir")
             } else {
-                (
-                    format!("/r/{}/{}/blob/{}", repo.owner_sub, repo.name, child),
-                    "file",
-                )
+                (blob_href(repo, &child, commit_prefix), "file")
             };
             let commit = last.by_name.get(&e.name);
             let message = commit
@@ -1458,6 +1665,33 @@ fn file_history_href(repo: &Repo, ref_name: &str, path: &str) -> String {
     )
 }
 
+fn tree_href(repo: &Repo, path: &str, commit_prefix: Option<&str>) -> String {
+    match commit_prefix {
+        Some(commit) if path.is_empty() => {
+            format!("/r/{}/{}/tree/{}", repo.owner_sub, repo.name, commit)
+        }
+        Some(commit) => {
+            format!(
+                "/r/{}/{}/tree/{}/{}",
+                repo.owner_sub, repo.name, commit, path
+            )
+        }
+        None => format!("/r/{}/{}/tree/{}", repo.owner_sub, repo.name, path),
+    }
+}
+
+fn blob_href(repo: &Repo, path: &str, commit_prefix: Option<&str>) -> String {
+    match commit_prefix {
+        Some(commit) => {
+            format!(
+                "/r/{}/{}/blob/{}/{}",
+                repo.owner_sub, repo.name, commit, path
+            )
+        }
+        None => format!("/r/{}/{}/blob/{}", repo.owner_sub, repo.name, path),
+    }
+}
+
 /// File-view card: repo header + breadcrumb + escaped file content (or a binary/too-large notice).
 fn render_blob(
     repo: &Repo,
@@ -1468,6 +1702,7 @@ fn render_blob(
     commit: &str,
     path: &str,
     bytes: &[u8],
+    pinned: bool,
 ) -> String {
     let header = render_repo_header(
         repo,
@@ -1477,13 +1712,17 @@ fn render_blob(
         release_count,
         "code",
     );
-    let history_href = file_history_href(repo, "HEAD", path);
-    let blame_href = format!("/r/{}/{}/blame/HEAD/{}", repo.owner_sub, repo.name, path);
+    let ref_name = if pinned { commit } else { "HEAD" };
+    let history_href = file_history_href(repo, ref_name, path);
+    let blame_href = format!(
+        "/r/{}/{}/blame/{}/{}",
+        repo.owner_sub, repo.name, ref_name, path
+    );
     let permalink_href = format!(
         "/r/{}/{}/blob/{}/{}",
         repo.owner_sub, repo.name, commit, path
     );
-    let search = render_code_search_form(repo, "", "HEAD", false);
+    let search = render_code_search_form(repo, "", ref_name, false);
     let content = if bytes.contains(&0) {
         "<div class=\"card__body\"><p class=\"muted\">Binary file not shown.</p></div>".to_string()
     } else if bytes.len() > crate::config::MAX_BLOB_RENDER_BYTES {
@@ -1515,7 +1754,7 @@ fn render_blob(
 </section>"##,
         header = header,
         search = search,
-        breadcrumb = render_breadcrumb(repo, path, true),
+        breadcrumb = render_breadcrumb_at(repo, path, true, pinned.then_some(commit)),
         history_href = esc(&history_href),
         blame_href = esc(&blame_href),
         permalink_href = esc(&permalink_href),
@@ -1731,10 +1970,22 @@ fn render_blame_table(repo: &Repo, path: &str, lines: &[BlameLine]) -> String {
 
 /// Path breadcrumb. `is_blob` makes the final segment a non-link leaf.
 fn render_breadcrumb(repo: &Repo, subpath: &str, is_blob: bool) -> String {
+    render_breadcrumb_at(repo, subpath, is_blob, None)
+}
+
+fn render_breadcrumb_at(
+    repo: &Repo,
+    subpath: &str,
+    is_blob: bool,
+    commit_prefix: Option<&str>,
+) -> String {
+    let root_href = match commit_prefix {
+        Some(commit) => tree_href(repo, "", Some(commit)),
+        None => format!("/r/{}/{}", repo.owner_sub, repo.name),
+    };
     let mut html = format!(
-        "<nav class=\"breadcrumb\"><a href=\"/r/{owner}/{name}\">{name_e}</a>",
-        owner = esc(&repo.owner_sub),
-        name = esc(&repo.name),
+        "<nav class=\"breadcrumb\"><a href=\"{href}\">{name_e}</a>",
+        href = esc(&root_href),
         name_e = esc(&repo.name),
     );
     if subpath.is_empty() {
@@ -1753,11 +2004,10 @@ fn render_breadcrumb(repo: &Repo, subpath: &str, is_blob: bool) -> String {
         if last && is_blob {
             html.push_str(&format!("<span>{}</span>", esc(seg)));
         } else {
+            let href = tree_href(repo, &acc, commit_prefix);
             html.push_str(&format!(
-                "<a href=\"/r/{owner}/{name}/tree/{acc}\">{seg}</a>",
-                owner = esc(&repo.owner_sub),
-                name = esc(&repo.name),
-                acc = esc(&acc),
+                "<a href=\"{href}\">{seg}</a>",
+                href = esc(&href),
                 seg = esc(seg),
             ));
         }

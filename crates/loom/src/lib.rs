@@ -71,7 +71,10 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::repos::index))
-        .route("/new", post(handlers::repos::create))
+        .route(
+            "/new",
+            get(handlers::repos::new_page).post(handlers::repos::create),
+        )
         .route("/r/{owner}/{name}", get(handlers::repos::view))
         .route("/r/{owner}/{name}/fork", post(handlers::repos::fork))
         .route(

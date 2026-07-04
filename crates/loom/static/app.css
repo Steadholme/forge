@@ -16,8 +16,8 @@
      Neutrals / status / elevation / geometry / motion are the canonical kit set;
      the brand ramp is retargeted to Loom's accent (Git · emerald #059669). ===== */
   /* neutrals — cool, slightly bluish for a modern console feel */
-  --bg:#f6f7f9; --bg-2:#eef0f4; --surface:#ffffff; --surface-2:#f7f8fa; --surface-3:#f0f2f6;
-  --border:#e5e7ec; --border-2:#d3d7e0; --hairline:#eef0f4;
+  --bg:#ffffff; --bg-2:#eef0f4; --surface:#ffffff; --surface-2:#f7f8fa; --surface-3:#f0f2f6;
+  --border:#d0d7de; --border-2:#afb8c1; --hairline:#d8dee4;
   --ink:#1a1d24; --ink-2:#4a5160; --ink-3:#727a8a; --ink-4:#9aa2b1;
   /* brand — Loom (Git) */
   --accent:#059669; --accent-2:#10b981; --accent-ink:#047857; --accent-soft:#e7f6ef; --accent-soft-2:#d1efdf;
@@ -35,13 +35,25 @@
   --sh-lg:0 12px 32px rgba(20,23,33,.12), 0 4px 8px rgba(20,23,33,.06);
   --sh-pop:0 8px 28px rgba(20,23,33,.16);
   /* geometry */
-  --r-xs:6px; --r-sm:8px; --r:11px; --r-lg:16px; --r-pill:999px;
-  --tap:40px;
+  --r-xs:4px; --r-sm:6px; --r:6px; --r-lg:12px; --r-pill:999px;
+  --tap:32px;
   --ease:cubic-bezier(.2,.6,.25,1); --dur:140ms;
   --font:"Inter","Inter Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;
   --mono:"JetBrains Mono","SFMono-Regular",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
   /* per-app accent tint for the app-icon tile */
   --app:#059669; --app-soft:#e7f6ef;
+
+  /* --- v4 GitHub-visual-language tokens: blue = link, purple = merged /
+     closed-issue, dark header chrome, coral tab underline (decorative only,
+     carries no text), and the dir-glyph blue. All new colours live here —
+     the v3/v4 banners forbid raw hex below them. --- */
+  --link:#0969da; --link-soft:#ddf4ff;
+  --merged:#8250df; --merged-soft:#f5ecff; --merged-ink:#6e40c9;
+  --accent-ink-2:#036c4f;
+  --chrome:#24292f; --chrome-ink:#ffffff;
+  --chrome-muted:rgba(255,255,255,.72);
+  --chrome-field:rgba(255,255,255,.12); --chrome-hover:rgba(255,255,255,.08);
+  --tab-hot:#fd8c73; --dir-ico:#54aeff;
 
   /* --- legacy token bridge: the older Odyssey names Loom's domain rules use,
      retargeted onto the v2 scale so every existing rule renders in v2. --- */
@@ -70,12 +82,12 @@ svg { flex:0 0 auto; }
 .muted { color:var(--ink-3); }
 .mono { font-family:var(--mono); }
 
-/* ---- App bar (top chrome for every app surface) ------------------------- */
+/* ---- App bar (dark chrome, GitHub-style header) -------------------------- */
 .appbar {
   position:sticky; top:0; z-index:40;
   height:56px; display:flex; align-items:center; gap:14px;
-  padding:0 20px; background:rgba(255,255,255,.86); backdrop-filter:saturate(1.6) blur(10px);
-  border-bottom:1px solid var(--border);
+  padding:0 20px; background:var(--chrome);
+  border-bottom:1px solid var(--chrome);
 }
 .appbar__brand { display:flex; align-items:center; gap:11px; text-decoration:none; color:inherit; }
 .appbar__brand:hover { text-decoration:none; }
@@ -86,17 +98,30 @@ svg { flex:0 0 auto; }
 }
 .app-tile svg { width:19px; height:19px; }
 .appbar__name { display:flex; flex-direction:column; line-height:1.15; }
-.appbar__name b { font-size:14.5px; font-weight:650; letter-spacing:-.01em; }
-.appbar__name span { font-size:11px; color:var(--ink-3); font-weight:500; }
-.appbar__nav { display:flex; align-items:center; gap:2px; margin-left:8px; }
-.appnav {
-  display:inline-flex; align-items:center; gap:7px; height:34px; padding:0 12px;
-  border-radius:var(--r-sm); color:var(--ink-2); font-weight:550; font-size:13px;
-  transition:background var(--dur) var(--ease), color var(--dur) var(--ease);
+.appbar__name b { font-size:15px; font-weight:650; letter-spacing:-.01em; color:var(--chrome-ink); }
+/* header search — a quiet translucent field that turns solid on focus */
+.appbar__search {
+  display:flex; align-items:center; gap:6px;
+  width:272px; max-width:320px; height:30px; padding:0 8px; margin-left:16px;
+  border-radius:var(--r-sm); background:var(--chrome-field); color:var(--chrome-muted);
 }
-.appnav:hover { background:var(--surface-3); color:var(--ink); text-decoration:none; }
-.appnav.is-active { background:var(--accent-soft); color:var(--accent-ink); }
-.appnav svg { width:16px; height:16px; opacity:.85; }
+.appbar__search .appbar__search-q {
+  flex:1 1 auto; min-width:0; width:auto; height:100%; padding:0;
+  background:none; border:0; border-radius:0; outline:none;
+  color:var(--chrome-ink); font-size:14px; font-family:inherit;
+}
+.appbar__search .appbar__search-q::placeholder { color:var(--chrome-muted); }
+.appbar__search .appbar__search-q:focus { box-shadow:none; border:0; background:none; }
+.appbar__search:focus-within { background:var(--surface); color:var(--ink-3); }
+.appbar__search:focus-within .appbar__search-q { color:var(--ink); }
+.appbar__nav { display:flex; align-items:center; gap:14px; margin-left:8px; }
+.appnav {
+  display:inline-flex; align-items:center; height:34px; padding:0 4px;
+  background:none; border-radius:0; color:var(--chrome-muted); font-weight:500; font-size:14px;
+  transition:color var(--dur) var(--ease);
+}
+.appnav:hover { color:var(--chrome-ink); text-decoration:none; }
+.appnav.is-active { color:var(--chrome-ink); font-weight:600; }
 .appbar__spacer { flex:1 1 auto; }
 .appbar__right { display:flex; align-items:center; gap:8px; }
 
@@ -139,6 +164,32 @@ svg { flex:0 0 auto; }
 .menuitem svg { width:16px; height:16px; color:var(--ink-3); }
 .menuitem--danger { color:var(--down-ink); } .menuitem--danger svg { color:var(--down); }
 
+/* controls sitting on the dark chrome (popovers stay white panels) */
+.appbar .iconbtn { color:var(--chrome-muted); border:0; }
+.appbar .iconbtn:hover { background:var(--chrome-hover); color:var(--chrome-ink); }
+.appbar .usermenu__btn { background:transparent; border-color:transparent; color:var(--chrome-ink); }
+.appbar .usermenu__btn:hover { background:var(--chrome-hover); border-color:transparent; box-shadow:none; }
+.appbar .usermenu__name { color:var(--chrome-muted); }
+.appbar .usermenu__caret { color:var(--chrome-muted); }
+/* the emerald focus ring vanishes on the dark chrome — swap to white there */
+.appbar :focus-visible { outline-color:var(--chrome-ink); }
+
+/* create-new menu (details popover; summary reuses .iconbtn) */
+.create-menu { position:relative; }
+.create-menu > summary {
+  width:auto; padding:0 8px; display:inline-flex; align-items:center; gap:2px;
+  list-style:none; user-select:none; -webkit-user-select:none;
+}
+.create-menu > summary::-webkit-details-marker { display:none; }
+.create-menu__pop {
+  position:absolute; right:0; top:calc(100% + 6px); z-index:60;
+  min-width:196px; padding:4px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm);
+  box-shadow:var(--sh-pop);
+}
+.create-menu__pop .menuitem { min-height:32px; padding:5px 10px; font-size:14px; }
+.create-menu__pop .menuitem:hover { background:var(--surface-2); }
+
 /* ---- Layout ------------------------------------------------------------- */
 .page { max-width:1120px; margin:0 auto; padding:28px 20px 64px; }
 .page--narrow { max-width:760px; }
@@ -151,18 +202,23 @@ svg { flex:0 0 auto; }
 .grid--4 { grid-template-columns:repeat(4,1fr); }
 
 /* ---- Card --------------------------------------------------------------- */
-.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); box-shadow:var(--sh-sm); }
-.card__head { display:flex; align-items:center; gap:11px; padding:15px 18px; border-bottom:1px solid var(--hairline); }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); }
+.card__head {
+  display:flex; align-items:center; gap:11px; padding:8px 16px;
+  background:var(--surface-2); border-bottom:1px solid var(--border);
+  border-radius:calc(var(--r) - 1px) calc(var(--r) - 1px) 0 0;
+}
+.card__head h2, .card__head h3 { font-size:14px; font-weight:600; }
 .card__ico { width:32px; height:32px; border-radius:9px; display:grid; place-items:center; background:var(--accent-soft); color:var(--accent-ink); }
 .card__ico svg { width:17px; height:17px; }
 .card__title { flex:1 1 auto; }
 .card__title h3 { font-size:14px; }
 .card__title p { margin:1px 0 0; font-size:12px; color:var(--ink-3); }
-.card__body { padding:18px; }
+.card__body { padding:16px; }
 .card__foot { padding:13px 18px; border-top:1px solid var(--hairline); background:var(--surface-2); border-radius:0 0 var(--r) var(--r); display:flex; gap:10px; align-items:center; }
 
 /* stat tiles */
-.stat { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); padding:16px 18px; box-shadow:var(--sh-sm); }
+.stat { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); padding:16px 18px; }
 .stat__label { font-size:12px; color:var(--ink-3); font-weight:550; display:flex; align-items:center; gap:7px; }
 .stat__label svg { width:15px; height:15px; color:var(--ink-4); }
 .stat__value { font-size:26px; font-weight:700; letter-spacing:-.02em; margin-top:7px; font-variant-numeric:tabular-nums; }
@@ -204,13 +260,13 @@ svg { flex:0 0 auto; }
 .dot-ok{background:var(--ok);} .dot-warn{background:var(--warn);} .dot-down{background:var(--down);} .dot-unknown{background:var(--unknown);}
 
 /* ---- Tables ------------------------------------------------------------- */
-.table-wrap { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); box-shadow:var(--sh-sm); overflow:hidden; }
+.table-wrap { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); overflow:hidden; }
 table.data { width:100%; border-collapse:collapse; font-size:13.5px; }
 table.data thead th {
-  text-align:left; font-size:11px; font-weight:650; letter-spacing:.06em; text-transform:uppercase;
-  color:var(--ink-3); background:var(--surface-2); padding:11px 16px; border-bottom:1px solid var(--border); white-space:nowrap;
+  text-align:left; font-size:12px; font-weight:600; text-transform:none;
+  color:var(--ink-2); background:var(--surface-2); padding:11px 16px; border-bottom:1px solid var(--border); white-space:nowrap;
 }
-table.data tbody td { padding:12px 16px; border-bottom:1px solid var(--hairline); color:var(--ink-2); vertical-align:middle; }
+table.data tbody td { padding:8px 16px; border-bottom:1px solid var(--hairline); color:var(--ink-2); vertical-align:middle; }
 table.data tbody tr:last-child td { border-bottom:0; }
 table.data tbody tr { transition:background var(--dur) var(--ease); }
 table.data tbody tr:hover { background:var(--surface-2); }
@@ -255,7 +311,7 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 .tabs { display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:18px; }
 .tab { height:38px; padding:0 14px; display:inline-flex; align-items:center; gap:7px; font-size:13.5px; font-weight:550; color:var(--ink-3); border-bottom:2px solid transparent; margin-bottom:-1px; }
 .tab:hover { color:var(--ink); text-decoration:none; }
-.tab.is-active { color:var(--accent-ink); border-bottom-color:var(--accent); }
+.tab.is-active { color:var(--ink); font-weight:600; border-bottom-color:var(--tab-hot); }
 .tab svg { width:16px; height:16px; }
 
 /* ---- Toast (minimal, no auto-motion beyond fade) ------------------------ */
@@ -285,10 +341,10 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 
 /* page shell + console layout (templates render .console, not the kit .page) */
 .page-console { background:var(--bg); }
-.console { max-width:1120px; margin:0 auto; padding:36px 20px 64px; }
+.console { max-width:1280px; margin:0 auto; padding:24px 24px 64px; }
 .console__head { margin:0 0 26px; }
 .console__head .eyebrow { margin:0 0 10px; font-size:12px; font-weight:600; letter-spacing:.04em; color:var(--accent-ink); }
-.console__head h1 { margin:0; font-size:28px; font-weight:650; letter-spacing:-.025em; }
+.console__head h1 { margin:0; font-size:20px; font-weight:650; letter-spacing:-.025em; }
 .console__head .sub, .sub { margin:8px 0 0; color:var(--ink-3); font-size:14px; line-height:1.6; max-width:680px; }
 .layout { display:grid; grid-template-columns:1fr 340px; gap:24px; align-items:start; }
 @media (max-width:920px){ .layout { grid-template-columns:1fr; } }
@@ -338,70 +394,73 @@ input::placeholder, textarea::placeholder { color:var(--ink-4); }
 }
 .vis-badge--private { background:var(--warn-soft); color:var(--warn-ink); border-color:var(--warn-border); }
 
-/* ---- Lists (repos / tree / commits / issues / pats) --------------------- */
-.repo-list, .tree-list, .commit-list, .issue-list, .pat-list, .pr-list { list-style:none; margin:0; padding:0; }
-.repo-item--empty, .tree-row--empty, .commit-item--empty, .issue-item--empty, .pat-item--empty {
+/* ---- Lists (tree / commits / issues / pats) ------------------------------ */
+/* (the dashboard repo list is the v4 .repo-rows flat-row system at the end) */
+.tree-list, .commit-list, .issue-list, .pat-list, .pr-list { list-style:none; margin:0; padding:0; }
+.tree-row--empty, .commit-item--empty, .issue-item--empty, .pat-item--empty {
   color:var(--ink-3); font-size:13px; padding:16px 0;
 }
-
-/* ---- Repo list ---------------------------------------------------------- */
-.repo-item { display:flex; flex-direction:column; gap:4px; padding:16px 0; border-top:1px solid var(--border); }
-.repo-item:first-child { border-top:0; }
-.repo-item__head { display:flex; align-items:center; gap:12px; }
-.repo-item__name { font-size:15px; font-weight:600; color:var(--accent-ink); }
-.repo-item__desc { margin:4px 0 0; color:var(--ink-2); font-size:13px; }
-.repo-item__meta { font-size:11px; color:var(--ink-3); }
 
 /* ---- Tabs (code / issues / pulls) --------------------------------------- */
 .tabs { display:flex; gap:8px; border-bottom:1px solid var(--border); margin-bottom:8px; }
 .tab {
-  padding:12px 16px; font-size:13px; font-weight:500; color:var(--ink-2);
+  padding:8px 12px; font-size:14px; font-weight:500; color:var(--ink-2);
   border-bottom:2px solid transparent; margin-bottom:-1px; height:auto;
 }
-.tab:hover { color:var(--ink); text-decoration:none; }
-.tab--active { color:var(--accent-ink); font-weight:600; border-bottom-color:var(--accent); }
+.tab:hover { color:var(--ink); border-bottom-color:var(--border); text-decoration:none; }
+.tab--active { color:var(--ink); font-weight:600; border-bottom-color:var(--tab-hot); }
 .tab__count {
   display:inline-block; background:var(--bg-2); border-radius:var(--r-pill);
-  padding:0 8px; font-size:11px; color:var(--ink-2);
+  padding:0 8px; font-size:12px; color:var(--ink-2);
 }
 
 /* ---- File tree (3-col grid: name | last-commit msg | age) --------------- */
 .tree-row { display:grid; grid-template-columns:minmax(0,44%) minmax(0,1fr) auto;
-  gap:16px; align-items:center; padding:9px 16px; border-top:1px solid var(--hairline);
+  gap:16px; align-items:center; min-height:40px; padding:8px 16px;
+  border-top:1px solid var(--hairline);
   transition:background var(--dur) var(--ease); }
 .tree-row:first-child { border-top:0; }
 .tree-row:hover { background:var(--surface-2); }
-.tree-row__name { font-size:13px; font-weight:500; min-width:0;
+.tree-row__name { font-size:14px; font-weight:400; min-width:0;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.tree-row--dir .tree-row__name { color:var(--accent-ink); font-weight:600; }
-.tree-row--dir .tree-row__name::before { content:"📁 "; }
-.tree-row--file .tree-row__name::before { content:"📄 "; }
+.tree-row--dir .tree-row__name { color:var(--link); font-weight:400; }
+/* octicon-style glyphs (data-URI fills mirror --dir-ico / --ink-3 — url() cannot
+   read custom properties, so these two literals live inside the image only) */
+.tree-row--dir .tree-row__name::before,
+.tree-row--file .tree-row__name::before {
+  content:""; display:inline-block; width:16px; height:16px; margin-right:8px;
+  vertical-align:-3px; background:center/contain no-repeat;
+}
+.tree-row--dir .tree-row__name::before { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%2354aeff'%3E%3Cpath d='M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z'/%3E%3C/svg%3E"); }
+.tree-row--file .tree-row__name::before { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23727a8a'%3E%3Cpath d='M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z'/%3E%3C/svg%3E"); }
 .tree-row__msg { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  font-size:12.5px; }
+  font-size:14px; color:var(--ink-3); }
 .tree-row__msg a { color:var(--ink-2); }
 .tree-row__msg a:hover { color:var(--accent-ink); }
-.tree-row__age { justify-self:end; font-size:12.5px; color:var(--ink-2); white-space:nowrap; }
+.tree-row__age { justify-self:end; font-size:12px; color:var(--ink-2); white-space:nowrap; }
 .tree-row--empty { display:block; padding:14px 16px; }   /* defensive: empty row escapes the grid */
 
-/* ---- Breadcrumb --------------------------------------------------------- */
-.breadcrumb { font-family:var(--mono); font-size:13px; font-weight:500; }
+/* ---- Breadcrumb (sans; the final segment reads as the title) ------------ */
+.breadcrumb { font-size:14px; font-weight:500; }
 .breadcrumb__sep { color:var(--border-2); margin:0 4px; }
+.breadcrumb b, .breadcrumb strong,
+.breadcrumb > a:last-child, .breadcrumb > span:last-child { font-weight:600; color:var(--ink); }
 
 /* ---- Commit list -------------------------------------------------------- */
 .commit-item { display:flex; flex-direction:column; gap:4px; padding:12px 0; border-top:1px solid var(--border); }
 .commit-item:first-child { border-top:0; }
 .commit-item__subject { font-size:13px; font-weight:500; word-break:break-word; }
 .commit-item__meta { display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-size:11px; color:var(--ink-3); }
-.oid { background:var(--accent-soft); border:1px solid var(--accent-border); border-radius:var(--r-sm); padding:1px 6px; color:var(--accent-ink); font-family:var(--mono); }
+.oid { background:var(--link-soft); border-radius:var(--r-xs); padding:1px 6px; color:var(--link); font-family:var(--mono); font-size:12px; }
 
 /* ---- Branches ----------------------------------------------------------- */
 .branch-row { display:flex; gap:8px; flex-wrap:wrap; }
 .branch-badge {
-  display:inline-flex; align-items:center; padding:3px 10px; border-radius:var(--r-pill);
-  background:var(--bg-2); color:var(--ink-2); border:1px solid var(--border);
-  font-size:11px; font-weight:500; font-family:var(--mono);
+  display:inline-flex; align-items:center; padding:1px 8px; border-radius:var(--r-xs);
+  background:var(--link-soft); color:var(--link);
+  font-size:12px; font-weight:500; font-family:var(--mono);
 }
-.branch-badge--default { background:var(--accent-soft); color:var(--accent-ink); border-color:var(--accent-border); }
+.branch-badge--default { background:var(--accent-soft); color:var(--accent-ink); }
 
 /* ---- Code view (mono blocks on the v2 --surface-2) ---------------------- */
 .code-pre {
@@ -2265,19 +2324,18 @@ mark.code-search-hit {
 .repohead { margin:0 0 14px; display:flex; flex-direction:column; gap:6px; }
 .repohead__row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; }
 .repohead__icon { width:20px; height:20px; color:var(--ink-3); }          /* aria-hidden decoration */
-.repohead__title { margin:0; font-size:21px; font-weight:600; letter-spacing:-.02em;
+.repohead__title { margin:0; font-size:20px; font-weight:600; letter-spacing:-.02em;
   line-height:1.3; min-width:0; word-break:break-word; }
-.repohead__owner { color:var(--accent-ink); font-weight:450; }
-.repohead__name  { color:var(--accent-ink); font-weight:700; }
+.repohead__owner { color:var(--link); font-weight:400; }
+.repohead__name  { color:var(--link); font-weight:600; }
 .repohead__sep   { color:var(--ink-4); margin:0 4px; font-weight:400; }   /* pure separator, decorative */
-.repohead__desc  { margin:0; font-size:13.5px; color:var(--ink-2); max-width:720px; }
-.repohead__desc--fork { font-size:12.5px; }
+.repohead__desc  { margin:0; font-size:14px; color:var(--ink-2); max-width:720px; }
+.repohead__desc--fork { font-size:12px; }
 
-/* tabs: active belt + count pills (markup emits class + aria-current) */
-.tab[aria-current="page"] { color:var(--accent-ink); font-weight:600; border-bottom-color:var(--accent); }
+/* tabs: active belt + count pills (markup emits class + aria-current);
+   the count pill stays neutral in every state (GitHub idiom) */
+.tab[aria-current="page"] { color:var(--ink); font-weight:600; border-bottom-color:var(--tab-hot); }
 .tab__count { margin-left:2px; padding:1px 8px; font-weight:600; font-variant-numeric:tabular-nums; }
-.tab--active .tab__count, .tab[aria-current="page"] .tab__count {
-  background:var(--accent-soft); color:var(--accent-ink); }
 
 @media (max-width:560px){
   .tabs { overflow-x:auto; flex-wrap:nowrap; -webkit-overflow-scrolling:touch; scrollbar-width:none; }
@@ -2354,8 +2412,8 @@ mark.code-search-hit {
 .filebox + .card { margin-top:16px; }        /* files -> readme rhythm on the no-release path */
 
 .filebox__commit { display:flex; align-items:center; gap:10px; min-width:0;
-  padding:10px 16px; background:var(--surface-2); border-bottom:1px solid var(--border);
-  border-radius:calc(var(--r) - 1px) calc(var(--r) - 1px) 0 0; font-size:13px; }
+  padding:8px 16px; background:var(--surface-2); border-bottom:1px solid var(--border);
+  border-radius:calc(var(--r) - 1px) calc(var(--r) - 1px) 0 0; font-size:14px; }
 .filebox__commit-author { font-weight:600; color:var(--ink); white-space:nowrap; }
 .filebox__commit-msg { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; color:var(--ink-2); }
@@ -2555,4 +2613,172 @@ details.diff-file[open] > .diff-file__summary {
 @media (prefers-reduced-motion:reduce){
   .branchbtn, .code-toolbar__link, .tree-row, .popbtn__caret,
   .segmented__opt span, .diff-toggle__whitespace { transition:none; }
+}
+
+/* ==========================================================================
+   ==== Loom v4 — GitHub visual language (de-carded density pass) ====
+   -------------------------------------------------------------------------
+   Tokens only (no raw hex below — the sole literals are the alpha stroke on
+   .lang-dot, same family as the --sh-* shadows), no new keyframes, appbar
+   stays 56px. Semantics: blue (--link) = navigation; emerald stays on
+   buttons + brand; --merged purple = merged PR / closed issue; coral
+   --tab-hot underlines the active tab (decorative line, carries no text).
+   Type scale in this segment is locked to 12 / 14 / 16 / 20.
+   ========================================================================== */
+
+/* --- link semantics: blue = link inside the console. :where() keeps this at
+   element specificity, so every classed component (.btn/.tab/.menuitem/
+   .filter-chip/.label-chip/.tree-row__msg a/.pager .btn/…) wins with its own
+   ink — the exception whitelist is the cascade itself. --- */
+:where(main.console) a { color:var(--link); }
+.markdown-body a { color:var(--link); }
+.release-asset a { color:var(--link); }
+
+/* --- buttons: GitHub-weight labels on the 32px --tap rhythm --- */
+.btn { font-size:14px; font-weight:500; padding:0 12px; }
+.btn-ghost, .btn-secondary, .btn-subtle {
+  background:var(--surface-2); border-color:var(--border); color:var(--ink); box-shadow:none;
+}
+.btn-ghost:hover, .btn-secondary:hover, .btn-subtle:hover {
+  background:var(--bg-2); border-color:var(--border-2); color:var(--ink);
+}
+.btn-primary { background:var(--accent-ink); border-color:var(--accent-ink); box-shadow:none; }
+.btn-primary:hover { background:var(--accent-ink-2); border-color:var(--accent-ink-2); box-shadow:none; }
+.btn-sm { height:28px; font-size:12px; }
+
+/* --- inputs: inset fields that lift to white on focus --- */
+.input, .select, .textarea,
+input[type=text], input[type=search], input[type=password], input[type=number],
+input[type=email], input[type=url], input[type=datetime-local], select, textarea {
+  background:var(--surface-2);
+}
+.input:focus, .select:focus, .textarea:focus,
+input:focus, select:focus, textarea:focus { background:var(--surface); }
+
+/* --- type scale: 12 / 14 / 16 / 20 --- */
+h1 { font-size:20px; }
+h2 { font-size:16px; }
+h3 { font-size:14px; }
+.detail-head__title { font-size:20px; }
+
+/* --- dashboard: flat repo rows on the white canvas --- */
+.console__head--row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+.repo-filter { margin:0 0 8px; padding-bottom:16px; border-bottom:1px solid var(--hairline); }
+.repo-filter__q { max-width:440px; }
+.repo-rows { list-style:none; margin:0; padding:0; }
+.repo-row { padding:16px 0; border-bottom:1px solid var(--hairline); }
+.repo-row__title { display:flex; align-items:center; gap:8px; }
+.repo-row__name { font-size:16px; font-weight:600; color:var(--link); }
+.repo-row__name:hover { text-decoration:underline; }
+.vis-chip { font-size:12px; font-weight:500; color:var(--ink-3);
+  border:1px solid var(--border); border-radius:var(--r-pill); padding:0 7px; line-height:18px; }
+.repo-row__desc { margin:4px 0 0; font-size:14px; color:var(--ink-2); max-width:720px; }
+.repo-row__meta { margin-top:6px; display:flex; align-items:center; gap:8px;
+  font-size:12px; color:var(--ink-3); }
+.lang-dot { width:8px; height:8px; border-radius:50%; flex:none;
+  background:var(--lang-color,var(--ink-4));
+  box-shadow:inset 0 0 0 1px rgba(20,23,33,.12); }   /* 1.4.11 stroke for light dots */
+
+/* --- /new form: sectioned, hairline-divided --- */
+.new-repo-form { max-width:600px; }
+.form-section { padding:16px 0; border-bottom:1px solid var(--hairline); }
+.form-section:last-child, .form-section:has(+ .actions) { border-bottom:0; }
+.new-repo-form .actions { margin-top:16px; }
+
+/* --- commits: date-grouped boxed lists --- */
+.commits-head { display:flex; align-items:center; justify-content:space-between; margin:0 0 8px; }
+.commits-head__title { font-size:16px; font-weight:600; }
+.commit-group { margin:16px 0 0; }
+.commit-group__date { font-size:14px; font-weight:600; color:var(--ink-2); margin:0 0 8px; }
+.commit-group__list { list-style:none; margin:0; padding:0;
+  border:1px solid var(--border); border-radius:var(--r); background:var(--surface); }
+.commit-row { display:flex; align-items:center; gap:12px; padding:8px 16px;
+  border-top:1px solid var(--hairline); }
+.commit-row:first-child { border-top:0; }
+.avatar--sm { width:20px; height:20px; font-size:10px; flex:none; }
+.commit-row__main { min-width:0; flex:1 1 auto; }
+.commit-row__subject { font-size:14px; font-weight:600; color:var(--ink);
+  display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; vertical-align:bottom;
+  transition:color 120ms var(--ease); }
+.commit-row__subject:hover { color:var(--link); text-decoration:underline; }
+.commit-row__meta { font-size:12px; color:var(--ink-3); margin-top:2px; }
+.commit-row__actions { flex:none; }
+.sha-group { display:inline-flex; border:1px solid var(--border);
+  border-radius:var(--r-sm); overflow:hidden; flex:none; }
+.sha-group__oid { padding:0 8px; line-height:26px; font-family:var(--mono); font-size:12px;
+  color:var(--link); background:var(--surface);
+  transition:background 120ms var(--ease); }
+.sha-group__oid:hover { background:var(--surface-2); text-decoration:none; }
+.sha-group__oid code { font:inherit; background:none; border:0; padding:0; color:inherit; }
+.sha-group__copy { width:28px; height:28px; display:grid; place-items:center;
+  border:0; border-left:1px solid var(--border); background:var(--surface);
+  color:var(--ink-3); cursor:pointer;
+  transition:color 120ms var(--ease), background 120ms var(--ease); }
+.sha-group__copy:hover { color:var(--link); background:var(--surface-2); }
+
+/* --- issue / PR list rows: leading state icon + stacked main column.
+   Scoped with :has(> .state-ico) so the reused .issue-item contexts (timeline
+   comments, PR checks rows, webhooks, pending review) keep their column
+   layout untouched. --- */
+.issue-item:has(> .state-ico), .pr-item:has(> .state-ico) {
+  flex-direction:row; align-items:flex-start; gap:8px; padding:8px 16px;
+}
+.issue-item__main, .pr-item__main {
+  min-width:0; flex:1 1 auto; display:flex; flex-direction:column; gap:4px;
+}
+.state-ico { flex:none; margin-top:2px; width:16px; height:16px; }
+.state-ico svg { width:16px; height:16px; display:block; fill:currentColor; }
+.state-ico--open { color:var(--ok-ink); }
+.issue-item .state-ico--closed { color:var(--merged); }
+.pr-item .state-ico--closed { color:var(--down-ink); }
+.state-ico--merged { color:var(--merged); }
+.state-ico--draft { color:var(--ink-3); }
+.issue-item__title, .pr-item__title { font-size:16px; font-weight:600; color:var(--ink);
+  transition:color 120ms var(--ease); }
+.issue-item__title:hover, .pr-item__title:hover { color:var(--link); }
+.issue-item:has(> .state-ico) .issue-item__meta,
+.pr-item:has(> .state-ico) .pr-item__meta { font-size:12px; color:var(--ink-3); }
+
+/* detail-page state badges: filled, state-hued. Ancestor selectors only —
+   app.js rewrites #state-badge-main's own class list wholesale. */
+.state-badge--open { background:var(--ok-ink); color:var(--surface); border-color:var(--ok-ink); }
+.state-badge--merged { background:var(--merged); color:var(--surface); border-color:var(--merged); }
+.detail-head--issue .state-badge--closed { background:var(--merged); color:var(--surface); border-color:var(--merged); }
+.detail-head--pr .state-badge--closed { background:var(--down-ink); color:var(--surface); border-color:var(--down-ink); }
+
+/* --- filebox: latest-commit bar internals --- */
+.filebox__commit-age { font-size:12px; }
+.filebox__commit .oid { font-size:12px; }
+
+/* --- side rail: unboxed, hairline-divided blocks --- */
+.side__block { border:0; background:none; border-radius:0;
+  border-bottom:1px solid var(--hairline); padding:16px 0; }
+.side__block:first-child { padding-top:0; }
+.side__block:last-child { border-bottom:0; padding-bottom:0; }
+.side__label { font-size:12px; font-weight:600; color:var(--ink-2);
+  text-transform:none; letter-spacing:0; }
+.side__value { font-size:14px; }
+
+/* --- list toolbar: tighter rhythm; count pills inherit the neutral recipe --- */
+.list-toolbar { margin:8px 0 12px; }
+
+/* --- empty states --- */
+.empty { padding:32px 16px; }
+.empty__icon { width:24px; height:24px; color:var(--ink-4); }
+.empty__title { font-size:16px; font-weight:600; }
+.empty__text { font-size:14px; }
+
+/* --- responsive --- */
+@media (max-width:768px){
+  .tree-row__msg { display:none; }
+  .appbar__search { display:none; }
+  .commit-row__actions { margin-left:auto; }
+}
+
+/* explicit reduced-motion guard (house pattern; the global kill-switch at the
+   top of this sheet already zeroes these — intent stays visible here) */
+@media (prefers-reduced-motion:reduce){
+  .commit-row__subject, .sha-group__oid, .sha-group__copy,
+  .issue-item__title, .pr-item__title { transition:none; }
 }

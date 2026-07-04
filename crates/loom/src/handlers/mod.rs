@@ -69,6 +69,30 @@ pub fn fmt_ts(secs: i64) -> String {
     }
 }
 
+/// Format epoch seconds as a UTC day heading like `Jul 3, 2026`.
+pub fn fmt_day(secs: i64) -> String {
+    match time::OffsetDateTime::from_unix_timestamp(secs) {
+        Ok(dt) => {
+            let month = match dt.month() {
+                time::Month::January => "Jan",
+                time::Month::February => "Feb",
+                time::Month::March => "Mar",
+                time::Month::April => "Apr",
+                time::Month::May => "May",
+                time::Month::June => "Jun",
+                time::Month::July => "Jul",
+                time::Month::August => "Aug",
+                time::Month::September => "Sep",
+                time::Month::October => "Oct",
+                time::Month::November => "Nov",
+                time::Month::December => "Dec",
+            };
+            format!("{month} {}, {}", dt.day(), dt.year())
+        }
+        Err(_) => secs.to_string(),
+    }
+}
+
 /// First 8 hex characters of a commit OID, for compact display.
 pub fn short_oid(oid: &str) -> String {
     oid.chars().take(8).collect()
@@ -273,8 +297,8 @@ pub fn render_reactions(
     )
 }
 
-/// Two-letter avatar initials from the signed-in email (falls back to a neutral glyph).
-fn initials(email: &str) -> String {
+/// Two-letter avatar initials from an email-ish identity (falls back to a neutral glyph).
+pub fn initials(email: &str) -> String {
     let local = email.split('@').next().unwrap_or(email);
     let mut parts = local
         .split(|c: char| !c.is_alphanumeric())
@@ -285,6 +309,21 @@ fn initials(email: &str) -> String {
         (Some(a), Some(b)) => format!("{}{}", a.to_uppercase(), b.to_uppercase()),
         (Some(a), None) => a.to_uppercase().to_string(),
         _ => "·".to_string(),
+    }
+}
+
+const ISSUE_OPEN_SVG: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-2.25a2.25 2.25 0 1 1 0 4.5 2.25 2.25 0 0 1 0-4.5Z"/></svg>"##;
+const ISSUE_CLOSED_SVG: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm11.28-1.78a.75.75 0 0 1 0 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-1.75-1.75a.75.75 0 0 1 1.06-1.06l1.22 1.22 2.97-2.97a.75.75 0 0 1 1.06 0Z"/></svg>"##;
+const PULL_REQUEST_SVG: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M5 3.25a2.25 2.25 0 1 0-3 2.122v5.256a2.251 2.251 0 1 0 1.5 0V5.372A2.25 2.25 0 0 0 5 3.25Zm7.5 7.378V5.372a2.25 2.25 0 1 0-1.5 0v5.256a2.251 2.251 0 1 0 1.5 0ZM3.75 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm0 9.5a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm8.25.75a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5Zm.75-10.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Z"/></svg>"##;
+const MERGE_SVG: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M5 3.25a2.25 2.25 0 1 0-3 2.122v5.256a2.251 2.251 0 1 0 1.5 0V5.372A2.25 2.25 0 0 0 5 3.25Zm-1.25 0a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm0 9.5a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0ZM13.5 5.372A2.25 2.25 0 1 0 12 5.372V6c0 1.657-1.343 3-3 3H7.75V7.75L5.5 10l2.25 2.25V10.5H9A4.5 4.5 0 0 0 13.5 6v-.628Zm-.75-2.122a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Z"/></svg>"##;
+
+/// Inline state icon SVG for issue and pull-request list rows.
+pub fn state_icon(kind: &str) -> &'static str {
+    match kind {
+        "issue-open" => ISSUE_OPEN_SVG,
+        "issue-closed" => ISSUE_CLOSED_SVG,
+        "merged" => MERGE_SVG,
+        _ => PULL_REQUEST_SVG,
     }
 }
 
@@ -344,14 +383,25 @@ pub fn userbox(title: &str, email: Option<&str>) -> String {
     format!(
         r##"<a class="appbar__brand" href="/" aria-label="HOLDFAST Loom">
   <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
-  <span class="appbar__name"><b>Loom</b><span>git.w33d.xyz</span></span>
+  <span class="appbar__name"><b>Loom</b></span>
 </a>
+<form class="appbar__search" method="get" action="/" role="search">
+  <svg class="appbar__search-ico" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"/></svg>
+  <input class="appbar__search-q" type="search" name="q" placeholder="Find a repository&hellip;" aria-label="Find a repository">
+</form>
 <nav class="appbar__nav" aria-label="Loom sections">
-  <a class="{repos_cls}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>Repositories</a>
-  <a class="{tokens_cls}" href="/pats"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>Tokens</a>
+  <a class="{repos_cls}" href="/">Repositories</a>
+  <a class="{tokens_cls}" href="/pats">Tokens</a>
 </nav>
 <div class="appbar__spacer"></div>
 <div class="appbar__right">
+  <details class="create-menu">
+    <summary class="iconbtn" aria-label="Create new" title="Create new&hellip;"><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg><svg class="create-menu__caret" viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="m4.427 7.427 3.396 3.396a.25.25 0 0 0 .354 0l3.396-3.396A.25.25 0 0 0 11.396 7H4.604a.25.25 0 0 0-.177.427Z"/></svg></summary>
+    <div class="create-menu__pop">
+      <a class="menuitem" href="/new">New repository</a>
+      <a class="menuitem" href="/pats">New access token</a>
+    </div>
+  </details>
   <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
   {user}
 </div>"##,
@@ -532,6 +582,11 @@ mod tests {
     fn short_oid_truncates() {
         assert_eq!(short_oid("deadbeefcafebabe"), "deadbeef");
         assert_eq!(short_oid("abc"), "abc");
+    }
+
+    #[test]
+    fn day_heading_formats_utc_date() {
+        assert_eq!(fmt_day(1_720_022_400), "Jul 3, 2024");
     }
 
     #[test]

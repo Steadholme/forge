@@ -121,6 +121,13 @@ pub struct CodeSearchResults {
     pub per_file_limited: bool,
 }
 
+/// Fixed language metadata for a repository's dominant extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LanguageStat {
+    pub name: &'static str,
+    pub color: &'static str,
+}
+
 /// One branch row for the branches page: head OID + head-commit subject and time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchInfo {
@@ -320,6 +327,16 @@ impl GitOps {
         }
     }
 
+    /// Author time of the default-branch HEAD commit, or `None` for an empty repository.
+    pub async fn head_commit_time(&self, owner: &str, name: &str) -> Option<i64> {
+        let head = self.head_commit(owner, name).await?;
+        self.log(owner, name, &head, 1)
+            .await
+            .into_iter()
+            .next()
+            .map(|commit| commit.time)
+    }
+
     /// List the local branch names (`refs/heads/*`).
     pub async fn branches(&self, owner: &str, name: &str) -> Vec<String> {
         let path = self.repo_path(owner, name);
@@ -445,6 +462,32 @@ impl GitOps {
             _ => return Vec::new(),
         };
         parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Dominant language at HEAD using a bounded extension histogram over tracked files.
+    pub async fn dominant_language(&self, owner: &str, name: &str) -> Option<LanguageStat> {
+        let head = self.head_commit(owner, name).await?;
+        self.dominant_language_at(owner, name, &head).await
+    }
+
+    async fn dominant_language_at(
+        &self,
+        owner: &str,
+        name: &str,
+        commit_oid: &str,
+    ) -> Option<LanguageStat> {
+        let repo = self.repo_path(owner, name);
+        let out = self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["ls-tree", "-r", "-z", "--name-only", commit_oid],
+            )
+            .await
+            .ok()?;
+        if !out.status {
+            return None;
+        }
+        dominant_language_from_paths(&String::from_utf8_lossy(&out.stdout))
     }
 
     /// Commit history for one file path, newest first, following renames, capped at `limit`.
@@ -1647,6 +1690,64 @@ struct CapturedOut {
     stdout: Vec<u8>,
 }
 
+const LANGUAGE_FILE_LIMIT: usize = 1_000;
+const LANGUAGE_DEPTH_LIMIT: usize = 8;
+const LANGUAGES: [(&str, &str, &str); 10] = [
+    ("rs", "Rust", "dea584"),
+    ("ts", "TypeScript", "3178c6"),
+    ("js", "JavaScript", "f1e05a"),
+    ("py", "Python", "3572a5"),
+    ("go", "Go", "00add8"),
+    ("sh", "Shell", "89e051"),
+    ("html", "HTML", "e34c26"),
+    ("css", "CSS", "663399"),
+    ("c", "C", "555555"),
+    ("md", "Markdown", "083fa1"),
+];
+
+fn dominant_language_from_paths(paths: &str) -> Option<LanguageStat> {
+    let mut counts = [0usize; LANGUAGES.len()];
+    let mut scanned = 0usize;
+    for path in paths.split('\0').filter(|path| !path.is_empty()) {
+        scanned += 1;
+        if scanned > LANGUAGE_FILE_LIMIT {
+            break;
+        }
+        if path.split('/').count() > LANGUAGE_DEPTH_LIMIT {
+            continue;
+        }
+        if let Some(idx) = language_index_for_path(path) {
+            counts[idx] += 1;
+        }
+    }
+
+    let mut best = None;
+    for (idx, count) in counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        if best
+            .map(|(_, best_count)| *count > best_count)
+            .unwrap_or(true)
+        {
+            best = Some((idx, *count));
+        }
+    }
+    best.map(|(idx, _)| {
+        let (_, name, color) = LANGUAGES[idx];
+        LanguageStat { name, color }
+    })
+}
+
+fn language_index_for_path(path: &str) -> Option<usize> {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let (_, ext) = file.rsplit_once('.')?;
+    let ext = ext.to_ascii_lowercase();
+    LANGUAGES
+        .iter()
+        .position(|(known, _, _)| known == &ext.as_str())
+}
+
 struct ReplayCommit {
     author_name: String,
     author_email: String,
@@ -2123,6 +2224,19 @@ mod tests {
         assert_eq!(commits[0].time, 1700000000);
         assert_eq!(commits[0].subject, "Initial commit");
         assert_eq!(commits[1].subject, "Second");
+    }
+
+    #[test]
+    fn dominant_language_uses_known_extensions_and_limits_depth() {
+        let raw = "src/main.rs\0src/lib.rs\0web/app.ts\0a/b/c/d/e/f/g/h/i/deep.rs\0README.md\0";
+        assert_eq!(
+            dominant_language_from_paths(raw),
+            Some(LanguageStat {
+                name: "Rust",
+                color: "dea584"
+            })
+        );
+        assert_eq!(dominant_language_from_paths("Makefile\0Dockerfile\0"), None);
     }
 
     #[test]

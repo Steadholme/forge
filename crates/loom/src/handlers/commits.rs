@@ -26,7 +26,7 @@ use crate::error::AppError;
 use crate::gitops::{CommitDetail, CommitInfo};
 use crate::handlers::pulls::{DiffControls, DiffQuery};
 use crate::handlers::repos::{header_with_counts, load_visible_repo};
-use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, page, short_oid};
+use crate::handlers::{esc, fmt_day, fmt_rel, fmt_ts, html_ok, initials, page, short_oid};
 use crate::model::{CommitStatus, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
@@ -167,7 +167,7 @@ pub async fn history(
     )))
 }
 
-/// The history card: a branch picker, the commit table, and the keyset pager.
+/// The history view: a branch picker, date-grouped commit rows, and the keyset pager.
 fn render_history(
     repo: &Repo,
     branches: &[String],
@@ -178,34 +178,6 @@ fn render_history(
     has_next: bool,
 ) -> String {
     let now = now_secs();
-    let rows = if commits.is_empty() {
-        "<tr><td colspan=\"4\" class=\"muted\">No commits on this branch.</td></tr>".to_string()
-    } else {
-        commits
-            .iter()
-            .map(|c| {
-                let status_dot = render_status_dot(status_by_commit.get(&c.oid).map(String::as_str));
-                format!(
-                    "<tr>\
-                       <td><a href=\"/r/{owner}/{name}/commit/{oid}\"><code class=\"oid\">{short}</code></a></td>\
-                       <td>{status}<span class=\"strong\">{subject}</span></td>\
-                       <td>{author}</td>\
-                       <td><span title=\"{abs}\">{rel}</span></td>\
-                     </tr>",
-                    owner = esc(&repo.owner_sub),
-                    name = esc(&repo.name),
-                    oid = esc(&c.oid),
-                    short = esc(&short_oid(&c.oid)),
-                    status = status_dot,
-                    subject = esc(&c.subject),
-                    author = esc(&c.author_name),
-                    abs = esc(&fmt_ts(c.time)),
-                    rel = esc(&fmt_rel(now, c.time)),
-                )
-            })
-            .collect::<String>()
-    };
-
     let opts = branches
         .iter()
         .map(|b| {
@@ -244,29 +216,84 @@ fn render_history(
     } else {
         format!("<div class=\"pager\">{newest}<span class=\"spacer\"></span>{older}</div>")
     };
-
-    format!(
-        r##"<section class="card">
-  <div class="card__head">
-    <h2>Commits</h2>
-    <form class="inline-form compare-picker" method="get" action="/r/{owner}/{name}/commits">
-      <span class="compare-picker__label">branch</span>
-      <select name="ref" class="compare-picker__select">{opts}</select>
-      <button class="btn btn-secondary btn-sm" type="submit">View</button>
-    </form>
-  </div>
-  <div class="card__body">
-    <table class="data">
-      <thead><tr><th>Commit</th><th>Message</th><th>Author</th><th>When</th></tr></thead>
-      <tbody>{rows}</tbody>
-    </table>
-    {pager}
-  </div>
-</section>"##,
+    let picker = format!(
+        r##"<div class="commits-head">
+  <h2 class="commits-head__title">Commits</h2>
+  <form class="inline-form compare-picker" method="get" action="/r/{owner}/{name}/commits">
+    <span class="compare-picker__label">branch</span>
+    <select name="ref" class="compare-picker__select">{opts}</select>
+    <button class="btn btn-secondary btn-sm" type="submit">View</button>
+  </form>
+</div>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         opts = opts,
-        rows = rows,
+    );
+
+    if commits.is_empty() {
+        return format!(
+            r##"{picker}
+<p class="muted commits-empty">No commits on this branch.</p>
+{pager}"##
+        );
+    }
+
+    let mut groups = String::new();
+    let mut current_day = String::new();
+    let mut group_open = false;
+    for c in commits {
+        let day = fmt_day(c.time);
+        if day != current_day {
+            if group_open {
+                groups.push_str("</ol></section>");
+            }
+            current_day = day;
+            group_open = true;
+            groups.push_str(&format!(
+                r##"<section class="commit-group">
+  <h3 class="commit-group__date">Commits on {day}</h3>
+  <ol class="commit-group__list">"##,
+                day = esc(&current_day),
+            ));
+        }
+        let status_dot = render_status_dot(status_by_commit.get(&c.oid).map(String::as_str));
+        groups.push_str(&format!(
+            r##"<li class="commit-row">
+  <span class="avatar avatar--sm" aria-hidden="true">{avatar}</span>
+  <div class="commit-row__main">
+    <div class="commit-row__title">{status}<a class="commit-row__subject" href="/r/{owner}/{name}/commit/{oid}">{subject}</a></div>
+    <div class="commit-row__meta">{author} committed <span title="{abs}">{rel}</span></div>
+  </div>
+  <div class="commit-row__actions">
+    <div class="sha-group">
+      <a class="sha-group__oid" href="/r/{owner}/{name}/commit/{oid}"><code>{short}</code></a>
+      <button class="sha-group__copy" type="button" data-copy="{oid}" aria-label="Copy full SHA"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg></button>
+    </div>
+    <a class="iconbtn iconbtn--sm" href="/r/{owner}/{name}/tree/{oid}" aria-label="Browse repository at this commit" title="Browse files"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M2 2.75A.75.75 0 0 1 2.75 2h4.5a.75.75 0 0 1 .53.22l1.28 1.28h4.19A1.75 1.75 0 0 1 15 5.25v6.5A1.75 1.75 0 0 1 13.25 13H2.75A1.75 1.75 0 0 1 1 11.25v-8.5A.75.75 0 0 1 1.75 2Zm.5.75v7.75c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-6a.25.25 0 0 0-.25-.25H8.75a.75.75 0 0 1-.53-.22L6.94 3.5H2.5Z"/></svg></a>
+  </div>
+</li>"##,
+            avatar = esc(&initials(&c.author_email)),
+            status = status_dot,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            oid = esc(&c.oid),
+            short = esc(&short_oid(&c.oid)),
+            subject = esc(&c.subject),
+            author = esc(&c.author_name),
+            abs = esc(&fmt_ts(c.time)),
+            rel = esc(&fmt_rel(now, c.time)),
+        ));
+    }
+    if group_open {
+        groups.push_str("</ol></section>");
+    }
+
+    format!(
+        r##"{picker}
+<div class="commit-groups">{groups}</div>
+{pager}"##,
+        picker = picker,
+        groups = groups,
         pager = pager,
     )
 }

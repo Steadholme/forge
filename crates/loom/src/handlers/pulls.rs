@@ -28,8 +28,8 @@ use crate::handlers::repos::{
 };
 use crate::handlers::{
     accepts_json, esc, fmt_rel, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
-    reaction_summaries_json, redirect, render_reactions, short_oid, REACTION_TARGET_COMMENT,
-    REACTION_TARGET_PULL,
+    reaction_summaries_json, redirect, render_reactions, short_oid, state_icon,
+    REACTION_TARGET_COMMENT, REACTION_TARGET_PULL,
 };
 use crate::model::{
     CommitStatus, Label, Milestone, PrFileViewed, PrThreadResolved, Pull, PullReview,
@@ -2156,15 +2156,15 @@ fn render_list(
     };
     format!(
         r##"{header}
-<div class="list-toolbar">
-  {tabs}
-  <span class="list-toolbar__fill"></span>
-  {filters}
-  <a class="btn btn-primary btn-sm" href="/r/{owner}/{name}/compare">New pull request</a>
-</div>
-<section class="card">
-  <div class="card__body card__body--list"><ul class="pr-list">{list}</ul></div>
-</section>"##,
+	<div class="list-toolbar">
+	  <span class="list-toolbar__fill"></span>
+	  {filters}
+	  <a class="btn btn-primary btn-sm" href="/r/{owner}/{name}/compare">New pull request</a>
+	</div>
+	<section class="card">
+	  <div class="card__head card__head--list">{tabs}</div>
+	  <div class="card__body card__body--list"><ul class="pr-list">{list}</ul></div>
+	</section>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         tabs = tabs,
@@ -2191,7 +2191,16 @@ fn filter_pulls_by_state(pulls: Vec<Pull>, state_filter: &str) -> Vec<Pull> {
 }
 
 fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Milestone]) -> String {
-    let (cls, label) = state_badge(pull);
+    let (_, label) = state_badge(pull);
+    let (icon_class, icon_kind) = if pull.state == "merged" {
+        ("state-ico--merged", "merged")
+    } else if pull.state == "closed" {
+        ("state-ico--closed", "pull")
+    } else if pull.is_draft {
+        ("state-ico--draft", "pull")
+    } else {
+        ("state-ico--open", "pull")
+    };
     let draft_badge_html = draft_badge(pull);
     let label_chips = render_label_chips(labels);
     let milestone = milestones
@@ -2211,16 +2220,19 @@ fn render_pr_row(repo: &Repo, pull: &Pull, labels: &[Label], milestones: &[Miles
     };
     format!(
         r##"<li class="pr-item">
-  <div class="pr-item__head">
-    <span class="state-badge {cls}">{label}</span>
-    {draft_badge_html}
-    <a class="pr-item__title" href="/r/{owner}/{name}/pulls/{number}">#{number} {title}</a>
+  <span class="state-ico {icon_class}" title="{label}">{icon}</span>
+  <div class="pr-item__main">
+    <div class="pr-item__head">
+      <a class="pr-item__title" href="/r/{owner}/{name}/pulls/{number}">#{number} {title}</a>
+      {draft_badge_html}
+    </div>
+    <div class="label-row">{label_chips}</div>
+    <span class="pr-item__meta">{head} &rarr; {base} · opened {when} by {author}{assignee}{reviewer}{milestone}</span>
   </div>
-  <div class="label-row">{label_chips}</div>
-  <span class="pr-item__meta">{head} &rarr; {base} · opened {when} by {author}{assignee}{reviewer}{milestone}</span>
 </li>"##,
-        cls = cls,
+        icon_class = icon_class,
         label = label,
+        icon = state_icon(icon_kind),
         draft_badge_html = draft_badge_html,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
@@ -2713,7 +2725,7 @@ async fn render_detail(
     Ok(format!(
         r##"{header}
 {pr_inline}
-<div class="detail-head">
+<div class="detail-head detail-head--pr">
   <div class="detail-head__badges"><span class="state-badge {cls}" id="state-badge-main">{label}</span>{draft_badge_html}</div>
   <h1 class="detail-head__title">{title} <span class="detail-head__number">#{number}</span></h1>
   <p class="detail-head__meta"><code>{head}</code> &rarr; <code>{base}</code> · opened <span title="{created_abs}">{created_rel}</span> by <b>{author}</b></p>
