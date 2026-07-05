@@ -14,6 +14,8 @@ name = "loom"
 path = "src/main.rs"
 
 [dependencies]
+# Odyssey canonical design-system CSS (vendored, path dep). Loom's own service.css layers after it.
+odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/cairn/pastefire): Method/Path/State/Query extractors,
 # raw-body (Bytes) extraction for the git smart-HTTP packs, server-rendered HTML.
 axum = "0.8"

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::WebError;
 use crate::handlers::{
-    esc, fmt_ts, human_size, short_digest, time_ago, userbox, APP_CSS, APP_JS, LAYERS_SVG,
+    esc, fmt_ts, human_size, short_digest, time_ago, userbox, app_css, APP_JS, LAYERS_SVG,
     SHIELD_SVG,
 };
 use crate::model::{
@@ -306,7 +306,7 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
         n => format!("{n} repositories"),
     };
     INDEX_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{JS}}", APP_JS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
@@ -375,7 +375,7 @@ fn render_repo(
     let sample_tag = tags.first().map(|t| t.tag.as_str()).unwrap_or("latest");
     let pull_cmd = format!("docker pull {host}/{name}:{sample_tag}");
     REPO_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{JS}}", APP_JS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{LAYERS}}", LAYERS_SVG)
@@ -502,7 +502,7 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
     // The canonical, fully-qualified pull command is by digest.
     let pull_cmd = format!("docker pull {host}/{name}@{digest}", name = v.name, digest = v.digest);
     MANIFEST_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{JS}}", APP_JS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))

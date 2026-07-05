@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, esc, human_size, userbox, APP_CSS, APP_JS};
+use crate::handlers::{admin_tabs, esc, human_size, userbox, app_css, APP_JS};
 use crate::model::{repo_pattern_matches, RetentionRule};
 use crate::names::is_valid_repo_pattern;
 use crate::{now_secs, random_alnum, AppState};
@@ -370,7 +370,7 @@ fn render(who: &Identity, rules: &[RetentionRule], csrf: &str, notice: &str, pre
         n => format!("{n} rules"),
     };
     RETENTION_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{JS}}", APP_JS)
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
         .replace("{{TABS}}", &admin_tabs("retention"))

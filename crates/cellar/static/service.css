@@ -1,0 +1,134 @@
+/* Cellar service surface, layered after Odyssey canonical CSS. */
+
+/* ==========================================================================
+   Cellar — domain layer (the container-registry surface) on the canonical
+   Odyssey kit. The console layout, the docker command strip, section heads +
+   count badges, the repository/tag data tables (table.data domain cells +
+   mobile stacked layout), repo-name cells, tag chips, the message card, and the
+   progressive-enhancement toasts/sortable-headers. Every shared component
+   (app-bar, card, button, field, base table, tabs, empty base, footer, tokens,
+   fonts) is owned by the canonical layer above.
+   ========================================================================== */
+
+/* Bridge: the one helper token Cellar's domain rules use that the canonical
+   layer doesn't define. Every shared token (--accent/--bg/--surface/--ink/
+   --sh-*/--r*/--radius*) is deliberately ceded to canonical. */
+:root {
+  --accent-border: var(--accent-soft-2);
+}
+
+/* page shell + console layout (templates render .console; cascade-override the
+   canonical page frame + add the 28px title, --row modifier, and .sub) */
+.page-console, .page-reading { background:var(--bg); }
+.console { max-width:1120px; margin:0 auto; padding:36px 20px 64px; }
+.console__head { margin:0 0 26px; }
+.console__head h1 { margin:0; font-size:28px; font-weight:650; letter-spacing:-.025em; }
+.console__head .sub, .sub { margin:8px 0 0; color:var(--ink-3); font-size:14px; line-height:1.6; }
+.console__head--row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+.console__head--row .sub { margin-top:8px; }
+@media (max-width:640px) { .console__head--row { flex-direction:column; } }
+.detail-title { word-break:break-all; }
+
+/* shared helpers kept working against the canonical kit */
+.hint { font-size:13px; color:var(--ink-2); line-height:1.6; }
+.actions { display:flex; gap:10px; align-items:center; margin-top:4px; }
+
+/* command strip — the docker login / push / pull endpoint banner */
+.cmd-strip {
+  display:flex; flex-wrap:wrap; align-items:center; gap:10px;
+  background:var(--accent-soft); border:1px solid var(--accent-border);
+  border-radius:var(--r); padding:13px 16px; margin-bottom:26px;
+}
+.cmd-strip .cmd-label { font-size:11px; letter-spacing:.02em; color:var(--accent-ink); font-weight:600; }
+.cmd-strip code {
+  background:var(--surface); border:1px solid var(--accent-border);
+  color:var(--ink); font-size:12.5px; padding:3px 9px; border-radius:var(--r-sm);
+}
+
+/* section head: a heading + a count badge */
+.section-head { display:flex; align-items:baseline; gap:11px; margin:0 0 14px; }
+.section-head h2 { margin:0; font-size:16px; font-weight:600; letter-spacing:-.01em; }
+.count-badge {
+  display:inline-flex; align-items:center; padding:2px 9px; border-radius:var(--r-sm);
+  background:var(--accent-soft); color:var(--accent-ink); border:1px solid var(--accent-border);
+  font-size:11.5px; font-weight:550; letter-spacing:0;
+}
+
+/* data-table domain cells + empty row (base table styling is canonical). The
+   repo/tag lists use table.data; cells here add tabular/mono treatment. */
+table.data td.num { text-align:right; font-variant-numeric:tabular-nums; color:var(--ink); }
+table.data td.mono, table.data td .mono { font-family:var(--mono); font-size:12px; color:var(--ink-2); }
+.empty-row td { padding:36px 16px; text-align:center; color:var(--ink-3); line-height:2; }
+.empty-row code { margin:2px; }
+
+/* repository name cell with its layers glyph */
+.repo-cell a { display:inline-flex; align-items:center; gap:11px; color:var(--ink); font-weight:600; }
+.repo-cell a:hover { color:var(--accent-ink); }
+.repo-glyph { display:inline-flex; width:26px; height:26px; flex:none; }
+.repo-glyph svg { width:100%; height:100%; }
+.repo-name { word-break:break-all; font-family:var(--mono); font-size:13px; }
+
+/* tag chip (monospace, soft accent tint) */
+.tag-pill {
+  display:inline-flex; padding:2px 9px; border-radius:var(--r-sm);
+  background:var(--accent-soft); color:var(--accent-ink); border:1px solid var(--accent-border);
+  font-size:11.5px; font-weight:550; font-family:var(--mono);
+}
+.row-action { text-align:right; }
+.row-action form { margin:0; display:inline; }
+
+/* centered message / error card (cascade-override of the canonical .card--message) */
+.card--message { max-width:560px; margin:48px auto 0; text-align:center; }
+.card--message .card__body { padding:44px 36px; }
+.status-code { font-size:46px; font-weight:700; letter-spacing:-.02em; color:var(--accent); font-family:var(--mono); }
+.message-heading { margin:10px 0; font-size:21px; font-weight:650; }
+.message-body { margin:0 0 24px; color:var(--ink-2); }
+
+/* responsive: collapse the data table to stacked rows */
+@media (max-width:640px) {
+  .cmd-strip { gap:7px; }
+  table.data thead { display:none; }
+  table.data tbody td { display:block; border-bottom:none; padding:3px 16px; }
+  table.data tbody td.num { text-align:left; }
+  table.data tbody tr { display:block; border-bottom:1px solid var(--border); padding:12px 0; }
+  .row-action { text-align:left; padding-top:10px; }
+}
+
+/* ============================================================================
+   Progressive-enhancement additions (Cellar). Additive only; transitions use
+   --dur (140ms) + --ease and are disabled under reduced motion. Cellar's toast
+   system uses its own .toast-root container + a light bordered .toast (this
+   cascade-overrides the canonical dark pill .toast for Cellar's markup).
+   ============================================================================ */
+.toast-root{position:fixed;right:16px;bottom:16px;z-index:1000;display:flex;flex-direction:column;gap:8px;max-width:min(92vw,360px)}
+.toast{background:var(--surface);color:var(--ink);border:1px solid var(--border);border-left-width:4px;border-radius:var(--r-sm);box-shadow:var(--sh-pop);padding:10px 14px;font:500 13px/1.4 var(--font);opacity:0;transform:translateY(8px);transition:opacity var(--dur) var(--ease),transform var(--dur) var(--ease)}
+.toast.is-in{opacity:1;transform:none}
+.toast--ok{border-left-color:var(--ok-ink)}
+.toast--err{border-left-color:var(--down-ink)}
+
+th.th-sort{cursor:pointer;user-select:none;white-space:nowrap}
+th.th-sort:hover{color:var(--accent-ink)}
+th.th-sort:focus-visible{outline:2px solid var(--ring);outline-offset:-2px}
+th.th-sort::after{content:"\2195";opacity:.35;margin-left:6px;font-size:11px;font-weight:400}
+th.th-sort[aria-sort="ascending"]::after{content:"\2191";opacity:1}
+th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
+
+.pill-size{background:var(--accent-soft);color:var(--accent-ink)}
+.pill-pulls{height:auto;padding:2px 9px;white-space:normal;line-height:1.35;background:var(--surface-3);color:var(--ink-2)}
+
+.cmd-strip .copy-btn{margin-left:auto}
+
+.empty{display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:32px 16px;color:var(--ink-3)}
+.empty__icon{width:40px;height:40px;color:var(--ink-4)}
+.empty__title{font:600 15px/1.2 var(--font);color:var(--ink-2)}
+.empty__text{font:400 13px/1.5 var(--font);color:var(--ink-3);max-width:48ch}
+.empty .cmd-strip{margin-top:4px}
+
+@media (max-width:720px){
+  .toast-root{left:12px;right:12px;bottom:12px;max-width:none}
+  .cmd-strip{flex-wrap:wrap}
+  .cmd-strip .copy-btn{margin-left:0}
+}
+@media (prefers-reduced-motion:reduce){
+  .toast,th.th-sort,.copy-btn{transition:none}
+}

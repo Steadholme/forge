@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, esc, human_size, userbox, APP_CSS, SHIELD_SVG};
+use crate::handlers::{admin_tabs, esc, human_size, userbox, app_css, SHIELD_SVG};
 use crate::model::{is_manifest_list, index_child_digests, manifest_blob_digests, ManifestRec};
 use crate::AppState;
 
@@ -331,7 +331,7 @@ fn render_admin(who: &Identity, view: &AdminView, csrf: &str, notice: &str) -> S
         )
     };
     ADMIN_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
         .replace("{{TABS}}", &admin_tabs("overview"))

@@ -14,8 +14,22 @@ use axum::http::StatusCode;
 
 use crate::inventory::auth_color;
 
-/// Embedded design system, inlined into each rendered page's `<style>`.
-pub const APP_CSS: &str = include_str!("../../static/app.css");
+/// Atlas-only CSS layered after Odyssey's canonical font, tokens, and components.
+pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Embedded design system (Odyssey canonical + Atlas service CSS), inlined into each page's `<style>`.
+pub fn app_css() -> &'static str {
+    APP_CSS
+        .get_or_init(|| {
+            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
+            css.push_str(odyssey::APP_CSS);
+            css.push_str(SERVICE_CSS);
+            css
+        })
+        .as_str()
+}
 
 /// Cross-subdomain gateway logout (Atlas lives at atlas.w33d.xyz; the IdP is at id.w33d.xyz).
 pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
@@ -198,7 +212,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
   <span>Estate ops atlas · part of the HOLDFAST estate</span>
 </footer>
 </body></html>"#,
-        css = APP_CSS,
+        css = app_css(),
         topbar = topbar("Atlas", "—"),
         code = code,
         reason = esc(reason),

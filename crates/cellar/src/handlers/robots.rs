@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, esc, fmt_ts, time_ago, userbox, APP_CSS};
+use crate::handlers::{admin_tabs, esc, fmt_ts, time_ago, userbox, app_css};
 use crate::model::{is_valid_robot_scope, RobotAccount, ROBOT_SCOPE_PUSHPULL};
 use crate::names::{is_valid_repo_pattern, is_valid_robot_name};
 use crate::{now_secs, random_alnum, AppState};
@@ -228,7 +228,7 @@ fn render(
         n => format!("{n} robots"),
     };
     ROBOTS_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
         .replace("{{TABS}}", &admin_tabs("robots"))
         .replace("{{NOTICE}}", notice)

@@ -18,7 +18,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::beacon;
 use crate::error::AppError;
-use crate::handlers::{auth_badge, esc, fmt_date, status_pill, topbar, APP_CSS};
+use crate::handlers::{app_css, auth_badge, esc, fmt_date, status_pill, topbar};
 use crate::inventory::{self, auth_color, Inventory, ServiceEntry};
 use crate::store::Service;
 use crate::{now_secs, AppState};
@@ -95,7 +95,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
     }
 
     let page = CATALOG_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Catalog", &email))
         .replace("{{BANNER}}", &banner)
         .replace("{{SUMMARY}}", &summary)
@@ -157,7 +157,7 @@ pub async fn detail(
     };
 
     let page = DETAIL_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Service", &email))
         .replace("{{KEY}}", &esc(&entry.key))
         .replace("{{DISPLAY_NAME}}", &esc(&entry.display_name))
@@ -229,7 +229,7 @@ pub async fn graph(State(state): State<AppState>, headers: HeaderMap) -> Result<
 
     let svg = render_graph_svg(&inv);
     let page = GRAPH_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Topology", &email))
         .replace("{{COUNT}}", &inv.services_total.to_string())
         .replace("{{SVG}}", &svg);

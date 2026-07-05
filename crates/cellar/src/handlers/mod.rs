@@ -19,8 +19,22 @@ pub mod web;
 use axum::http::StatusCode;
 use axum::response::Html;
 
-/// Embedded design system, inlined into each rendered page's `<style>`.
-pub const APP_CSS: &str = include_str!("../../static/app.css");
+/// Cellar-only CSS layered after Odyssey's canonical font, tokens, and components.
+pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Embedded design system (Odyssey canonical + Cellar service CSS), inlined into each page's `<style>`.
+pub fn app_css() -> &'static str {
+    APP_CSS
+        .get_or_init(|| {
+            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
+            css.push_str(odyssey::APP_CSS);
+            css.push_str(SERVICE_CSS);
+            css
+        })
+        .as_str()
+}
 
 /// Embedded progressive-enhancement script, inlined into each rendered page's `<script>`. Purely
 /// additive: every form route + server-rendered markup still works with JavaScript disabled.
@@ -199,7 +213,7 @@ pub fn render_error(
     email: Option<&str>,
 ) -> (StatusCode, Html<String>) {
     let body = ERROR_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", email))
         .replace("{{STATUS}}", &status.as_u16().to_string())
