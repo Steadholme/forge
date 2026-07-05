@@ -2123,7 +2123,7 @@ const PR_THREAD_RESOLVED_COLS: &str = "pr_id, thread_key, resolved, resolved_by,
 const COMMIT_STATUS_COLS: &str =
     "id, repo_id, commit_sha, state, context, description, target_url, created_at, updated_at";
 const WEBHOOK_COLS: &str = "id, repo_id, url, secret, events, active, created_at";
-const DEPLOY_COLS: &str = "id, repo_id, siteflow_slug, siteflow_project_id, deploy_hook_token, deploy_hook_url, production_branch, output_directory, framework, auto_deploy, last_build_job_id, preview_url, last_deployed_sha, created_at, updated_at";
+const DEPLOY_COLS: &str = "id, repo_id, siteflow_slug, siteflow_project_id, deploy_hook_token, deploy_hook_url, production_branch, output_directory, framework, auto_deploy, last_build_job_id, preview_url, last_deployed_sha, created_at, updated_at, cistern_provisioned, cistern_slug";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -2631,8 +2631,22 @@ impl PgStore {
                  preview_url TEXT NOT NULL DEFAULT '', \
                  last_deployed_sha TEXT NOT NULL DEFAULT '', \
                  created_at BIGINT NOT NULL, \
-                 updated_at BIGINT NOT NULL\
+                 updated_at BIGINT NOT NULL, \
+                 cistern_provisioned BOOLEAN NOT NULL DEFAULT FALSE, \
+                 cistern_slug TEXT NOT NULL DEFAULT ''\
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Lazy cistern-database provisioning columns, added idempotently for deploy rows created
+        // before the integration existed.
+        sqlx::query(
+            "ALTER TABLE repo_deploy ADD COLUMN IF NOT EXISTS cistern_provisioned BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE repo_deploy ADD COLUMN IF NOT EXISTS cistern_slug TEXT NOT NULL DEFAULT ''",
         )
         .execute(&self.pool)
         .await?;
@@ -2876,6 +2890,8 @@ impl PgStore {
             last_deployed_sha: row.try_get("last_deployed_sha")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            cistern_provisioned: row.try_get("cistern_provisioned")?,
+            cistern_slug: row.try_get("cistern_slug")?,
         })
     }
 }
@@ -4676,8 +4692,9 @@ impl Store for PgStore {
             "INSERT INTO repo_deploy \
                  (id, repo_id, siteflow_slug, siteflow_project_id, deploy_hook_token, \
                   deploy_hook_url, production_branch, output_directory, framework, auto_deploy, \
-                  last_build_job_id, preview_url, last_deployed_sha, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                  last_build_job_id, preview_url, last_deployed_sha, created_at, updated_at, \
+                  cistern_provisioned, cistern_slug) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
              ON CONFLICT (repo_id) DO UPDATE SET \
                  siteflow_slug = $3, \
                  siteflow_project_id = $4, \
@@ -4690,7 +4707,9 @@ impl Store for PgStore {
                  last_build_job_id = $11, \
                  preview_url = $12, \
                  last_deployed_sha = $13, \
-                 updated_at = $15 \
+                 updated_at = $15, \
+                 cistern_provisioned = $16, \
+                 cistern_slug = $17 \
              RETURNING {DEPLOY_COLS}"
         ))
         .bind(&deploy.id)
@@ -4708,6 +4727,8 @@ impl Store for PgStore {
         .bind(&deploy.last_deployed_sha)
         .bind(deploy.created_at)
         .bind(deploy.updated_at)
+        .bind(deploy.cistern_provisioned)
+        .bind(&deploy.cistern_slug)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;

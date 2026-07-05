@@ -20,6 +20,9 @@ pub const DEFAULT_SITEFLOW_LOOM_CLONE_BASE_URL: &str = "https://git.w33d.xyz/git
 /// Default placeholder domain for SiteFlow preview URLs. This must not be under `w33d.xyz`.
 pub const DEFAULT_SITEFLOW_BASE_DOMAIN: &str = "sites.holdfast.internal";
 
+/// Default cistern provisioning endpoint (`CISTERN_PROVISION_URL`); internal service address.
+pub const DEFAULT_CISTERN_PROVISION_URL: &str = "http://cistern:9370/provision";
+
 /// Default path to the `git http-backend` CGI (Debian `git` package location).
 pub const DEFAULT_GIT_HTTP_BACKEND: &str = "/usr/lib/git-core/git-http-backend";
 
@@ -60,6 +63,12 @@ pub struct Config {
     pub siteflow_base_domain: String,
     /// Default auto-deploy setting for newly saved deploy configs.
     pub auto_deploy_default: bool,
+    /// Cistern provisioning endpoint (`CISTERN_PROVISION_URL`) called to lazily open a database
+    /// for a repo on first deploy. Defaults to the internal service address.
+    pub cistern_provision_url: String,
+    /// Bearer token for Loom -> cistern provisioning calls (`CISTERN_PROVISION_TOKEN`). Empty
+    /// disables lazy database provisioning (no outbound call is made).
+    pub cistern_provision_token: String,
 }
 
 impl Config {
@@ -77,6 +86,8 @@ impl Config {
             siteflow_clone_base_url: DEFAULT_SITEFLOW_LOOM_CLONE_BASE_URL.to_string(),
             siteflow_base_domain: DEFAULT_SITEFLOW_BASE_DOMAIN.to_string(),
             auto_deploy_default: false,
+            cistern_provision_url: DEFAULT_CISTERN_PROVISION_URL.to_string(),
+            cistern_provision_token: String::new(),
         }
     }
 
@@ -115,6 +126,12 @@ impl Config {
         }
         if let Some(v) = env_nonempty("SITEFLOW_AUTO_DEPLOY_DEFAULT") {
             config.auto_deploy_default = parse_bool(&v);
+        }
+        if let Some(v) = env_nonempty("CISTERN_PROVISION_URL") {
+            config.cistern_provision_url = v;
+        }
+        if let Some(v) = env_nonempty("CISTERN_PROVISION_TOKEN") {
+            config.cistern_provision_token = v;
         }
         config
     }

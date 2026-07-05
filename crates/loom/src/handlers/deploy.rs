@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -262,6 +263,11 @@ pub(crate) fn render_deploy_card(
         .filter(|s| !s.is_empty())
         .unwrap_or("none");
     let status = deploy.map(deploy_status_label).unwrap_or("not_configured");
+    let database = deploy
+        .map(|d| d.cistern_slug.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|slug| format!("<div class=\"deploy-database\">Database: <code>{}</code></div>", esc(slug)))
+        .unwrap_or_default();
     let private_note = if repo.is_private {
         "<p class=\"hint hint--muted\">Deploy supports public repositories only.</p>"
     } else {
@@ -280,6 +286,7 @@ pub(crate) fn render_deploy_card(
     <div class="deploy-summary">
       <div class="deploy-preview-url" title="Internal placeholder; independent domain pending, not a public site.">{preview}</div>
       <div class="deploy-build-id">Build: <code>{build}</code></div>
+      {database}
     </div>
     <form class="deploy-form" method="post" action="/r/{owner}/{name}/settings/deploy">
       <input type="hidden" name="csrf_token" value="{csrf}">
@@ -326,6 +333,7 @@ pub(crate) fn render_deploy_card(
         private_note = private_note,
         preview = esc(preview),
         build = esc(build),
+        database = database,
         branch = esc(production_branch),
         output = esc(output_directory),
         auto_checked = auto_checked,
@@ -427,6 +435,8 @@ fn new_deploy(state: &AppState, repo: &Repo, now: i64) -> RepoDeploy {
         last_deployed_sha: String::new(),
         created_at: now,
         updated_at: now,
+        cistern_provisioned: false,
+        cistern_slug: String::new(),
     }
 }
 
@@ -460,6 +470,19 @@ async fn submit_deploy(
         deploy.deploy_hook_url = hook_url;
         deploy.updated_at = now_secs();
         deploy = state.store.upsert_deploy(&deploy).await?;
+    }
+
+    // Lazily provision a cistern database on first deploy and seal its connection env vars into
+    // the SiteFlow project. Fail-open: this never blocks the deploy, and the guard makes it run at
+    // most once per repo. `deploy` is persisted below regardless, so a success is captured there.
+    if !deploy.cistern_provisioned
+        && !state.config.cistern_provision_token.trim().is_empty()
+        && !deploy.siteflow_project_id.is_empty()
+    {
+        let provisioner = HttpProvisioner::new(&client, &state.config);
+        let project_id = deploy.siteflow_project_id.clone();
+        provision_cistern(&provisioner, &project_id, &repo.owner_sub, &repo.name, &mut deploy)
+            .await;
     }
 
     let build_job_id = trigger_deploy_hook(
@@ -604,6 +627,177 @@ async fn trigger_deploy_hook(
         .ok_or_else(|| {
             AppError::BadRequest("SiteFlow trigger response missed buildJobId.".to_string())
         })
+}
+
+/// Connection credentials returned by cistern's provision endpoint. `anon_key`/`service_key` are
+/// secrets: they are sealed straight into SiteFlow and are never persisted in loom or logged.
+#[derive(Clone)]
+struct CisternCredentials {
+    slug: String,
+    rest_url: String,
+    anon_key: String,
+    service_key: String,
+}
+
+/// Injectable seam over the two outbound calls first-deploy provisioning makes — opening a cistern
+/// database and sealing one SiteFlow project env var. The real impl (`HttpProvisioner`) uses
+/// reqwest; unit tests use an in-memory fake so the guard / fail-open / env-var scope logic runs
+/// fully offline. Errors carry a short, secret-free reason for logging.
+#[async_trait]
+trait Provisioner: Send + Sync {
+    async fn open_database(&self, owner: &str, repo: &str) -> Result<CisternCredentials, String>;
+    async fn seal_env_var(
+        &self,
+        project_id: &str,
+        key: &str,
+        value: &str,
+        scope: &str,
+    ) -> Result<(), String>;
+}
+
+/// Real provisioner: cistern over its provision endpoint, SiteFlow over the shared control-plane.
+/// Reuses the deploy request's reqwest client (bounded timeout) and config-driven tokens.
+struct HttpProvisioner<'a> {
+    client: &'a reqwest::Client,
+    config: &'a Config,
+}
+
+impl<'a> HttpProvisioner<'a> {
+    fn new(client: &'a reqwest::Client, config: &'a Config) -> Self {
+        Self { client, config }
+    }
+}
+
+#[async_trait]
+impl Provisioner for HttpProvisioner<'_> {
+    async fn open_database(&self, owner: &str, repo: &str) -> Result<CisternCredentials, String> {
+        let body = serde_json::to_vec(&json!({ "owner": owner, "repo": repo }))
+            .map_err(|_| "request body could not be encoded".to_string())?;
+        let response = self
+            .client
+            .post(self.config.cistern_provision_url.trim())
+            .header(USER_AGENT, "Loom-Cistern/0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.cistern_provision_token),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| "cistern request failed".to_string())?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|_| "cistern response could not be read".to_string())?;
+        if !status.is_success() {
+            return Err(format!("cistern returned HTTP status {status}"));
+        }
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|_| "cistern response was not valid JSON".to_string())?;
+        let field = |key: &str| {
+            json_string(&value, &[key])
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| format!("cistern response missed {key}"))
+        };
+        Ok(CisternCredentials {
+            slug: field("slug")?,
+            rest_url: field("rest_url")?,
+            anon_key: field("anon_key")?,
+            service_key: field("service_key")?,
+        })
+    }
+
+    async fn seal_env_var(
+        &self,
+        project_id: &str,
+        key: &str,
+        value: &str,
+        scope: &str,
+    ) -> Result<(), String> {
+        let path = format!(
+            "/api/projects/{}/environment-variables",
+            percent_encode(project_id)
+        );
+        let body = serde_json::to_vec(&json!({
+            "key": key,
+            "value": value,
+            "targetEnvironment": "production",
+            "scope": scope
+        }))
+        .map_err(|_| "request body could not be encoded".to_string())?;
+        let response = self
+            .client
+            .post(siteflow_url(self.config, &path))
+            .header(USER_AGENT, "Loom-SiteFlow/0.1")
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.siteflow_api_token),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| "SiteFlow env-var request failed".to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("SiteFlow env-var returned HTTP status {status}"));
+        }
+        Ok(())
+    }
+}
+
+/// One-time lazy provisioning: open a cistern database for `repo` and seal its three connection
+/// env vars into the SiteFlow project. Fail-open — any failure is logged (never with secret
+/// values) and returns without marking `deploy` provisioned, so the next deploy retries. On
+/// success `deploy.cistern_provisioned`/`cistern_slug` are set; the caller persists `deploy`.
+async fn provision_cistern(
+    provisioner: &dyn Provisioner,
+    project_id: &str,
+    owner: &str,
+    repo: &str,
+    deploy: &mut RepoDeploy,
+) {
+    if deploy.cistern_provisioned {
+        return;
+    }
+    let creds = match provisioner.open_database(owner, repo).await {
+        Ok(creds) => creds,
+        Err(reason) => {
+            tracing::warn!(
+                repo = deploy.repo_id,
+                reason = %reason,
+                "cistern provisioning skipped: could not open database"
+            );
+            return;
+        }
+    };
+    // `scope` gates SiteFlow-side visibility: `build` values may enter the client bundle, `runtime`
+    // values are server-only secrets. The service key MUST stay `runtime` (never client-visible).
+    let env_vars = [
+        ("CISTERN_REST_URL", creds.rest_url.as_str(), "build"),
+        ("CISTERN_ANON_KEY", creds.anon_key.as_str(), "build"),
+        ("CISTERN_SERVICE_KEY", creds.service_key.as_str(), "runtime"),
+    ];
+    for (key, value, scope) in env_vars {
+        if let Err(reason) = provisioner.seal_env_var(project_id, key, value, scope).await {
+            tracing::warn!(
+                repo = deploy.repo_id,
+                key = key,
+                reason = %reason,
+                "cistern provisioning skipped: could not seal env var"
+            );
+            return;
+        }
+    }
+    deploy.cistern_provisioned = true;
+    deploy.cistern_slug = creds.slug;
+    tracing::info!(
+        repo = deploy.repo_id,
+        cistern_slug = deploy.cistern_slug,
+        "cistern database provisioned and env vars sealed"
+    );
 }
 
 async fn poll_siteflow_status(config: &Config, deploy: &RepoDeploy) -> Option<String> {
@@ -839,4 +1033,178 @@ fn latest_deployment_status(value: &Value) -> Option<String> {
 fn push_body_touches_branch(body: &[u8], branch: &str) -> bool {
     let needle = format!("refs/heads/{branch}");
     String::from_utf8_lossy(body).contains(&needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// In-memory provisioner double: records sealed env vars and can be told to fail either the
+    /// database open or one specific env-var seal, so the guard / fail-open / scope logic runs
+    /// entirely offline (no reqwest, no cistern, no SiteFlow).
+    struct FakeProvisioner {
+        open_result: Result<CisternCredentials, String>,
+        open_calls: AtomicUsize,
+        sealed: Mutex<Vec<(String, String, String)>>,
+        fail_seal_for: Option<&'static str>,
+    }
+
+    impl FakeProvisioner {
+        fn new(open_result: Result<CisternCredentials, String>) -> Self {
+            Self {
+                open_result,
+                open_calls: AtomicUsize::new(0),
+                sealed: Mutex::new(Vec::new()),
+                fail_seal_for: None,
+            }
+        }
+
+        fn fail_seal(mut self, key: &'static str) -> Self {
+            self.fail_seal_for = Some(key);
+            self
+        }
+
+        fn sealed(&self) -> Vec<(String, String, String)> {
+            self.sealed.lock().expect("sealed lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provisioner for FakeProvisioner {
+        async fn open_database(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<CisternCredentials, String> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            self.open_result.clone()
+        }
+
+        async fn seal_env_var(
+            &self,
+            _project_id: &str,
+            key: &str,
+            value: &str,
+            scope: &str,
+        ) -> Result<(), String> {
+            if self.fail_seal_for == Some(key) {
+                return Err(format!("seal failed for {key}"));
+            }
+            self.sealed.lock().expect("sealed lock").push((
+                key.to_string(),
+                value.to_string(),
+                scope.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn sample_creds() -> CisternCredentials {
+        CisternCredentials {
+            slug: "sf_abc123".to_string(),
+            rest_url: "https://cistern.internal/rest/v1".to_string(),
+            anon_key: "anon-key-secret".to_string(),
+            service_key: "service-key-secret".to_string(),
+        }
+    }
+
+    fn sample_deploy(provisioned: bool) -> RepoDeploy {
+        RepoDeploy {
+            id: "rd_test".to_string(),
+            repo_id: "rp_test".to_string(),
+            siteflow_slug: "alice-site".to_string(),
+            siteflow_project_id: "proj_1".to_string(),
+            deploy_hook_token: "hook-token".to_string(),
+            deploy_hook_url: "https://siteflow.test/hook".to_string(),
+            production_branch: "main".to_string(),
+            output_directory: ".".to_string(),
+            framework: "static".to_string(),
+            auto_deploy: false,
+            last_build_job_id: String::new(),
+            preview_url: String::new(),
+            last_deployed_sha: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            cistern_provisioned: provisioned,
+            cistern_slug: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_guard_skips_already_provisioned_repo() {
+        let fake = FakeProvisioner::new(Ok(sample_creds()));
+        let mut deploy = sample_deploy(true);
+        provision_cistern(&fake, "proj_1", "alice", "site", &mut deploy).await;
+        assert_eq!(
+            fake.open_calls.load(Ordering::SeqCst),
+            0,
+            "guard must short-circuit before opening a database"
+        );
+        assert!(fake.sealed().is_empty(), "no env vars sealed on re-deploy");
+        assert!(deploy.cistern_provisioned);
+        assert!(deploy.cistern_slug.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provision_fail_open_when_database_open_fails() {
+        let fake = FakeProvisioner::new(Err("cistern unreachable".to_string()));
+        let mut deploy = sample_deploy(false);
+        provision_cistern(&fake, "proj_1", "alice", "site", &mut deploy).await;
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 1);
+        assert!(fake.sealed().is_empty());
+        assert!(
+            !deploy.cistern_provisioned,
+            "fail-open: unprovisioned so the next deploy retries"
+        );
+        assert!(deploy.cistern_slug.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provision_seals_three_env_vars_with_correct_scopes() {
+        let fake = FakeProvisioner::new(Ok(sample_creds()));
+        let mut deploy = sample_deploy(false);
+        provision_cistern(&fake, "proj_1", "alice", "site", &mut deploy).await;
+        assert_eq!(
+            fake.sealed(),
+            vec![
+                (
+                    "CISTERN_REST_URL".to_string(),
+                    "https://cistern.internal/rest/v1".to_string(),
+                    "build".to_string()
+                ),
+                (
+                    "CISTERN_ANON_KEY".to_string(),
+                    "anon-key-secret".to_string(),
+                    "build".to_string()
+                ),
+                (
+                    "CISTERN_SERVICE_KEY".to_string(),
+                    "service-key-secret".to_string(),
+                    "runtime".to_string()
+                ),
+            ],
+            "service key must be runtime-scoped; rest_url + anon_key must be build-scoped"
+        );
+        assert!(deploy.cistern_provisioned);
+        assert_eq!(deploy.cistern_slug, "sf_abc123");
+    }
+
+    #[tokio::test]
+    async fn provision_fail_open_when_env_var_seal_fails() {
+        let fake = FakeProvisioner::new(Ok(sample_creds())).fail_seal("CISTERN_SERVICE_KEY");
+        let mut deploy = sample_deploy(false);
+        provision_cistern(&fake, "proj_1", "alice", "site", &mut deploy).await;
+        assert!(
+            !deploy.cistern_provisioned,
+            "any seal failure leaves the repo unprovisioned for a later retry"
+        );
+        assert!(deploy.cistern_slug.is_empty());
+        assert_eq!(
+            fake.sealed().len(),
+            2,
+            "the two build-scope vars sealed before the runtime seal failed"
+        );
+    }
 }

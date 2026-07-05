@@ -340,6 +340,12 @@ pub struct RepoDeploy {
     pub created_at: i64,
     /// Last update time, epoch seconds.
     pub updated_at: i64,
+    /// Whether a cistern database has been lazily provisioned for this repo. Guards the one-time
+    /// provisioning: once true, further deploys never reopen the database or rewrite env vars.
+    pub cistern_provisioned: bool,
+    /// Cistern database slug (e.g. `sf_xxx`), stored only for display ("Database: sf_xxx"). The
+    /// anon/service keys are handed once to SiteFlow's sealed env-var API and are never stored here.
+    pub cistern_slug: String,
 }
 
 /// A pull-request review verdict.

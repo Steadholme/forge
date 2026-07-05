@@ -87,6 +87,8 @@ fn deploy(repo_id: &str, output_directory: &str, auto_deploy: bool, updated_at: 
         last_deployed_sha: "abc123".to_string(),
         created_at: 1,
         updated_at,
+        cistern_provisioned: false,
+        cistern_slug: String::new(),
     }
 }
 
