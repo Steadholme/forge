@@ -2672,3 +2672,58 @@ h3 { font-size:14px; }
   max-width:340px; }
 .deploy-disconnect-form .btn:not([disabled]):hover {
   color:var(--down-ink); border-color:var(--down-border); background:var(--down-soft); }
+
+
+/* ==========================================================================
+   Responsive reinforcement — narrow-viewport gaps in Loom's SERVICE-SPECIFIC
+   layouts only. DESKTOP IS UNTOUCHED: everything below is additive @media,
+   no existing non-@media rule is edited.
+   -------------------------------------------------------------------------
+   Loom's domain layouts already carry their own breakpoints above and are NOT
+   re-declared here — the multi-column grids collapse (.repo-layout /
+   .detail-layout / .review-forms / .layout @≤920px, .pr-diff @≤900px), the
+   toolbars/tabs/file-tree reflow (.code-toolbar / .list-toolbar @≤720px,
+   .tabs @≤560px, .tree-row @≤720/768px), the split diff stacks (@≤640px) and
+   the header search hides (@≤768px). This block only fills what remained:
+   wide bare data tables (no .table-wrap wrapper exists in Loom markup) and the
+   dark GitHub chrome app-bar on phones, plus the page shell + blame band.
+   Loom keeps its emerald + --r:6 theme; every value is a shared semantic
+   token (no raw hex).
+   ========================================================================== */
+
+/* --- Tablet & down (≤900px): wide domain tables scroll, never burst --------
+   The branches / commits / access-token tables are bare `table.data` inside a
+   plain `.card__body` (Loom never uses `.table-wrap`), so a wide table would
+   push past the card and force a horizontal BODY scroll. Give only the card
+   bodies that DIRECTLY hold a data table their own horizontal scroll, so every
+   other card body is left exactly as-is. */
+@media (max-width:900px){
+  .card__body:has(> table.data){ overflow-x:auto; }
+}
+
+/* --- Phone (≤640px) -------------------------------------------------------- */
+@media (max-width:640px){
+  /* Page shell: reclaim side padding so the wide code / diff / table / blame
+     surfaces get the full narrow width instead of spilling into a body scroll. */
+  .console{ padding:18px 14px 48px; }
+
+  /* Dark chrome app-bar. The header search is already hidden (≤768px); tighten
+     the remaining brand · nav · actions to a phone rail (gaps + padding), and
+     drop the secondary "All apps" launcher — a non-essential cross-app jump,
+     kept on wider screens (mirrors corvid hiding .user-email at 640px). Height
+     stays 56px so the sticky diff-bar / per-file summary offsets keyed to it
+     above are undisturbed. */
+  .appbar{ gap:8px; padding:0 12px; }
+  .appbar__nav{ gap:6px; margin-left:2px; }
+  .appnav{ font-size:13px; }
+  .appbar__right{ gap:4px; }
+  .appbar__right > a.iconbtn{ display:none; }   /* All-apps launcher — secondary */
+
+  /* Blame: shrink the commit meta band so more source shows before the code
+     column scrolls. The band + line-no + code live in .card__body--code, which
+     already scrolls horizontally; the relative time is dropped (its absolute
+     value survives in the cell title) to buy that width back. */
+  .blame-commit{ padding:0 8px; }
+  .blame-author{ max-width:88px; margin-left:6px; }
+  .blame-time{ display:none; }
+}
