@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
@@ -84,6 +84,11 @@ pub struct DeployPreviewPasswordForm {
     pub csrf_token: String,
     #[serde(default)]
     pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeployLogsQuery {
+    pub cursor: Option<String>,
 }
 
 /// POST /r/{owner}/{name}/deploy
@@ -367,6 +372,54 @@ pub async fn status_json(
     .into_response())
 }
 
+/// GET /r/{owner}/{name}/deploy/logs
+pub async fn logs_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<DeployLogsQuery>,
+) -> Result<Response, AppError> {
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    require_deploy_admin(&state, &repo, &who, &headers).await?;
+    let cursor = build_log_cursor(query.cursor.as_deref())?;
+    let Some(deploy) = state.store.get_deploy(&repo.id).await? else {
+        return Ok(Json(empty_build_logs_json()).into_response());
+    };
+
+    let client = siteflow_client()?;
+    let path = format!(
+        "/api/projects/{}/build-logs?cursor={}",
+        percent_encode(&deploy.siteflow_project_id),
+        percent_encode(&cursor)
+    );
+    let value = siteflow_get(&client, &state.config, &path).await?;
+    Ok(Json(value).into_response())
+}
+
+fn build_log_cursor(cursor: Option<&str>) -> Result<String, AppError> {
+    let cursor = cursor.unwrap_or("0");
+
+    if cursor.is_empty() || !cursor.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(AppError::BadRequest(
+            "Build log cursor must be a non-negative integer.".to_string(),
+        ));
+    }
+
+    Ok(cursor.to_string())
+}
+
+fn empty_build_logs_json() -> Value {
+    json!({
+        "buildJobId": "",
+        "status": "none",
+        "lines": [],
+        "nextCursor": "0",
+        "hasMore": false,
+        "complete": true
+    })
+}
+
 pub fn emit_auto_deploy(state: &AppState, repo: &Repo, actor_sub: &str, push_body: &[u8]) {
     if repo.is_private {
         return;
@@ -632,6 +685,10 @@ pub(crate) fn render_deploy_card(
       <div class="deploy-build-id">Build: <code>{build}</code></div>
       {database}
     </div>
+    <details class="deploy-logs" data-logs-url="/r/{owner}/{name}/deploy/logs">
+      <summary class="deploy-logs__summary">Build logs</summary>
+      <pre class="deploy-logs__pre" data-logs-pre>Waiting for build output…</pre>
+    </details>
     <form class="deploy-form" method="post" action="/r/{owner}/{name}/settings/deploy">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <div class="field">
@@ -2320,6 +2377,145 @@ mod tests {
         });
 
         (format!("http://{addr}"), handle)
+    }
+
+    fn mock_siteflow_logs() -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock siteflow");
+        let addr = listener.local_addr().expect("mock siteflow addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock siteflow");
+            let mut buffer = [0_u8; 4096];
+            let read = stream
+                .read(&mut buffer)
+                .expect("read mock siteflow request");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"buildJobId":"build/one","status":"running","lines":["npm ci"],"nextCursor":"10","hasMore":false,"complete":false}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write mock siteflow response");
+            request
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    fn owner_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(auth::HEADER_SUBJECT, "alice".parse().unwrap());
+        headers
+    }
+
+    async fn response_json_value(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body bytes");
+        serde_json::from_slice(&bytes).expect("json response body")
+    }
+
+    #[tokio::test]
+    async fn logs_json_returns_empty_when_deploy_config_is_missing() {
+        let state = sample_state();
+        let repo = sample_repo();
+        state.store.create_repo(&repo).await.unwrap();
+
+        let response = logs_json(
+            State(state),
+            owner_headers(),
+            Path(("alice".to_string(), "site".to_string())),
+            Query(DeployLogsQuery { cursor: None }),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = response_json_value(response).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "buildJobId": "",
+                "status": "none",
+                "lines": [],
+                "nextCursor": "0",
+                "hasMore": false,
+                "complete": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_json_rejects_invalid_cursor() {
+        let state = sample_state();
+        let repo = sample_repo();
+        let deploy = sample_deploy(false);
+        state.store.create_repo(&repo).await.unwrap();
+        state.store.upsert_deploy(&deploy).await.unwrap();
+
+        let result = logs_json(
+            State(state),
+            owner_headers(),
+            Path(("alice".to_string(), "site".to_string())),
+            Query(DeployLogsQuery {
+                cursor: Some("abc".to_string()),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(message)) => {
+                assert_eq!(message, "Build log cursor must be a non-negative integer.");
+            }
+            _ => panic!("expected bad request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_json_proxies_siteflow_build_job_logs() {
+        let (base_url, server) = mock_siteflow_logs();
+        let mut config = Config::dev();
+        config.siteflow_base_url = base_url;
+        config.siteflow_api_token = "siteflow-token".to_string();
+        let state = sample_state_with_config(config);
+        let repo = sample_repo();
+        let mut deploy = sample_deploy(false);
+        deploy.siteflow_project_id = "proj/one".to_string();
+        state.store.create_repo(&repo).await.unwrap();
+        state.store.upsert_deploy(&deploy).await.unwrap();
+
+        let response = logs_json(
+            State(state),
+            owner_headers(),
+            Path(("alice".to_string(), "site".to_string())),
+            Query(DeployLogsQuery {
+                cursor: Some("9".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = response_json_value(response).await;
+        let request = server.join().expect("mock siteflow server joined");
+        let lower_request = request.to_ascii_lowercase();
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(request.starts_with("GET /api/projects/proj%2Fone/build-logs?cursor=9 "));
+        assert!(lower_request.contains("authorization: bearer siteflow-token"));
+        assert_eq!(
+            body,
+            json!({
+                "buildJobId": "build/one",
+                "status": "running",
+                "lines": ["npm ci"],
+                "nextCursor": "10",
+                "hasMore": false,
+                "complete": false
+            })
+        );
     }
 
     #[test]

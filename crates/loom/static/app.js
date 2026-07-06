@@ -510,6 +510,56 @@
     tick();
   }
 
+  // --- Build logs cursor poll (starts when the details block is opened) -----
+  // Follows the project's LATEST build: when buildJobId changes between polls
+  // (a new build started), the pane resets and follows the new build from the
+  // top. After a build completes it keeps a slow poll while open to catch the
+  // next one; closing the block cancels all polling.
+  function initDeployLogs() {
+    var box = document.querySelector(".deploy-logs[data-logs-url]");
+    if (!box) return;
+    var pre = box.querySelector("[data-logs-pre]");
+    var url = box.getAttribute("data-logs-url");
+    var cursor = "0";
+    var jobId = "";
+    var timer = null;
+    var seen = false;
+    function schedule(ms) {
+      if (timer) clearTimeout(timer);
+      timer = box.open ? setTimeout(tick, ms) : null;
+    }
+    function tick() {
+      timer = null;
+      fetch(url + "?cursor=" + cursor, { headers: { Accept: "application/json" }, credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d) { if (!seen) pre.textContent = "Could not load build logs."; schedule(6000); return; }
+          if (d.status === "none") { pre.textContent = "No build yet."; schedule(10000); return; }
+          if (jobId && d.buildJobId && d.buildJobId !== jobId) {
+            jobId = d.buildJobId; cursor = "0"; seen = false;
+            pre.textContent = "New build started…";
+            schedule(0);
+            return;
+          }
+          if (d.buildJobId) jobId = d.buildJobId;
+          if (d.lines && d.lines.length) {
+            if (!seen) { seen = true; pre.textContent = ""; }
+            pre.appendChild(document.createTextNode(d.lines.join("\n") + "\n"));
+            pre.scrollTop = pre.scrollHeight;
+          } else if (!seen) {
+            pre.textContent = d.complete ? "No log lines recorded for this build." : "Waiting for build output…";
+          }
+          if (d.nextCursor) cursor = d.nextCursor;
+          schedule(d.complete ? 10000 : d.hasMore ? 250 : 2000);
+        })
+        .catch(function () { schedule(6000); });
+    }
+    box.addEventListener("toggle", function () {
+      if (box.open) { if (!timer) tick(); }
+      else if (timer) { clearTimeout(timer); timer = null; }
+    });
+  }
+
   function init() {
     initCopy();
     initSort();
@@ -522,6 +572,7 @@
     initDeleteConfirm();
     initDeployDomains();
     initDeployPreview();
+    initDeployLogs();
   }
 
   if (document.readyState === "loading") {

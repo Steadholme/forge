@@ -86,6 +86,10 @@ pub fn app(state: AppState) -> Router {
             get(handlers::deploy::status_json),
         )
         .route(
+            "/r/{owner}/{name}/deploy/logs",
+            get(handlers::deploy::logs_json),
+        )
+        .route(
             "/r/{owner}/{name}/deploy/domains",
             get(handlers::deploy::domains_json),
         )
