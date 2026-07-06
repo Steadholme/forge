@@ -87,8 +87,26 @@ pub struct DeployPreviewPasswordForm {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RollbackDeployForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub deployment_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DeployLogsQuery {
     pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeploymentHistoryItem {
+    id: String,
+    project_id: String,
+    commit_sha: String,
+    branch: String,
+    status: String,
+    created_at: String,
 }
 
 /// POST /r/{owner}/{name}/deploy
@@ -313,6 +331,65 @@ pub async fn clear_preview_password(
         siteflow_project_id = deploy.siteflow_project_id,
         "deploy preview password cleared"
     );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+/// POST /r/{owner}/{name}/settings/deploy/rollback
+pub async fn rollback_deploy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<RollbackDeployForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let deployment_id = nonempty_trimmed(&form.deployment_id).ok_or_else(|| {
+        AppError::BadRequest("Choose a deployment from the production history.".to_string())
+    })?;
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    require_deploy_admin(&state, &repo, &who, &headers).await?;
+    ensure_public_repo(&repo)?;
+    let mut deploy = require_siteflow_deploy(&state, &repo).await?;
+
+    let client = siteflow_client()?;
+    let value =
+        fetch_siteflow_deployments(&client, &state.config, &deploy.siteflow_project_id).await?;
+    let deployments = parse_deployment_history(&value);
+    let target = rollback_target_for_deployment(&deployments, &deployment_id, &deploy)?;
+    let target_deployment_id = target.id.clone();
+    let target_sha = target.commit_sha.to_ascii_lowercase();
+    let detail = resolve_rollback_commit_detail(&state, &repo, &target_sha).await;
+
+    let build_job_id = trigger_rollback_deploy_hook(
+        &client,
+        &state.config,
+        &deploy,
+        &target_sha,
+        &detail,
+        &who.subject,
+    )
+    .await?;
+    deploy.last_build_job_id = build_job_id;
+    deploy.last_deployed_sha = target_sha.clone();
+    deploy.preview_url = preview_url(&state.config.siteflow_base_domain, &deploy.siteflow_slug);
+    deploy.updated_at = now_secs();
+    deploy = state.store.upsert_deploy(&deploy).await?;
+    tracing::info!(
+        action = "deploy.rollback",
+        repo = repo.id,
+        actor = who.subject,
+        siteflow_slug = deploy.siteflow_slug,
+        project_id = deploy.siteflow_project_id,
+        deployment_id = target_deployment_id,
+        target_sha = target_sha,
+        build_job_id = deploy.last_build_job_id,
+        "deploy rollback submitted"
+    );
+
     Ok(redirect(&format!("/r/{owner}/{name}/settings")))
 }
 
@@ -665,6 +742,8 @@ pub(crate) fn render_deploy_card(
     } else {
         String::new()
     };
+    let deployment_history =
+        render_deployment_history_section(&state.config, repo, csrf, deploy, disabled);
 
     // TODO(opus): Domains UI section wires POST /r/{owner}/{name}/settings/deploy/domains
     // and GET /r/{owner}/{name}/deploy/domains.
@@ -689,6 +768,7 @@ pub(crate) fn render_deploy_card(
       <summary class="deploy-logs__summary">Build logs</summary>
       <pre class="deploy-logs__pre" data-logs-pre>Waiting for build output…</pre>
     </details>
+    {deployment_history}
     <form class="deploy-form" method="post" action="/r/{owner}/{name}/settings/deploy">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <div class="field">
@@ -766,6 +846,125 @@ pub(crate) fn render_deploy_card(
         disabled = disabled,
         preview_protection_status = esc(preview_protection_status),
         preview_protection_clear = preview_protection_clear,
+        deployment_history = deployment_history,
+    )
+}
+
+fn render_deployment_history_section(
+    config: &Config,
+    repo: &Repo,
+    csrf: &str,
+    deploy: Option<&RepoDeploy>,
+    disabled: &str,
+) -> String {
+    let body = match deploy {
+        Some(deploy) => match deployment_history_for_card(config, deploy) {
+            Ok(items) => render_deployment_history_rows(repo, csrf, deploy, &items, disabled),
+            Err(_) => {
+                "<p class=\"hint hint--muted\">Deployment history unavailable.</p>".to_string()
+            }
+        },
+        None => "<p class=\"hint hint--muted\">Deployment history unavailable.</p>".to_string(),
+    };
+    format!(
+        r#"<div class="deploy-history">
+      <h3 class="deploy-history__title">Deployment history</h3>
+      {body}
+    </div>"#,
+        body = body
+    )
+}
+
+fn deployment_history_for_card(
+    config: &Config,
+    deploy: &RepoDeploy,
+) -> Result<Vec<DeploymentHistoryItem>, String> {
+    if config.siteflow_base_url.trim().is_empty()
+        || config.siteflow_api_token.trim().is_empty()
+        || deploy.siteflow_project_id.trim().is_empty()
+    {
+        return Err("history unavailable".to_string());
+    }
+    let config = config.clone();
+    let project_id = deploy.siteflow_project_id.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "SiteFlow runtime could not be built".to_string())?;
+        runtime.block_on(async move {
+            let client = siteflow_client().map_err(|e| e.to_string())?;
+            let value = fetch_siteflow_deployments(&client, &config, &project_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(parse_deployment_history(&value))
+        })
+    })
+    .join()
+    .map_err(|_| "history unavailable".to_string())?
+}
+
+fn render_deployment_history_rows(
+    repo: &Repo,
+    csrf: &str,
+    deploy: &RepoDeploy,
+    deployments: &[DeploymentHistoryItem],
+    disabled: &str,
+) -> String {
+    let rows = production_deployment_history(deployments, &deploy.production_branch, 8);
+    if rows.is_empty() {
+        return "<p class=\"hint hint--muted\">No production deployments yet.</p>".to_string();
+    }
+    let current_id = current_production_deployment_id(deployments, &deploy.production_branch);
+    rows.into_iter()
+        .map(|item| {
+            render_deployment_history_row(repo, csrf, item, current_id.as_deref(), disabled)
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_deployment_history_row(
+    repo: &Repo,
+    csrf: &str,
+    item: &DeploymentHistoryItem,
+    current_id: Option<&str>,
+    disabled: &str,
+) -> String {
+    let is_current = deployment_is_current(item, current_id);
+    let current_chip = if is_current {
+        r#"<span class="deploy-history__current">Current</span>"#
+    } else {
+        ""
+    };
+    let rollback_form = if deployment_eligible_for_rollback(item, current_id) {
+        format!(
+            r#"<form class="deploy-history__form" method="post" action="/r/{owner}/{name}/settings/deploy/rollback">
+        <input type="hidden" name="csrf_token" value="{csrf}">
+        <input type="hidden" name="deployment_id" value="{deployment_id}">
+        <button class="btn btn-secondary btn-sm" type="submit"{disabled}>Rollback</button>
+      </form>"#,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            csrf = esc(csrf),
+            deployment_id = esc(&item.id),
+            disabled = disabled,
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="deploy-history__row">
+      <span class="deploy-history__sha">{sha}</span>
+      <span class="deploy-history__meta">{status} · {created_at}</span>
+      {current_chip}
+      {rollback_form}
+    </div>"#,
+        sha = esc(&deployment_short_sha(&item.commit_sha)),
+        status = esc(&item.status),
+        created_at = esc(&item.created_at),
+        current_chip = current_chip,
+        rollback_form = rollback_form,
     )
 }
 
@@ -1280,6 +1479,29 @@ async fn resolve_deploy_commit(
     Ok((commit_sha, detail))
 }
 
+async fn resolve_rollback_commit_detail(
+    state: &AppState,
+    repo: &Repo,
+    commit_sha: &str,
+) -> CommitDetail {
+    state
+        .git
+        .commit_detail(&repo.owner_sub, &repo.name, commit_sha)
+        .await
+        .unwrap_or_else(|| synthetic_rollback_commit_detail(commit_sha))
+}
+
+fn synthetic_rollback_commit_detail(commit_sha: &str) -> CommitDetail {
+    CommitDetail {
+        oid: commit_sha.to_string(),
+        author_name: "Loom".to_string(),
+        author_email: String::new(),
+        time: now_secs(),
+        parents: Vec::new(),
+        message: format!("Rollback to {}", deployment_short_sha(commit_sha)),
+    }
+}
+
 async fn create_siteflow_project(
     client: &reqwest::Client,
     config: &Config,
@@ -1355,16 +1577,80 @@ async fn trigger_deploy_hook(
     detail: &CommitDetail,
     actor_sub: &str,
 ) -> Result<String, AppError> {
+    let idempotency_key = deploy_hook_idempotency_key(deploy, commit_sha);
+    trigger_deploy_hook_with_idempotency_key(
+        client,
+        config,
+        deploy,
+        &deploy.production_branch,
+        commit_sha,
+        detail,
+        actor_sub,
+        &idempotency_key,
+    )
+    .await
+}
+
+async fn trigger_rollback_deploy_hook(
+    client: &reqwest::Client,
+    config: &Config,
+    deploy: &RepoDeploy,
+    commit_sha: &str,
+    detail: &CommitDetail,
+    actor_sub: &str,
+) -> Result<String, AppError> {
+    let idempotency_key = rollback_deploy_hook_idempotency_key(deploy, commit_sha, now_secs());
+    trigger_deploy_hook_with_idempotency_key(
+        client,
+        config,
+        deploy,
+        &deploy.production_branch,
+        commit_sha,
+        detail,
+        actor_sub,
+        &idempotency_key,
+    )
+    .await
+}
+
+fn deploy_hook_idempotency_key(deploy: &RepoDeploy, commit_sha: &str) -> String {
+    format!(
+        "loom:{}:{}:{}",
+        deploy.repo_id, deploy.production_branch, commit_sha
+    )
+}
+
+fn rollback_deploy_hook_idempotency_key(
+    deploy: &RepoDeploy,
+    commit_sha: &str,
+    unix_seconds: i64,
+) -> String {
+    format!(
+        "loom-rollback:{}:{}:{}:{}",
+        deploy.repo_id, deploy.production_branch, commit_sha, unix_seconds
+    )
+}
+
+async fn trigger_deploy_hook_with_idempotency_key(
+    client: &reqwest::Client,
+    config: &Config,
+    deploy: &RepoDeploy,
+    branch: &str,
+    commit_sha: &str,
+    detail: &CommitDetail,
+    actor_sub: &str,
+    idempotency_key: &str,
+) -> Result<String, AppError> {
     let path = format!(
         "/api/deploy-hooks/{}/trigger",
         percent_encode(&deploy.deploy_hook_token)
     );
     let body = json!({
-        "branch": deploy.production_branch,
+        "branch": branch,
         "commitSha": commit_sha,
         "commitMessage": detail.subject(),
         "commitAuthor": commit_author(detail),
-        "idempotencyKey": format!("loom:{}:{}:{}", deploy.repo_id, deploy.production_branch, commit_sha),
+        "idempotencyKey": idempotency_key,
         "actor": actor_sub
     });
     let value = siteflow_post(client, config, &path, &body, false).await?;
@@ -1601,6 +1887,26 @@ async fn poll_siteflow_status(
     );
     let value = siteflow_get(&client, config, &path).await.ok()?;
     production_status_from_deployments(&value, deploy)
+}
+
+async fn fetch_siteflow_deployments(
+    client: &reqwest::Client,
+    config: &Config,
+    project_id: &str,
+) -> Result<Value, AppError> {
+    if config.siteflow_base_url.trim().is_empty() || config.siteflow_api_token.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "SiteFlow API is not configured.".to_string(),
+        ));
+    }
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("Deploy the site first.".to_string()));
+    }
+    let path = format!(
+        "/api/deployments?projectId={}",
+        percent_encode(project_id.trim())
+    );
+    siteflow_get(client, config, &path).await
 }
 
 async fn poll_preview_status(
@@ -1935,6 +2241,11 @@ fn valid_commit_sha(sha: &str) -> bool {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
+fn hex_like_commit_sha(sha: &str) -> bool {
+    let sha = sha.trim();
+    (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn percent_encode(input: &str) -> String {
     let mut out = String::new();
     for b in input.as_bytes() {
@@ -1954,6 +2265,145 @@ fn json_string(value: &Value, path: &[&str]) -> Option<String> {
         cur = cur.get(*key)?;
     }
     cur.as_str().map(str::to_string)
+}
+
+fn parse_deployment_history(value: &Value) -> Vec<DeploymentHistoryItem> {
+    deployment_items(value)
+        .into_iter()
+        .map(|item| DeploymentHistoryItem {
+            id: deployment_id(item),
+            project_id: deployment_project_id(item),
+            commit_sha: deployment_commit_sha(item),
+            branch: deployment_branch(item).unwrap_or_default(),
+            status: deployment_status(item),
+            created_at: deployment_created_at(item),
+        })
+        .collect()
+}
+
+fn production_deployment_history<'a>(
+    deployments: &'a [DeploymentHistoryItem],
+    production_branch: &str,
+    limit: usize,
+) -> Vec<&'a DeploymentHistoryItem> {
+    deployments
+        .iter()
+        .filter(|item| item.branch == production_branch)
+        .take(limit)
+        .collect()
+}
+
+fn current_production_deployment_id(
+    deployments: &[DeploymentHistoryItem],
+    production_branch: &str,
+) -> Option<String> {
+    deployments
+        .iter()
+        .find(|item| {
+            item.branch == production_branch && item.status.trim().eq_ignore_ascii_case("ready")
+        })
+        .map(|item| item.id.clone())
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn deployment_eligible_for_rollback(
+    item: &DeploymentHistoryItem,
+    current_id: Option<&str>,
+) -> bool {
+    item.status.trim().eq_ignore_ascii_case("ready")
+        && hex_like_commit_sha(&item.commit_sha)
+        && !deployment_is_current(item, current_id)
+}
+
+fn deployment_is_current(item: &DeploymentHistoryItem, current_id: Option<&str>) -> bool {
+    current_id.is_some_and(|id| !id.trim().is_empty() && id == item.id)
+}
+
+fn rollback_target_for_deployment<'a>(
+    deployments: &'a [DeploymentHistoryItem],
+    deployment_id: &str,
+    deploy: &RepoDeploy,
+) -> Result<&'a DeploymentHistoryItem, AppError> {
+    let target = deployments
+        .iter()
+        .find(|item| item.id == deployment_id)
+        .ok_or_else(|| {
+            AppError::BadRequest("Choose a deployment from the production history.".to_string())
+        })?;
+
+    if target.project_id != deploy.siteflow_project_id {
+        return Err(AppError::BadRequest(
+            "Deployment does not belong to this SiteFlow project.".to_string(),
+        ));
+    }
+    if !target.status.trim().eq_ignore_ascii_case("ready") {
+        return Err(AppError::BadRequest(
+            "Only ready deployments can be rolled back.".to_string(),
+        ));
+    }
+    if target.branch != deploy.production_branch {
+        return Err(AppError::BadRequest(
+            "Choose a deployment from the production branch.".to_string(),
+        ));
+    }
+    let current_id = current_production_deployment_id(deployments, &deploy.production_branch);
+    if deployment_is_current(target, current_id.as_deref()) {
+        return Err(AppError::BadRequest(
+            "The current production deployment is already live.".to_string(),
+        ));
+    }
+    if !hex_like_commit_sha(&target.commit_sha) {
+        return Err(AppError::BadRequest(
+            "Only Git commit deployments can be rolled back.".to_string(),
+        ));
+    }
+
+    Ok(target)
+}
+
+fn deployment_id(item: &Value) -> String {
+    json_string(item, &["id"])
+        .and_then(|id| nonempty_trimmed(&id))
+        .unwrap_or_default()
+}
+
+fn deployment_project_id(item: &Value) -> String {
+    json_string(item, &["projectId"])
+        .or_else(|| json_string(item, &["project_id"]))
+        .and_then(|id| nonempty_trimmed(&id))
+        .unwrap_or_default()
+}
+
+fn deployment_commit_sha(item: &Value) -> String {
+    json_string(item, &["commitSha"])
+        .or_else(|| json_string(item, &["commit_sha"]))
+        .or_else(|| json_string(item, &["source", "commitSha"]))
+        .or_else(|| json_string(item, &["source", "commit_sha"]))
+        .or_else(|| json_string(item, &["source", "commit"]))
+        .and_then(|sha| nonempty_trimmed(&sha))
+        .unwrap_or_default()
+}
+
+fn deployment_status(item: &Value) -> String {
+    json_string(item, &["status"])
+        .and_then(|status| nonempty_trimmed(&status))
+        .unwrap_or_default()
+}
+
+fn deployment_created_at(item: &Value) -> String {
+    json_string(item, &["createdAt"])
+        .or_else(|| json_string(item, &["created_at"]))
+        .and_then(|created_at| nonempty_trimmed(&created_at))
+        .unwrap_or_else(|| "unknown time".to_string())
+}
+
+fn deployment_short_sha(commit_sha: &str) -> String {
+    let trimmed = commit_sha.trim();
+    if trimmed.chars().count() <= 7 {
+        trimmed.to_string()
+    } else {
+        trimmed.chars().take(7).collect()
+    }
 }
 
 #[cfg(test)]
@@ -2404,9 +2854,97 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    fn mock_siteflow_sequence(bodies: Vec<String>) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock siteflow");
+        listener
+            .set_nonblocking(true)
+            .expect("set mock siteflow nonblocking");
+        let addr = listener.local_addr().expect("mock siteflow addr");
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let mut stream = accept_mock_connection(&listener);
+                let request = read_http_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write mock siteflow response");
+                requests.push(request);
+            }
+            requests
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    fn accept_mock_connection(listener: &TcpListener) -> std::net::TcpStream {
+        let start = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(3),
+                        "timed out waiting for mock siteflow request"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept mock siteflow: {e}"),
+            }
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("read mock siteflow request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if http_request_complete(&request) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
+    fn http_request_complete(request: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(request);
+        let Some(header_end) = text.find("\r\n\r\n") else {
+            return false;
+        };
+        let content_length = text[..header_end]
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
+    }
+
     fn owner_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(auth::HEADER_SUBJECT, "alice".parse().unwrap());
+        headers
+    }
+
+    fn owner_headers_with_csrf(csrf: &str) -> HeaderMap {
+        let mut headers = owner_headers();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("{}={csrf}", auth::CSRF_COOKIE).parse().unwrap(),
+        );
         headers
     }
 
@@ -2415,6 +2953,86 @@ mod tests {
             .await
             .expect("response body bytes");
         serde_json::from_slice(&bytes).expect("json response body")
+    }
+
+    fn siteflow_state(base_url: String) -> AppState {
+        let mut config = Config::dev();
+        config.siteflow_base_url = base_url;
+        config.siteflow_api_token = "siteflow-token".to_string();
+        sample_state_with_config(config)
+    }
+
+    fn rollback_deployments() -> Value {
+        json!({
+            "deployments": [
+                {
+                    "id": "dep_current",
+                    "projectId": "proj_1",
+                    "branch": "main",
+                    "status": "ready",
+                    "commitSha": "bbbbbbbbbbbbbbbb",
+                    "createdAt": "2026-07-06T12:00:00Z"
+                },
+                {
+                    "id": "dep_feature",
+                    "projectId": "proj_1",
+                    "branch": "feature",
+                    "status": "ready",
+                    "commitSha": "aaaaaaaaaaaaaaaa",
+                    "createdAt": "2026-07-06T11:00:00Z"
+                },
+                {
+                    "id": "dep_failed",
+                    "projectId": "proj_1",
+                    "branch": "main",
+                    "status": "failed",
+                    "commitSha": "cccccccccccccccc",
+                    "createdAt": "2026-07-06T10:00:00Z"
+                },
+                {
+                    "id": "dep_prebuilt",
+                    "projectId": "proj_1",
+                    "branch": "main",
+                    "status": "ready",
+                    "commitSha": "prebuilt",
+                    "createdAt": "2026-07-06T09:00:00Z"
+                },
+                {
+                    "id": "dep_older",
+                    "projectId": "proj_1",
+                    "branch": "main",
+                    "status": "ready",
+                    "commitSha": "deadbeefcafebabe",
+                    "createdAt": "2026-07-06T08:00:00Z"
+                }
+            ]
+        })
+    }
+
+    async fn rollback_bad_request_message(deployment_id: &str, deployments: Value) -> String {
+        let (base_url, server) = mock_siteflow_sequence(vec![deployments.to_string()]);
+        let state = siteflow_state(base_url);
+        let repo = sample_repo();
+        let deploy = sample_deploy(false);
+        state.store.create_repo(&repo).await.unwrap();
+        state.store.upsert_deploy(&deploy).await.unwrap();
+
+        let result = rollback_deploy(
+            State(state),
+            owner_headers_with_csrf("csrf-token"),
+            Path(("alice".to_string(), "site".to_string())),
+            Form(RollbackDeployForm {
+                csrf_token: "csrf-token".to_string(),
+                deployment_id: deployment_id.to_string(),
+            }),
+        )
+        .await;
+        let _requests = server.join().expect("mock siteflow server joined");
+
+        match result {
+            Err(AppError::BadRequest(message)) => message,
+            _ => panic!("expected bad request"),
+        }
     }
 
     #[tokio::test]
@@ -2552,6 +3170,138 @@ mod tests {
         assert!(lower_request.contains("authorization: bearer siteflow-token"));
         assert!(html.contains("Preview links require a password"));
         assert!(html.contains("/r/alice/site/settings/deploy/preview-password/clear"));
+    }
+
+    #[test]
+    fn deployment_history_marks_current_and_eligible_rows() {
+        let deployments = rollback_deployments();
+        let items = parse_deployment_history(&deployments);
+        let production_rows = production_deployment_history(&items, "main", 8);
+        let production_ids: Vec<&str> = production_rows
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        let current_id = current_production_deployment_id(&items, "main");
+        let by_id = |id: &str| items.iter().find(|item| item.id == id).unwrap();
+
+        assert_eq!(
+            production_ids,
+            vec!["dep_current", "dep_failed", "dep_prebuilt", "dep_older"]
+        );
+        assert_eq!(current_id.as_deref(), Some("dep_current"));
+        assert!(!deployment_eligible_for_rollback(
+            by_id("dep_current"),
+            current_id.as_deref()
+        ));
+        assert!(!deployment_eligible_for_rollback(
+            by_id("dep_failed"),
+            current_id.as_deref()
+        ));
+        assert!(!deployment_eligible_for_rollback(
+            by_id("dep_prebuilt"),
+            current_id.as_deref()
+        ));
+        assert!(deployment_eligible_for_rollback(
+            by_id("dep_older"),
+            current_id.as_deref()
+        ));
+    }
+
+    #[test]
+    fn rollback_idempotency_key_is_fresh_and_prefixed() {
+        let deploy = sample_deploy(false);
+        let key_one = rollback_deploy_hook_idempotency_key(&deploy, "deadbeef", 100);
+        let key_two = rollback_deploy_hook_idempotency_key(&deploy, "deadbeef", 101);
+
+        assert_eq!(key_one, "loom-rollback:rp_test:main:deadbeef:100");
+        assert_ne!(key_one, key_two);
+        assert!(key_two.starts_with("loom-rollback:rp_test:main:deadbeef:"));
+    }
+
+    #[test]
+    fn render_deploy_card_includes_deployment_history_with_rollback_button() {
+        let (base_url, server) = mock_siteflow_sequence(vec![
+            json!({ "previewProtectionEnabled": false }).to_string(),
+            rollback_deployments().to_string(),
+        ]);
+        let state = siteflow_state(base_url);
+        let repo = sample_repo();
+        let deploy = sample_deploy(false);
+
+        let html = render_deploy_card(&state, &repo, "csrf-token", Some(&deploy));
+        let requests = server.join().expect("mock siteflow server joined");
+
+        assert!(requests[0].starts_with("GET /api/projects/proj_1/settings "));
+        assert!(requests[1].starts_with("GET /api/deployments?projectId=proj_1 "));
+        assert!(html.contains("Deployment history"));
+        assert!(html.contains("deploy-history__current\">Current"));
+        assert!(html.contains("deadbee"));
+        assert!(html.contains("/r/alice/site/settings/deploy/rollback"));
+        assert!(html.contains(
+            r#"<button class="btn btn-secondary btn-sm" type="submit">Rollback</button>"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn rollback_deploy_rejects_unknown_deployment_id() {
+        let message = rollback_bad_request_message("dep_missing", rollback_deployments()).await;
+
+        assert_eq!(message, "Choose a deployment from the production history.");
+    }
+
+    #[tokio::test]
+    async fn rollback_deploy_rejects_current_production_deployment() {
+        let message = rollback_bad_request_message("dep_current", rollback_deployments()).await;
+
+        assert_eq!(
+            message,
+            "The current production deployment is already live."
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_deploy_rejects_non_production_branch_deployment() {
+        let message = rollback_bad_request_message("dep_feature", rollback_deployments()).await;
+
+        assert_eq!(message, "Choose a deployment from the production branch.");
+    }
+
+    #[tokio::test]
+    async fn rollback_deploy_triggers_old_commit_and_updates_bookkeeping() {
+        let (base_url, server) = mock_siteflow_sequence(vec![
+            rollback_deployments().to_string(),
+            json!({ "buildJobId": "build_rollback" }).to_string(),
+        ]);
+        let state = siteflow_state(base_url);
+        let repo = sample_repo();
+        let deploy = sample_deploy(false);
+        state.store.create_repo(&repo).await.unwrap();
+        state.store.upsert_deploy(&deploy).await.unwrap();
+
+        let response = rollback_deploy(
+            State(state.clone()),
+            owner_headers_with_csrf("csrf-token"),
+            Path(("alice".to_string(), "site".to_string())),
+            Form(RollbackDeployForm {
+                csrf_token: "csrf-token".to_string(),
+                deployment_id: "dep_older".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let requests = server.join().expect("mock siteflow server joined");
+        let stored = state.store.get_deploy(&repo.id).await.unwrap().unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::FOUND);
+        assert!(requests[0].starts_with("GET /api/deployments?projectId=proj_1 "));
+        assert!(requests[1].starts_with("POST /api/deploy-hooks/hook-token/trigger "));
+        assert!(requests[1].contains(r#""branch":"main""#));
+        assert!(requests[1].contains(r#""commitSha":"deadbeefcafebabe""#));
+        assert!(requests[1].contains(r#""commitMessage":"Rollback to deadbee""#));
+        assert!(requests[1]
+            .contains(r#""idempotencyKey":"loom-rollback:rp_test:main:deadbeefcafebabe:"#));
+        assert_eq!(stored.last_build_job_id, "build_rollback");
+        assert_eq!(stored.last_deployed_sha, "deadbeefcafebabe");
     }
 
     #[tokio::test]

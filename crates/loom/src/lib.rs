@@ -151,6 +151,10 @@ pub fn app(state: AppState) -> Router {
             post(handlers::deploy::update_settings),
         )
         .route(
+            "/r/{owner}/{name}/settings/deploy/rollback",
+            post(handlers::deploy::rollback_deploy),
+        )
+        .route(
             "/r/{owner}/{name}/settings/deploy/domains",
             post(handlers::deploy::add_domain),
         )
