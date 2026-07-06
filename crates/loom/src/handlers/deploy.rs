@@ -30,11 +30,18 @@ const DEPLOY_ID_LEN: usize = 16;
 const SITEFLOW_TIMEOUT_SECS: u64 = 5;
 const PR_PREVIEW_POLL_ATTEMPTS: usize = 40;
 const PR_PREVIEW_POLL_SECS: u64 = 5;
+const AGENT_PREVIEW_BRANCH_PREFIX: &str = "agent/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewResult {
     build_job_id: String,
     commit_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewCommentTarget {
+    pull_id: String,
+    pull_number: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,6 +388,7 @@ pub fn emit_pr_previews(state: &AppState, repo: &Repo, actor_sub: &str, push_bod
                     continue;
                 }
             };
+            let has_open_pull = !pulls.is_empty();
             for pull in pulls {
                 if pull.is_draft || !push_body_touches_branch(&push_body, &pull.head) {
                     continue;
@@ -392,6 +400,23 @@ pub fn emit_pr_previews(state: &AppState, repo: &Repo, actor_sub: &str, push_bod
                         repo = repo.id,
                         pull = pull.number,
                         "preview deploy failed"
+                    );
+                }
+            }
+            if should_preview_pushed_agent_branch(
+                &head_branch,
+                &deploy.production_branch,
+                has_open_pull,
+            ) {
+                if let Err(e) =
+                    start_agent_branch_preview(&state, &repo, &deploy, &actor_sub, &head_branch)
+                        .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        repo = repo.id,
+                        branch = head_branch,
+                        "agent branch preview deploy failed"
                     );
                 }
             }
@@ -765,30 +790,64 @@ async fn start_pull_preview(
     actor_sub: &str,
     pull: &Pull,
 ) -> Result<(), AppError> {
-    if pull.head == deploy.production_branch {
+    start_branch_preview(
+        state,
+        repo,
+        deploy,
+        actor_sub,
+        &pull.head,
+        Some(PreviewCommentTarget {
+            pull_id: pull.id.clone(),
+            pull_number: pull.number,
+        }),
+    )
+    .await
+}
+
+async fn start_agent_branch_preview(
+    state: &AppState,
+    repo: &Repo,
+    deploy: &RepoDeploy,
+    actor_sub: &str,
+    branch: &str,
+) -> Result<(), AppError> {
+    start_branch_preview(state, repo, deploy, actor_sub, branch, None).await
+}
+
+async fn start_branch_preview(
+    state: &AppState,
+    repo: &Repo,
+    deploy: &RepoDeploy,
+    actor_sub: &str,
+    branch: &str,
+    comment: Option<PreviewCommentTarget>,
+) -> Result<(), AppError> {
+    if branch == deploy.production_branch {
         return Ok(());
     }
-    let Some(submitted) = submit_preview_deploy(state, repo, deploy, &pull.head, actor_sub).await?
+    let Some(submitted) = submit_preview_deploy(state, repo, deploy, branch, actor_sub).await?
     else {
         return Ok(());
     };
-    let body = preview_comment_body("building", "", &submitted.commit_sha);
-    state
-        .store
-        .upsert_pull_preview_comment(
-            &pull.id,
-            &submitted.build_job_id,
-            "building",
-            "",
-            &submitted.commit_sha,
-            &body,
-            now_secs(),
-        )
-        .await?;
+    if let Some(target) = comment.as_ref() {
+        let body = preview_comment_body("building", "", &submitted.commit_sha);
+        state
+            .store
+            .upsert_pull_preview_comment(
+                &target.pull_id,
+                &submitted.build_job_id,
+                "building",
+                "",
+                &submitted.commit_sha,
+                &body,
+                now_secs(),
+            )
+            .await?;
+    }
 
     let state = state.clone();
     let repo = repo.clone();
-    let pull = pull.clone();
+    let branch = branch.to_string();
     let mut deploy = deploy.clone();
     deploy.last_build_job_id = submitted.build_job_id.clone();
     let build_job_id = submitted.build_job_id;
@@ -802,42 +861,46 @@ async fn start_pull_preview(
             match poll_preview_status(&state.config, &deploy, &commit_sha).await {
                 Some((status, preview_url)) => {
                     let preview_url = preview_url.unwrap_or_default();
-                    let body = preview_comment_body(&status, &preview_url, &commit_sha);
-                    match state
-                        .store
-                        .update_pull_preview_comment_status(
-                            &pull.id,
-                            &build_job_id,
-                            &status,
-                            &preview_url,
-                            &commit_sha,
-                            &body,
-                            now_secs(),
-                        )
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            owned = false;
-                            break;
+                    if let Some(target) = comment.as_ref() {
+                        let body = preview_comment_body(&status, &preview_url, &commit_sha);
+                        match state
+                            .store
+                            .update_pull_preview_comment_status(
+                                &target.pull_id,
+                                &build_job_id,
+                                &status,
+                                &preview_url,
+                                &commit_sha,
+                                &body,
+                                now_secs(),
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                owned = false;
+                                break;
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                repo = repo.id,
+                                pull = target.pull_number,
+                                "preview bot comment update failed"
+                            ),
                         }
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            repo = repo.id,
-                            pull = pull.number,
-                            "preview bot comment update failed"
-                        ),
                     }
                     if is_terminal_preview_status(&status) {
                         if should_emit_deployment_ready(&status, &preview_url) {
+                            let pull_number =
+                                comment.as_ref().map_or(0, |target| target.pull_number);
                             webhooks::emit_deployment_ready(
                                 &state,
                                 &repo,
                                 &repo.owner_sub,
-                                &pull.head,
+                                &branch,
                                 &preview_url,
                                 &commit_sha,
-                                pull.number,
+                                pull_number,
                             );
                         }
                         terminal_seen = true;
@@ -847,7 +910,8 @@ async fn start_pull_preview(
                 None => {
                     tracing::warn!(
                         repo = repo.id,
-                        pull = pull.number,
+                        pull = comment.as_ref().map_or(0, |target| target.pull_number),
+                        branch = branch,
                         build_job_id = build_job_id,
                         attempt = attempt + 1,
                         "preview deploy status poll returned no match"
@@ -856,14 +920,24 @@ async fn start_pull_preview(
             }
         }
         if owned && !terminal_seen {
-            if let Err(e) =
-                mark_preview_timed_out(&state, &repo, &pull, &build_job_id, &commit_sha).await
-            {
+            if let Some(target) = comment.as_ref() {
+                if let Err(e) =
+                    mark_preview_comment_timed_out(&state, &repo, target, &build_job_id, &commit_sha)
+                        .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        repo = repo.id,
+                        pull = target.pull_number,
+                        "preview bot timeout update failed"
+                    );
+                }
+            } else {
                 tracing::warn!(
-                    error = %e,
                     repo = repo.id,
-                    pull = pull.number,
-                    "preview bot timeout update failed"
+                    branch = branch,
+                    build_job_id = build_job_id,
+                    "preview deploy status poll timed out"
                 );
             }
         }
@@ -909,6 +983,7 @@ async fn submit_preview_deploy(
     }))
 }
 
+#[cfg(test)]
 async fn mark_preview_timed_out(
     state: &AppState,
     repo: &Repo,
@@ -916,9 +991,29 @@ async fn mark_preview_timed_out(
     build_job_id: &str,
     commit_sha: &str,
 ) -> Result<bool, AppError> {
+    mark_preview_comment_timed_out(
+        state,
+        repo,
+        &PreviewCommentTarget {
+            pull_id: pull.id.clone(),
+            pull_number: pull.number,
+        },
+        build_job_id,
+        commit_sha,
+    )
+    .await
+}
+
+async fn mark_preview_comment_timed_out(
+    state: &AppState,
+    repo: &Repo,
+    target: &PreviewCommentTarget,
+    build_job_id: &str,
+    commit_sha: &str,
+) -> Result<bool, AppError> {
     tracing::warn!(
         repo = repo.id,
-        pull = pull.number,
+        pull = target.pull_number,
         build_job_id = build_job_id,
         "preview deploy status poll timed out"
     );
@@ -926,7 +1021,7 @@ async fn mark_preview_timed_out(
     Ok(state
         .store
         .update_pull_preview_comment_status(
-            &pull.id,
+            &target.pull_id,
             build_job_id,
             "failed",
             "",
@@ -1815,6 +1910,16 @@ fn push_body_touches_branch(body: &[u8], branch: &str) -> bool {
     String::from_utf8_lossy(body).contains(&needle)
 }
 
+fn should_preview_pushed_agent_branch(
+    branch: &str,
+    production_branch: &str,
+    has_open_pull: bool,
+) -> bool {
+    branch.starts_with(AGENT_PREVIEW_BRANCH_PREFIX)
+        && branch != production_branch
+        && !has_open_pull
+}
+
 fn push_body_head_branches(body: &[u8]) -> Vec<String> {
     let mut branches = Vec::new();
     for segment in String::from_utf8_lossy(body).split("refs/heads/").skip(1) {
@@ -2223,6 +2328,32 @@ mod tests {
             );
         }
         assert!(!should_emit_deployment_ready("ready", ""));
+    }
+
+    #[test]
+    fn pushed_agent_branch_preview_selection_matches_rules() {
+        let push_body = b"old new refs/heads/agent/multica/issue-123\0old new refs/heads/feature/no-pr\0";
+        let selected: Vec<String> = push_body_head_branches(push_body)
+            .into_iter()
+            .filter(|branch| should_preview_pushed_agent_branch(branch, "main", false))
+            .collect();
+
+        assert_eq!(selected, vec!["agent/multica/issue-123".to_string()]);
+        assert!(!should_preview_pushed_agent_branch(
+            "feature/no-pr",
+            "main",
+            false
+        ));
+        assert!(!should_preview_pushed_agent_branch(
+            "agent/multica/issue-123",
+            "agent/multica/issue-123",
+            false
+        ));
+        assert!(!should_preview_pushed_agent_branch(
+            "agent/multica/issue-123",
+            "main",
+            true
+        ));
     }
 
     #[test]
