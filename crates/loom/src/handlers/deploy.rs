@@ -174,7 +174,16 @@ pub async fn update_settings(
     deploy = state.store.upsert_deploy(&deploy).await?;
 
     if form.action == "redeploy" {
-        deploy = submit_deploy(&state, &repo, &who.subject, deploy).await?;
+        // An explicit Redeploy must rebuild even when the tip sha was already
+        // built once — the stable key would dedupe to the old build (no-op).
+        deploy = submit_deploy_as(
+            &state,
+            &repo,
+            &who.subject,
+            deploy,
+            DeploySubmitKind::Redeploy,
+        )
+        .await?;
         tracing::info!(
             repo = repo.id,
             actor = who.subject,
@@ -1126,11 +1135,31 @@ fn new_deploy(state: &AppState, repo: &Repo, now: i64) -> RepoDeploy {
     }
 }
 
+/// How a deploy submission picks its deploy-hook idempotency key. SiteFlow
+/// derives build ids from the key, so a reused key dedupes to the OLD build
+/// and nothing rebuilds: push/connect deploys want that (webhook retries),
+/// an explicit user Redeploy must always trigger a fresh build.
+#[derive(Clone, Copy, PartialEq)]
+enum DeploySubmitKind {
+    Standard,
+    Redeploy,
+}
+
 async fn submit_deploy(
     state: &AppState,
     repo: &Repo,
     actor_sub: &str,
+    deploy: RepoDeploy,
+) -> Result<RepoDeploy, AppError> {
+    submit_deploy_as(state, repo, actor_sub, deploy, DeploySubmitKind::Standard).await
+}
+
+async fn submit_deploy_as(
+    state: &AppState,
+    repo: &Repo,
+    actor_sub: &str,
     mut deploy: RepoDeploy,
+    kind: DeploySubmitKind,
 ) -> Result<RepoDeploy, AppError> {
     let (commit_sha, detail) =
         resolve_deploy_commit(state, repo, &deploy.production_branch).await?;
@@ -1177,13 +1206,21 @@ async fn submit_deploy(
         .await;
     }
 
-    let build_job_id = trigger_deploy_hook(
+    let idempotency_key = match kind {
+        DeploySubmitKind::Standard => deploy_hook_idempotency_key(&deploy, &commit_sha),
+        DeploySubmitKind::Redeploy => {
+            redeploy_deploy_hook_idempotency_key(&deploy, &commit_sha, now_secs())
+        }
+    };
+    let build_job_id = trigger_deploy_hook_with_idempotency_key(
         &client,
         &state.config,
         &deploy,
+        &deploy.production_branch.clone(),
         &commit_sha,
         &detail,
         actor_sub,
+        &idempotency_key,
     )
     .await?;
     deploy.last_build_job_id = build_job_id;
@@ -1569,28 +1606,6 @@ async fn create_deploy_hook(
     Ok((token, hook_url))
 }
 
-async fn trigger_deploy_hook(
-    client: &reqwest::Client,
-    config: &Config,
-    deploy: &RepoDeploy,
-    commit_sha: &str,
-    detail: &CommitDetail,
-    actor_sub: &str,
-) -> Result<String, AppError> {
-    let idempotency_key = deploy_hook_idempotency_key(deploy, commit_sha);
-    trigger_deploy_hook_with_idempotency_key(
-        client,
-        config,
-        deploy,
-        &deploy.production_branch,
-        commit_sha,
-        detail,
-        actor_sub,
-        &idempotency_key,
-    )
-    .await
-}
-
 async fn trigger_rollback_deploy_hook(
     client: &reqwest::Client,
     config: &Config,
@@ -1627,6 +1642,17 @@ fn rollback_deploy_hook_idempotency_key(
 ) -> String {
     format!(
         "loom-rollback:{}:{}:{}:{}",
+        deploy.repo_id, deploy.production_branch, commit_sha, unix_seconds
+    )
+}
+
+fn redeploy_deploy_hook_idempotency_key(
+    deploy: &RepoDeploy,
+    commit_sha: &str,
+    unix_seconds: i64,
+) -> String {
+    format!(
+        "loom-redeploy:{}:{}:{}:{}",
         deploy.repo_id, deploy.production_branch, commit_sha, unix_seconds
     )
 }
@@ -3216,6 +3242,20 @@ mod tests {
         assert_eq!(key_one, "loom-rollback:rp_test:main:deadbeef:100");
         assert_ne!(key_one, key_two);
         assert!(key_two.starts_with("loom-rollback:rp_test:main:deadbeef:"));
+    }
+
+    #[test]
+    fn redeploy_idempotency_key_is_fresh_while_standard_key_is_stable() {
+        let deploy = sample_deploy(false);
+        let redo_one = redeploy_deploy_hook_idempotency_key(&deploy, "deadbeef", 100);
+        let redo_two = redeploy_deploy_hook_idempotency_key(&deploy, "deadbeef", 101);
+        let standard = deploy_hook_idempotency_key(&deploy, "deadbeef");
+
+        assert_eq!(redo_one, "loom-redeploy:rp_test:main:deadbeef:100");
+        assert_ne!(redo_one, redo_two);
+        // Push/connect deploys keep deduping on the stable key.
+        assert_eq!(standard, "loom:rp_test:main:deadbeef");
+        assert_ne!(redo_one, standard);
     }
 
     #[test]

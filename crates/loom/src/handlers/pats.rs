@@ -26,7 +26,11 @@ const PAT_ID_LEN: usize = 16;
 pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let who = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
-    let pats = state.store.list_pats(&who.subject).await.unwrap_or_default();
+    let pats = state
+        .store
+        .list_pats(&who.subject)
+        .await
+        .unwrap_or_default();
     let body = render_pats(&who, &csrf, &pats, None, None);
     html_with_csrf(StatusCode::OK, page_shell(&who, &body), &csrf)
 }
@@ -58,8 +62,18 @@ pub async fn create(
     let name = form.name.trim();
     let csrf = auth::new_csrf_token();
     if name.is_empty() {
-        let pats = state.store.list_pats(&who.subject).await.unwrap_or_default();
-        let body = render_pats(&who, &csrf, &pats, Some("Token name cannot be empty."), None);
+        let pats = state
+            .store
+            .list_pats(&who.subject)
+            .await
+            .unwrap_or_default();
+        let body = render_pats(
+            &who,
+            &csrf,
+            &pats,
+            Some("Token name cannot be empty."),
+            None,
+        );
         return Ok(html_with_csrf(
             StatusCode::BAD_REQUEST,
             page_shell(&who, &body),
@@ -77,11 +91,23 @@ pub async fn create(
         created_at: now_secs(),
     };
     state.store.create_pat(&pat).await?;
-    tracing::info!(owner = who.subject, pat = pat.id, "personal access token minted");
+    tracing::info!(
+        owner = who.subject,
+        pat = pat.id,
+        "personal access token minted"
+    );
 
-    let pats = state.store.list_pats(&who.subject).await.unwrap_or_default();
+    let pats = state
+        .store
+        .list_pats(&who.subject)
+        .await
+        .unwrap_or_default();
     let body = render_pats(&who, &csrf, &pats, None, Some(&secret));
-    Ok(html_with_csrf(StatusCode::OK, page_shell(&who, &body), &csrf))
+    Ok(html_with_csrf(
+        StatusCode::OK,
+        page_shell(&who, &body),
+        &csrf,
+    ))
 }
 
 // ===========================================================================
