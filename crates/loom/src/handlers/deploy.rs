@@ -488,6 +488,14 @@ pub(crate) fn render_deploy_card(
         .filter(|s| !s.is_empty())
         .unwrap_or("none");
     let status = deploy.map(deploy_status_label).unwrap_or("not_configured");
+    let vanity_base = normalized_siteflow_base_domain(&state.config.siteflow_base_domain)
+        .unwrap_or_else(|| {
+            state
+                .config
+                .siteflow_base_domain
+                .trim()
+                .to_ascii_lowercase()
+        });
     let database = deploy
         .map(|d| d.cistern_slug.as_str())
         .filter(|s| !s.is_empty())
@@ -551,7 +559,7 @@ pub(crate) fn render_deploy_card(
     </form>
     <div class="deploy-domains">
       <h3 class="deploy-domains__title">Custom domains</h3>
-      <p class="hint hint--muted">Add a domain you control and CNAME it to the gateway. Once verified it auto-follows production on every deploy.</p>
+      <p class="hint hint--muted">Use <code>&lt;name&gt;.{vanity_base}</code> for an instant vanity URL, or add a domain you control and CNAME it to the gateway.</p>
       <form class="deploy-domain-add" method="post" action="/r/{owner}/{name}/settings/deploy/domains">
         <input type="hidden" name="csrf_token" value="{csrf}">
         <div class="field field--inline">
@@ -584,6 +592,7 @@ pub(crate) fn render_deploy_card(
         database = database,
         branch = esc(production_branch),
         output = esc(output_directory),
+        vanity_base = esc(&vanity_base),
         auto_checked = auto_checked,
         disabled = disabled,
     )
@@ -1553,7 +1562,9 @@ fn normalize_framework(raw: &str) -> Result<String, AppError> {
 
 fn clean_custom_domain_hostname(raw: &str, siteflow_base_domain: &str) -> Result<String, AppError> {
     let hostname = clean_domain_hostname(raw)?;
-    if has_siteflow_base_suffix(&hostname, siteflow_base_domain) {
+    if has_siteflow_base_suffix(&hostname, siteflow_base_domain)
+        && !is_siteflow_vanity_subdomain(&hostname, siteflow_base_domain)
+    {
         return Err(AppError::BadRequest(
             "Use a domain outside the SiteFlow base domain.".to_string(),
         ));
@@ -1569,14 +1580,7 @@ fn clean_domain_hostname(raw: &str) -> Result<String, AppError> {
         ));
     }
     for label in hostname.split('.') {
-        if label.is_empty()
-            || label.len() > 63
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
+        if !is_dns_label(label) {
             return Err(AppError::BadRequest(
                 "Custom domain must use DNS-safe labels.".to_string(),
             ));
@@ -1585,11 +1589,32 @@ fn clean_domain_hostname(raw: &str) -> Result<String, AppError> {
     Ok(hostname)
 }
 
+fn is_siteflow_vanity_subdomain(hostname: &str, siteflow_base_domain: &str) -> bool {
+    let Some(base) = normalized_siteflow_base_domain(siteflow_base_domain) else {
+        return false;
+    };
+    let suffix = format!(".{base}");
+    let Some(label) = hostname.strip_suffix(&suffix) else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.') && is_dns_label(label)
+}
+
 fn has_siteflow_base_suffix(hostname: &str, siteflow_base_domain: &str) -> bool {
     let Some(base) = normalized_siteflow_base_domain(siteflow_base_domain) else {
         return false;
     };
     hostname == base || hostname.ends_with(&format!(".{base}"))
+}
+
+fn is_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn normalized_siteflow_base_domain(raw: &str) -> Option<String> {
@@ -2252,11 +2277,24 @@ mod tests {
     }
 
     #[test]
-    fn custom_domain_rejects_siteflow_base_domain_suffix() {
-        assert!(
-            clean_custom_domain_hostname("app.siteflow.w33d.xyz", "siteflow.w33d.xyz").is_err()
+    fn custom_domain_allows_single_label_siteflow_vanity_subdomain() {
+        assert_eq!(
+            clean_custom_domain_hostname("App.Siteflow.W33D.XYZ", "siteflow.w33d.xyz").unwrap(),
+            "app.siteflow.w33d.xyz"
         );
+        assert_eq!(
+            clean_custom_domain_hostname("app.siteflow.w33d.xyz", "https://siteflow.w33d.xyz/")
+                .unwrap(),
+            "app.siteflow.w33d.xyz"
+        );
+    }
+
+    #[test]
+    fn custom_domain_rejects_bare_and_multi_label_siteflow_base_domain() {
         assert!(clean_custom_domain_hostname("siteflow.w33d.xyz", "siteflow.w33d.xyz").is_err());
+        assert!(
+            clean_custom_domain_hostname("a.b.siteflow.w33d.xyz", "siteflow.w33d.xyz").is_err()
+        );
         assert!(
             clean_custom_domain_hostname("app.example.com", "https://siteflow.w33d.xyz/").is_ok()
         );
