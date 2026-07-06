@@ -86,6 +86,10 @@ pub fn app(state: AppState) -> Router {
             get(handlers::deploy::status_json),
         )
         .route(
+            "/r/{owner}/{name}/deploy/domains",
+            get(handlers::deploy::domains_json),
+        )
+        .route(
             "/r/{owner}/{name}/search",
             get(handlers::repos::code_search),
         )
@@ -141,6 +145,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/r/{owner}/{name}/settings/deploy",
             post(handlers::deploy::update_settings),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/deploy/domains",
+            post(handlers::deploy::add_domain),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/deploy/domains/remove",
+            post(handlers::deploy::remove_domain),
         )
         .route(
             "/r/{owner}/{name}/settings/labels",

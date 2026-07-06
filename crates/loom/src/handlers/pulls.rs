@@ -27,13 +27,13 @@ use crate::handlers::repos::{
     can_write_repo, load_visible_repo, render_repo_header, validate_branch_name,
 };
 use crate::handlers::{
-    accepts_json, esc, fmt_rel, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
-    reaction_summaries_json, redirect, render_reactions, short_oid, state_icon,
+    accepts_json, deploy, esc, fmt_rel, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
+    reaction_summaries_json, redirect, render_reactions, short_oid, state_icon, PREVIEW_BOT_SUB,
     REACTION_TARGET_COMMENT, REACTION_TARGET_PULL,
 };
 use crate::model::{
-    CommitStatus, Label, Milestone, PrFileViewed, PrThreadResolved, Pull, PullReview,
-    PullReviewComment, ReactionSummary, Repo,
+    CommitStatus, Label, Milestone, PrFileViewed, PrThreadResolved, Pull, PullPreviewComment,
+    PullReview, PullReviewComment, ReactionSummary, Repo,
 };
 use crate::webhooks;
 use crate::{now_secs, random_alnum, AppState};
@@ -581,6 +581,9 @@ pub async fn create(
         &reviewer,
     );
     webhooks::emit_pull_request(&state, &repo, "opened", &who.subject, &pull, &pull.state);
+    if !pull.is_draft {
+        deploy::emit_pr_preview(&state, &repo, &who.subject, &pull);
+    }
 
     // Audit: no dedicated AuditSink in this crate — tracing is the audit surface (as with repo
     // create / issue open / PAT mint).
@@ -2535,6 +2538,11 @@ async fn render_detail(
     let repo_writer = can_write_repo(state, repo, who, headers).await?;
     let can_gate_user = can_gate(pull, who, repo_writer);
     let can_review_user = can_review(pull, who, repo_writer);
+    let preview_comment = state.store.get_pull_preview_comment(&pull.id).await?;
+    let preview_bot_card = preview_comment
+        .as_ref()
+        .map(render_preview_bot_card)
+        .unwrap_or_default();
     let reviews_card = render_reviews_card(
         repo,
         reviews,
@@ -2737,6 +2745,7 @@ async fn render_detail(
       <div class="comment-box__meta"><b>{author}</b> <span>opened this pull request</span> <span title="{created_abs}">{created_rel}</span></div>
       <div class="comment-box__body">{body_html}{pull_reactions}</div>
     </section>
+    {preview_bot_card}
     {commits_card}
   </div>
   <aside class="side">{sidebar}</aside>
@@ -2756,6 +2765,7 @@ async fn render_detail(
         author = esc(&pull.author_sub),
         body_html = body_html,
         pull_reactions = pull_reactions,
+        preview_bot_card = preview_bot_card,
         commits_card = commits_card,
         reviews_card = reviews_card,
         sidebar = sidebar,
@@ -3282,6 +3292,64 @@ fn owner_group_text(owners: &[String]) -> String {
         .map(|owner| format!("@{}", owner.trim_start_matches('@')))
         .collect::<Vec<_>>()
         .join(" or ")
+}
+
+fn render_preview_bot_card(comment: &PullPreviewComment) -> String {
+    let (status_class, status_label) = preview_bot_status(&comment.deployment_status);
+    let preview = if comment.preview_url.trim().is_empty() {
+        "<span class=\"preview-bot-empty\">Preview URL pending</span>".to_string()
+    } else {
+        let url = esc(comment.preview_url.trim());
+        format!(
+            r##"<a class="preview-bot-link" href="{url}" target="_blank" rel="noopener">{url}</a>"##
+        )
+    };
+    let commit = if comment.commit_sha.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        esc(&short_oid(&comment.commit_sha))
+    };
+    let body = if comment.body.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"preview-bot-body muted\">{}</p>",
+            esc(&comment.body)
+        )
+    };
+    let author = preview_bot_author_label(PREVIEW_BOT_SUB);
+    format!(
+        r##"<section class="card preview-bot-card">
+  <div class="card__head card__head--slim"><span>{author}</span><span class="preview-bot-status preview-bot-status--{status_class}">{status_label}</span></div>
+  <div class="card__body">
+    <div class="preview-bot-row"><span>Preview</span>{preview}</div>
+    <div class="preview-bot-row"><span>Commit</span><code>{commit}</code></div>
+    {body}
+  </div>
+</section>"##,
+        author = author,
+        status_class = status_class,
+        status_label = status_label,
+        preview = preview,
+        commit = commit,
+        body = body,
+    )
+}
+
+fn preview_bot_author_label(subject: &str) -> String {
+    if subject == PREVIEW_BOT_SUB {
+        "Preview Bot".to_string()
+    } else {
+        esc(subject)
+    }
+}
+
+fn preview_bot_status(status: &str) -> (&'static str, &'static str) {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "ready" => ("ready", "Ready"),
+        "error" | "failed" | "canceled" => ("failed", "Failed"),
+        _ => ("building", "Building"),
+    }
 }
 
 fn render_reviews_card(
@@ -4537,6 +4605,25 @@ mod tests {
         repo.require_approval = false;
         repo.required_approvals = 0;
         assert_eq!(effective_required_approvals(&repo), 0);
+    }
+
+    #[test]
+    fn preview_bot_card_shows_bot_label_link_and_short_sha() {
+        let comment = PullPreviewComment {
+            pull_id: "pl1".to_string(),
+            build_job_id: "build_1".to_string(),
+            deployment_status: "ready".to_string(),
+            preview_url: "https://preview.siteflow.test".to_string(),
+            commit_sha: "deadbeefcafebabe".to_string(),
+            body: "Preview deployment Ready for deadbeef.".to_string(),
+            updated_at: 10,
+        };
+        let html = render_preview_bot_card(&comment);
+        assert!(html.contains("Preview Bot"));
+        assert!(html.contains("preview-bot-status--ready"));
+        assert!(html.contains("href=\"https://preview.siteflow.test\""));
+        assert!(html.contains("target=\"_blank\" rel=\"noopener\""));
+        assert!(html.contains("<code>deadbeef</code>"));
     }
 
     #[test]

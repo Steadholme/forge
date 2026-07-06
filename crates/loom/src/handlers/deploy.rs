@@ -14,18 +14,27 @@ use axum::{Form, Json};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::time::sleep;
 
 use crate::auth::{self, Identity};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::gitops::CommitDetail;
 use crate::handlers::repos::{can_admin_repo, load_visible_repo, validate_branch_name};
-use crate::handlers::{esc, redirect};
-use crate::model::{Repo, RepoDeploy};
+use crate::handlers::{esc, redirect, short_oid};
+use crate::model::{Pull, Repo, RepoDeploy};
 use crate::{now_secs, random_alnum, AppState};
 
 const DEPLOY_ID_LEN: usize = 16;
 const SITEFLOW_TIMEOUT_SECS: u64 = 5;
+const PR_PREVIEW_POLL_ATTEMPTS: usize = 40;
+const PR_PREVIEW_POLL_SECS: u64 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewResult {
+    build_job_id: String,
+    commit_sha: String,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DeployForm {
@@ -51,6 +60,14 @@ pub struct DeploySettingsForm {
     pub action: String,
     #[serde(default)]
     pub confirm_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeployDomainForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub hostname: String,
 }
 
 /// POST /r/{owner}/{name}/deploy
@@ -137,6 +154,98 @@ pub async fn update_settings(
     Ok(redirect(&format!("/r/{owner}/{name}/settings")))
 }
 
+/// POST /r/{owner}/{name}/settings/deploy/domains
+pub async fn add_domain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<DeployDomainForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    require_deploy_admin(&state, &repo, &who, &headers).await?;
+    ensure_public_repo(&repo)?;
+    let deploy = require_siteflow_deploy(&state, &repo).await?;
+    let hostname =
+        clean_custom_domain_hostname(&form.hostname, &state.config.siteflow_base_domain)?;
+
+    let client = siteflow_client()?;
+    let path = format!(
+        "/api/projects/{}/domains",
+        percent_encode(&deploy.siteflow_project_id)
+    );
+    let body = json!({ "hostname": hostname });
+    siteflow_post(&client, &state.config, &path, &body, true).await?;
+    tracing::info!(
+        repo = repo.id,
+        siteflow_project_id = deploy.siteflow_project_id,
+        hostname = hostname,
+        "deploy domain added"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+/// POST /r/{owner}/{name}/settings/deploy/domains/remove
+pub async fn remove_domain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<DeployDomainForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    require_deploy_admin(&state, &repo, &who, &headers).await?;
+    ensure_public_repo(&repo)?;
+    let deploy = require_siteflow_deploy(&state, &repo).await?;
+    let hostname = clean_domain_hostname(&form.hostname)?;
+
+    let client = siteflow_client()?;
+    let path = format!(
+        "/api/projects/{}/domains/{}",
+        percent_encode(&deploy.siteflow_project_id),
+        percent_encode(&hostname)
+    );
+    siteflow_delete(&client, &state.config, &path).await?;
+    tracing::info!(
+        repo = repo.id,
+        siteflow_project_id = deploy.siteflow_project_id,
+        hostname = hostname,
+        "deploy domain removed"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+/// GET /r/{owner}/{name}/deploy/domains
+pub async fn domains_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    require_deploy_admin(&state, &repo, &who, &headers).await?;
+    ensure_public_repo(&repo)?;
+    let deploy = require_siteflow_deploy(&state, &repo).await?;
+
+    let client = siteflow_client()?;
+    let path = format!(
+        "/api/projects/{}",
+        percent_encode(&deploy.siteflow_project_id)
+    );
+    let value = siteflow_get(&client, &state.config, &path).await?;
+    Ok(Json(json!({ "domains": siteflow_domains(&value) })).into_response())
+}
+
 /// GET /r/{owner}/{name}/deploy/status
 pub async fn status_json(
     State(state): State<AppState>,
@@ -146,11 +255,19 @@ pub async fn status_json(
     let who = auth::identity(&headers);
     let repo = load_visible_repo(&state, &who, &owner, &name).await?;
     require_deploy_admin(&state, &repo, &who, &headers).await?;
-    let Some(deploy) = state.store.get_deploy(&repo.id).await? else {
+    let Some(mut deploy) = state.store.get_deploy(&repo.id).await? else {
         return Ok(Json(json!({ "configured": false })).into_response());
     };
 
-    let siteflow_status = poll_siteflow_status(&state.config, &deploy).await;
+    let (siteflow_status, siteflow_preview_url) = poll_siteflow_status(&state.config, &deploy)
+        .await
+        .map_or((None, None), |(status, preview_url)| {
+            (Some(status), preview_url)
+        });
+    if let Some(preview_url) = siteflow_preview_url.filter(|url| url != &deploy.preview_url) {
+        deploy.preview_url = preview_url;
+        deploy = state.store.upsert_deploy(&deploy).await?;
+    }
     let status = siteflow_status
         .as_deref()
         .unwrap_or_else(|| deploy_status_label(&deploy));
@@ -195,6 +312,88 @@ pub fn emit_auto_deploy(state: &AppState, repo: &Repo, actor_sub: &str, push_bod
                 "auto deploy submitted"
             ),
             Err(e) => tracing::warn!(error = %e, repo = repo.id, "auto deploy failed"),
+        }
+    });
+}
+
+pub fn emit_pr_preview(state: &AppState, repo: &Repo, actor_sub: &str, pull: &Pull) {
+    if repo.is_private || pull.is_draft || !siteflow_preview_configured(&state.config) {
+        return;
+    }
+    let state = state.clone();
+    let repo = repo.clone();
+    let pull = pull.clone();
+    let actor_sub = actor_sub.to_string();
+
+    tokio::spawn(async move {
+        let deploy = match preview_deploy_for_repo(&state, &repo).await {
+            Ok(Some(deploy)) => deploy,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, repo = repo.id, "preview deploy lookup failed");
+                return;
+            }
+        };
+        if let Err(e) = start_pull_preview(&state, &repo, &deploy, &actor_sub, &pull).await {
+            tracing::warn!(
+                error = %e,
+                repo = repo.id,
+                pull = pull.number,
+                "preview deploy failed"
+            );
+        }
+    });
+}
+
+pub fn emit_pr_previews(state: &AppState, repo: &Repo, actor_sub: &str, push_body: &[u8]) {
+    if repo.is_private || !siteflow_preview_configured(&state.config) {
+        return;
+    }
+    let state = state.clone();
+    let repo = repo.clone();
+    let actor_sub = actor_sub.to_string();
+    let push_body = push_body.to_vec();
+
+    tokio::spawn(async move {
+        let deploy = match preview_deploy_for_repo(&state, &repo).await {
+            Ok(Some(deploy)) => deploy,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, repo = repo.id, "preview deploy lookup failed");
+                return;
+            }
+        };
+        for head_branch in push_body_head_branches(&push_body) {
+            let pulls = match state
+                .store
+                .list_open_pulls_by_head(&repo.id, &head_branch)
+                .await
+            {
+                Ok(pulls) => pulls,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        repo = repo.id,
+                        branch = head_branch,
+                        "open pull lookup failed for preview deploy"
+                    );
+                    continue;
+                }
+            };
+            for pull in pulls {
+                if pull.is_draft || !push_body_touches_branch(&push_body, &pull.head) {
+                    continue;
+                }
+                if let Err(e) = start_pull_preview(&state, &repo, &deploy, &actor_sub, &pull).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        repo = repo.id,
+                        pull = pull.number,
+                        "preview deploy failed"
+                    );
+                }
+            }
         }
     });
 }
@@ -266,7 +465,12 @@ pub(crate) fn render_deploy_card(
     let database = deploy
         .map(|d| d.cistern_slug.as_str())
         .filter(|s| !s.is_empty())
-        .map(|slug| format!("<div class=\"deploy-database\">Database: <code>{}</code></div>", esc(slug)))
+        .map(|slug| {
+            let s = esc(slug);
+            format!(
+                "<div class=\"deploy-database\">Database <code>{s}</code> · <a class=\"deploy-db-link\" href=\"https://cistern.w33d.xyz/p/{s}\" target=\"_blank\" rel=\"noopener\">Manage database →</a></div>"
+            )
+        })
         .unwrap_or_default();
     let private_note = if repo.is_private {
         "<p class=\"hint hint--muted\">Deploy supports public repositories only.</p>"
@@ -275,6 +479,8 @@ pub(crate) fn render_deploy_card(
     };
     let disabled = if repo.is_private { " disabled" } else { "" };
 
+    // TODO(opus): Domains UI section wires POST /r/{owner}/{name}/settings/deploy/domains
+    // and GET /r/{owner}/{name}/deploy/domains.
     format!(
         r##"<section class="card deploy-card">
   <div class="card__head">
@@ -284,7 +490,11 @@ pub(crate) fn render_deploy_card(
   <div class="card__body">
     {private_note}
     <div class="deploy-summary">
-      <div class="deploy-preview-url" title="Internal placeholder; independent domain pending, not a public site.">{preview}</div>
+      <div class="deploy-preview-row">
+        <span class="deploy-preview-label">Preview</span>
+        <a class="deploy-preview-url" data-preview-link href="{preview}" target="_blank" rel="noopener">{preview}</a>
+        <button class="btn btn-ghost btn-sm" type="button" data-copy="{preview}" data-preview-copy title="Copy preview URL">Copy</button>
+      </div>
       <div class="deploy-build-id">Build: <code>{build}</code></div>
       {database}
     </div>
@@ -313,6 +523,18 @@ pub(crate) fn render_deploy_card(
         <button class="btn btn-primary" type="submit" name="action" value="redeploy"{disabled}>Redeploy</button>
       </div>
     </form>
+    <div class="deploy-domains">
+      <h3 class="deploy-domains__title">Custom domains</h3>
+      <p class="hint hint--muted">Add a domain you control and CNAME it to the gateway. Once verified it auto-follows production on every deploy.</p>
+      <form class="deploy-domain-add" method="post" action="/r/{owner}/{name}/settings/deploy/domains">
+        <input type="hidden" name="csrf_token" value="{csrf}">
+        <div class="field field--inline">
+          <input type="text" name="hostname" placeholder="app.example.com" maxlength="253" autocomplete="off" spellcheck="false"{disabled}>
+          <button class="btn btn-secondary btn-sm" type="submit"{disabled}>Add</button>
+        </div>
+      </form>
+      <ul class="deploy-domain-list" data-domains-poll="/r/{owner}/{name}/deploy/domains" data-domains-action="/r/{owner}/{name}/settings/deploy/domains/remove" data-domains-csrf="{csrf}"></ul>
+    </div>
     <form class="deploy-disconnect-form" method="post" action="/r/{owner}/{name}/settings/deploy" data-delete-confirm="{name}">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <input type="hidden" name="action" value="disconnect">
@@ -363,6 +585,34 @@ fn ensure_public_repo(repo: &Repo) -> Result<(), AppError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+async fn require_siteflow_deploy(state: &AppState, repo: &Repo) -> Result<RepoDeploy, AppError> {
+    let deploy = state
+        .store
+        .get_deploy(&repo.id)
+        .await?
+        .filter(|d| !d.siteflow_project_id.trim().is_empty())
+        .ok_or_else(|| AppError::BadRequest("Deploy the site first.".to_string()))?;
+    Ok(deploy)
+}
+
+fn siteflow_preview_configured(config: &Config) -> bool {
+    !config.siteflow_base_url.trim().is_empty() && !config.siteflow_api_token.trim().is_empty()
+}
+
+async fn preview_deploy_for_repo(
+    state: &AppState,
+    repo: &Repo,
+) -> Result<Option<RepoDeploy>, AppError> {
+    if !siteflow_preview_configured(&state.config) {
+        return Ok(None);
+    }
+    match require_siteflow_deploy(state, repo).await {
+        Ok(deploy) => Ok(Some(deploy)),
+        Err(AppError::BadRequest(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -481,8 +731,14 @@ async fn submit_deploy(
     {
         let provisioner = HttpProvisioner::new(&client, &state.config);
         let project_id = deploy.siteflow_project_id.clone();
-        provision_cistern(&provisioner, &project_id, &repo.owner_sub, &repo.name, &mut deploy)
-            .await;
+        provision_cistern(
+            &provisioner,
+            &project_id,
+            &repo.owner_sub,
+            &repo.name,
+            &mut deploy,
+        )
+        .await;
     }
 
     let build_job_id = trigger_deploy_hook(
@@ -499,6 +755,174 @@ async fn submit_deploy(
     deploy.preview_url = preview_url(&state.config.siteflow_base_domain, &deploy.siteflow_slug);
     deploy.updated_at = now_secs();
     Ok(state.store.upsert_deploy(&deploy).await?)
+}
+
+async fn start_pull_preview(
+    state: &AppState,
+    repo: &Repo,
+    deploy: &RepoDeploy,
+    actor_sub: &str,
+    pull: &Pull,
+) -> Result<(), AppError> {
+    if pull.head == deploy.production_branch {
+        return Ok(());
+    }
+    let Some(submitted) = submit_preview_deploy(state, repo, deploy, &pull.head, actor_sub).await?
+    else {
+        return Ok(());
+    };
+    let body = preview_comment_body("building", "", &submitted.commit_sha);
+    state
+        .store
+        .upsert_pull_preview_comment(
+            &pull.id,
+            &submitted.build_job_id,
+            "building",
+            "",
+            &submitted.commit_sha,
+            &body,
+            now_secs(),
+        )
+        .await?;
+
+    let state = state.clone();
+    let repo = repo.clone();
+    let pull = pull.clone();
+    let mut deploy = deploy.clone();
+    deploy.last_build_job_id = submitted.build_job_id.clone();
+    let build_job_id = submitted.build_job_id;
+    let commit_sha = submitted.commit_sha;
+
+    tokio::spawn(async move {
+        let mut owned = true;
+        let mut terminal_seen = false;
+        for attempt in 0..PR_PREVIEW_POLL_ATTEMPTS {
+            sleep(Duration::from_secs(PR_PREVIEW_POLL_SECS)).await;
+            match poll_preview_status(&state.config, &deploy, &commit_sha).await {
+                Some((status, preview_url)) => {
+                    let preview_url = preview_url.unwrap_or_default();
+                    let body = preview_comment_body(&status, &preview_url, &commit_sha);
+                    match state
+                        .store
+                        .update_pull_preview_comment_status(
+                            &pull.id,
+                            &build_job_id,
+                            &status,
+                            &preview_url,
+                            &commit_sha,
+                            &body,
+                            now_secs(),
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            owned = false;
+                            break;
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            repo = repo.id,
+                            pull = pull.number,
+                            "preview bot comment update failed"
+                        ),
+                    }
+                    if is_terminal_preview_status(&status) {
+                        terminal_seen = true;
+                        break;
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        repo = repo.id,
+                        pull = pull.number,
+                        build_job_id = build_job_id,
+                        attempt = attempt + 1,
+                        "preview deploy status poll returned no match"
+                    );
+                }
+            }
+        }
+        if owned && !terminal_seen {
+            if let Err(e) =
+                mark_preview_timed_out(&state, &repo, &pull, &build_job_id, &commit_sha).await
+            {
+                tracing::warn!(
+                    error = %e,
+                    repo = repo.id,
+                    pull = pull.number,
+                    "preview bot timeout update failed"
+                );
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn submit_preview_deploy(
+    state: &AppState,
+    repo: &Repo,
+    deploy: &RepoDeploy,
+    head_branch: &str,
+    actor_sub: &str,
+) -> Result<Option<PreviewResult>, AppError> {
+    let deploy = if deploy.siteflow_project_id.trim().is_empty() {
+        require_siteflow_deploy(state, repo).await?
+    } else {
+        deploy.clone()
+    };
+    if deploy.deploy_hook_token.trim().is_empty() {
+        tracing::warn!(
+            repo = repo.id,
+            pull_head = head_branch,
+            "preview deploy skipped: no persisted deploy hook"
+        );
+        return Ok(None);
+    }
+    let (commit_sha, detail) = resolve_deploy_commit(state, repo, head_branch).await?;
+    let client = siteflow_client()?;
+    let build_job_id = trigger_preview_deploy_hook(
+        &client,
+        &state.config,
+        &deploy,
+        head_branch,
+        &commit_sha,
+        &detail,
+        actor_sub,
+    )
+    .await?;
+    Ok(Some(PreviewResult {
+        build_job_id,
+        commit_sha,
+    }))
+}
+
+async fn mark_preview_timed_out(
+    state: &AppState,
+    repo: &Repo,
+    pull: &Pull,
+    build_job_id: &str,
+    commit_sha: &str,
+) -> Result<bool, AppError> {
+    tracing::warn!(
+        repo = repo.id,
+        pull = pull.number,
+        build_job_id = build_job_id,
+        "preview deploy status poll timed out"
+    );
+    let body = preview_timeout_comment_body(commit_sha);
+    Ok(state
+        .store
+        .update_pull_preview_comment_status(
+            &pull.id,
+            build_job_id,
+            "failed",
+            "",
+            commit_sha,
+            &body,
+            now_secs(),
+        )
+        .await?)
 }
 
 async fn resolve_deploy_commit(
@@ -618,6 +1042,36 @@ async fn trigger_deploy_hook(
         "commitMessage": detail.subject(),
         "commitAuthor": commit_author(detail),
         "idempotencyKey": format!("loom:{}:{}:{}", deploy.repo_id, deploy.production_branch, commit_sha),
+        "actor": actor_sub
+    });
+    let value = siteflow_post(client, config, &path, &body, false).await?;
+    json_string(&value, &["buildJobId"])
+        .or_else(|| json_string(&value, &["build_job_id"]))
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("SiteFlow trigger response missed buildJobId.".to_string())
+        })
+}
+
+async fn trigger_preview_deploy_hook(
+    client: &reqwest::Client,
+    config: &Config,
+    deploy: &RepoDeploy,
+    head_branch: &str,
+    commit_sha: &str,
+    detail: &CommitDetail,
+    actor_sub: &str,
+) -> Result<String, AppError> {
+    let path = format!(
+        "/api/deploy-hooks/{}/trigger",
+        percent_encode(&deploy.deploy_hook_token)
+    );
+    let body = json!({
+        "branch": head_branch,
+        "commitSha": commit_sha,
+        "commitMessage": detail.subject(),
+        "commitAuthor": commit_author(detail),
+        "idempotencyKey": format!("loom:preview:{}:{}", head_branch, commit_sha),
         "actor": actor_sub
     });
     let value = siteflow_post(client, config, &path, &body, false).await?;
@@ -774,14 +1228,21 @@ async fn provision_cistern(
         }
     };
     // `scope` gates SiteFlow-side visibility: `build` values may enter the client bundle, `runtime`
-    // values are server-only secrets. The service key MUST stay `runtime` (never client-visible).
+    // values are server-only secrets. Values needed by both client builds and serverless
+    // functions are sealed in both scopes. The service key MUST stay `runtime` only (never
+    // client-visible).
     let env_vars = [
         ("CISTERN_REST_URL", creds.rest_url.as_str(), "build"),
+        ("CISTERN_REST_URL", creds.rest_url.as_str(), "runtime"),
         ("CISTERN_ANON_KEY", creds.anon_key.as_str(), "build"),
+        ("CISTERN_ANON_KEY", creds.anon_key.as_str(), "runtime"),
         ("CISTERN_SERVICE_KEY", creds.service_key.as_str(), "runtime"),
     ];
     for (key, value, scope) in env_vars {
-        if let Err(reason) = provisioner.seal_env_var(project_id, key, value, scope).await {
+        if let Err(reason) = provisioner
+            .seal_env_var(project_id, key, value, scope)
+            .await
+        {
             tracing::warn!(
                 repo = deploy.repo_id,
                 key = key,
@@ -800,7 +1261,10 @@ async fn provision_cistern(
     );
 }
 
-async fn poll_siteflow_status(config: &Config, deploy: &RepoDeploy) -> Option<String> {
+async fn poll_siteflow_status(
+    config: &Config,
+    deploy: &RepoDeploy,
+) -> Option<(String, Option<String>)> {
     if config.siteflow_base_url.trim().is_empty()
         || config.siteflow_api_token.trim().is_empty()
         || deploy.siteflow_project_id.trim().is_empty()
@@ -813,7 +1277,27 @@ async fn poll_siteflow_status(config: &Config, deploy: &RepoDeploy) -> Option<St
         percent_encode(&deploy.siteflow_project_id)
     );
     let value = siteflow_get(&client, config, &path).await.ok()?;
-    latest_deployment_status(&value)
+    production_status_from_deployments(&value, deploy)
+}
+
+async fn poll_preview_status(
+    config: &Config,
+    deploy: &RepoDeploy,
+    commit_sha: &str,
+) -> Option<(String, Option<String>)> {
+    if config.siteflow_base_url.trim().is_empty()
+        || config.siteflow_api_token.trim().is_empty()
+        || deploy.siteflow_project_id.trim().is_empty()
+    {
+        return None;
+    }
+    let client = siteflow_client().ok()?;
+    let path = format!(
+        "/api/deployments?projectId={}",
+        percent_encode(&deploy.siteflow_project_id)
+    );
+    let value = siteflow_get(&client, config, &path).await.ok()?;
+    preview_status_from_deployments(&value, commit_sha, &deploy.last_build_job_id)
 }
 
 fn siteflow_client() -> Result<reqwest::Client, AppError> {
@@ -870,6 +1354,24 @@ async fn siteflow_get(
     response_json(response).await
 }
 
+async fn siteflow_delete(
+    client: &reqwest::Client,
+    config: &Config,
+    path: &str,
+) -> Result<(), AppError> {
+    let response = client
+        .delete(siteflow_url(config, path))
+        .header(USER_AGENT, "Loom-SiteFlow/0.1")
+        .header(
+            "Authorization",
+            format!("Bearer {}", config.siteflow_api_token),
+        )
+        .send()
+        .await
+        .map_err(|_| AppError::BadRequest("SiteFlow request failed.".to_string()))?;
+    response_empty(response).await
+}
+
 async fn response_json(response: reqwest::Response) -> Result<Value, AppError> {
     let status = response.status();
     let text = response
@@ -877,12 +1379,30 @@ async fn response_json(response: reqwest::Response) -> Result<Value, AppError> {
         .await
         .map_err(|_| AppError::BadRequest("SiteFlow response could not be read.".to_string()))?;
     if !status.is_success() {
-        return Err(AppError::BadRequest(format!(
-            "SiteFlow returned HTTP status {status}."
-        )));
+        return Err(siteflow_response_error(status, &text));
     }
     serde_json::from_str(&text)
         .map_err(|_| AppError::BadRequest("SiteFlow response was not valid JSON.".to_string()))
+}
+
+async fn response_empty(response: reqwest::Response) -> Result<(), AppError> {
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|_| AppError::BadRequest("SiteFlow response could not be read.".to_string()))?;
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(siteflow_response_error(status, &text))
+    }
+}
+
+fn siteflow_response_error(status: reqwest::StatusCode, body: &str) -> AppError {
+    let detail = siteflow_error_message(body)
+        .map(|message| format!("SiteFlow returned HTTP status {status}: {message}"))
+        .unwrap_or_else(|| format!("SiteFlow returned HTTP status {status}."));
+    AppError::BadRequest(detail)
 }
 
 fn siteflow_url(config: &Config, path: &str) -> String {
@@ -922,6 +1442,63 @@ fn normalize_framework(raw: &str) -> Result<String, AppError> {
             "Only static SiteFlow deployments are supported.".to_string(),
         ))
     }
+}
+
+fn clean_custom_domain_hostname(raw: &str, siteflow_base_domain: &str) -> Result<String, AppError> {
+    let hostname = clean_domain_hostname(raw)?;
+    if has_siteflow_base_suffix(&hostname, siteflow_base_domain) {
+        return Err(AppError::BadRequest(
+            "Use a domain outside the SiteFlow base domain.".to_string(),
+        ));
+    }
+    Ok(hostname)
+}
+
+fn clean_domain_hostname(raw: &str) -> Result<String, AppError> {
+    let hostname = raw.trim().to_ascii_lowercase();
+    if hostname.is_empty() || hostname.len() > 253 {
+        return Err(AppError::BadRequest(
+            "Custom domain must be a DNS hostname.".to_string(),
+        ));
+    }
+    for label in hostname.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(AppError::BadRequest(
+                "Custom domain must use DNS-safe labels.".to_string(),
+            ));
+        }
+    }
+    Ok(hostname)
+}
+
+fn has_siteflow_base_suffix(hostname: &str, siteflow_base_domain: &str) -> bool {
+    let Some(base) = normalized_siteflow_base_domain(siteflow_base_domain) else {
+        return false;
+    };
+    hostname == base || hostname.ends_with(&format!(".{base}"))
+}
+
+fn normalized_siteflow_base_domain(raw: &str) -> Option<String> {
+    let mut base = raw.trim().trim_end_matches('/').to_ascii_lowercase();
+    if let Some(rest) = base.strip_prefix("https://") {
+        base = rest.to_string();
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        base = rest.to_string();
+    }
+    base = base
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('.')
+        .to_string();
+    (!base.is_empty()).then_some(base)
 }
 
 fn nonempty_trimmed(raw: &str) -> Option<String> {
@@ -1011,23 +1588,210 @@ fn json_string(value: &Value, path: &[&str]) -> Option<String> {
     cur.as_str().map(str::to_string)
 }
 
-fn latest_deployment_status(value: &Value) -> Option<String> {
-    if let Some(status) = json_string(value, &["status"]) {
-        return Some(status);
+#[cfg(test)]
+fn latest_deployment_preview_url(value: &Value) -> Option<String> {
+    if let Some(preview_url) = value
+        .get("previewUrl")
+        .and_then(Value::as_str)
+        .and_then(nonempty_trimmed)
+    {
+        return Some(preview_url);
     }
     if let Some(items) = value.get("deployments").and_then(Value::as_array) {
         return items
             .first()
-            .and_then(|item| item.get("status"))
+            .and_then(|item| item.get("previewUrl"))
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .and_then(nonempty_trimmed);
     }
     value
         .as_array()
         .and_then(|items| items.first())
-        .and_then(|item| item.get("status"))
+        .and_then(|item| item.get("previewUrl"))
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .and_then(nonempty_trimmed)
+}
+
+fn production_status_from_deployments(
+    value: &Value,
+    deploy: &RepoDeploy,
+) -> Option<(String, Option<String>)> {
+    let items = deployment_items(value);
+    let production_branch = deploy.production_branch.trim();
+    if !production_branch.is_empty() {
+        if let Some(item) = items.iter().copied().find(|item| {
+            deployment_branch(item)
+                .as_deref()
+                .is_some_and(|branch| branch == production_branch)
+        }) {
+            return deployment_status_with_preview(item);
+        }
+    }
+
+    if let Some(item) = items
+        .iter()
+        .copied()
+        .find(|item| deployment_matches(item, "", &deploy.last_build_job_id))
+    {
+        return deployment_status_with_preview(item);
+    }
+    if let Some(item) = items
+        .iter()
+        .copied()
+        .find(|item| deployment_matches(item, &deploy.last_deployed_sha, ""))
+    {
+        return deployment_status_with_preview(item);
+    }
+
+    if items.iter().any(|item| deployment_branch(item).is_some()) {
+        return None;
+    }
+    items
+        .first()
+        .and_then(|item| deployment_status_with_preview(item))
+}
+
+fn preview_status_from_deployments(
+    value: &Value,
+    commit_sha: &str,
+    build_job_id: &str,
+) -> Option<(String, Option<String>)> {
+    deployment_items(value)
+        .into_iter()
+        .find(|item| deployment_matches(item, commit_sha, build_job_id))
+        .and_then(deployment_status_with_preview)
+}
+
+fn deployment_items(value: &Value) -> Vec<&Value> {
+    if let Some(items) = value.get("deployments").and_then(Value::as_array) {
+        return items.iter().collect();
+    }
+    if let Some(items) = value.as_array() {
+        return items.iter().collect();
+    }
+    vec![value]
+}
+
+fn deployment_matches(item: &Value, commit_sha: &str, build_job_id: &str) -> bool {
+    let commit_matches = !commit_sha.trim().is_empty()
+        && [
+            json_string(item, &["commitSha"]),
+            json_string(item, &["commit_sha"]),
+            json_string(item, &["source", "commitSha"]),
+            json_string(item, &["source", "commit_sha"]),
+            json_string(item, &["source", "commit"]),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|sha| sha == commit_sha);
+    if commit_matches {
+        return true;
+    }
+    if build_job_id.trim().is_empty() {
+        return false;
+    }
+    [
+        json_string(item, &["buildJobId"]),
+        json_string(item, &["build_job_id"]),
+        json_string(item, &["build", "jobId"]),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|id| id == build_job_id)
+}
+
+fn deployment_status_with_preview(item: &Value) -> Option<(String, Option<String>)> {
+    let status = json_string(item, &["status"])?;
+    Some((status, deployment_preview_url(item)))
+}
+
+fn deployment_branch(item: &Value) -> Option<String> {
+    json_string(item, &["branch"])
+        .or_else(|| json_string(item, &["source", "branch"]))
+        .or_else(|| json_string(item, &["git", "branch"]))
+}
+
+fn deployment_preview_url(item: &Value) -> Option<String> {
+    json_string(item, &["previewUrl"])
+        .or_else(|| json_string(item, &["preview_url"]))
+        .and_then(|url| nonempty_trimmed(&url))
+}
+
+fn is_terminal_preview_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "ready" | "error" | "failed" | "canceled"
+    )
+}
+
+fn preview_status_label(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "ready" => "Ready",
+        "error" | "failed" | "canceled" => "Failed",
+        _ => "Building",
+    }
+}
+
+fn preview_comment_body(status: &str, preview_url: &str, commit_sha: &str) -> String {
+    let label = preview_status_label(status);
+    let commit = short_oid(commit_sha);
+    if preview_url.trim().is_empty() {
+        format!("Preview deployment {label} for {commit}. Preview URL pending.")
+    } else {
+        format!(
+            "Preview deployment {label} for {commit}. Preview URL: {}",
+            preview_url.trim()
+        )
+    }
+}
+
+fn preview_timeout_comment_body(commit_sha: &str) -> String {
+    format!(
+        "Preview deployment Failed for {}. Preview timed out before SiteFlow returned a terminal status.",
+        short_oid(commit_sha)
+    )
+}
+
+fn siteflow_domains(value: &Value) -> Vec<Value> {
+    // SiteFlow GET /api/projects/{id} nests the project under `.project`, so domains live at
+    // `.project.domains`; fall back to a top-level `.domains` for robustness (mirrors how
+    // create_siteflow_project resolves `.project.id` or `.id`).
+    value
+        .get("project")
+        .and_then(|project| project.get("domains"))
+        .or_else(|| value.get("domains"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let hostname = item.get("hostname")?.as_str()?.trim();
+                    if hostname.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "hostname": hostname,
+                        "verified": item.get("verified").and_then(Value::as_bool).unwrap_or(false),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn siteflow_error_message(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        return json_string(&value, &["message"])
+            .or_else(|| json_string(&value, &["error", "message"]))
+            .or_else(|| json_string(&value, &["error"]))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    Some(body.chars().take(512).collect())
 }
 
 fn push_body_touches_branch(body: &[u8], branch: &str) -> bool {
@@ -1035,11 +1799,29 @@ fn push_body_touches_branch(body: &[u8], branch: &str) -> bool {
     String::from_utf8_lossy(body).contains(&needle)
 }
 
+fn push_body_head_branches(body: &[u8]) -> Vec<String> {
+    let mut branches = Vec::new();
+    for segment in String::from_utf8_lossy(body).split("refs/heads/").skip(1) {
+        let branch = segment
+            .split(|c: char| c == '\0' || c.is_whitespace())
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !branch.is_empty() && !branches.iter().any(|b| b == branch) {
+            branches.push(branch.to_string());
+        }
+    }
+    branches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::gitops::GitOps;
+    use crate::store::InMemoryStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// In-memory provisioner double: records sealed env vars and can be told to fail either the
     /// database open or one specific env-var seal, so the guard / fail-open / scope logic runs
@@ -1132,6 +1914,122 @@ mod tests {
         }
     }
 
+    fn sample_repo() -> Repo {
+        Repo {
+            id: "rp_test".to_string(),
+            owner_sub: "alice".to_string(),
+            name: "site".to_string(),
+            description: String::new(),
+            is_private: false,
+            default_branch: "main".to_string(),
+            require_approval: false,
+            required_approvals: 0,
+            require_code_owner_reviews: false,
+            protect_default_branch: false,
+            forked_from_id: String::new(),
+            created_at: 0,
+        }
+    }
+
+    fn sample_pull(head: &str) -> Pull {
+        Pull {
+            id: "pl_test".to_string(),
+            repo_id: "rp_test".to_string(),
+            number: 1,
+            title: "Preview".to_string(),
+            body: String::new(),
+            base: "main".to_string(),
+            head: head.to_string(),
+            author_sub: "alice".to_string(),
+            assignee_sub: String::new(),
+            reviewer_sub: String::new(),
+            milestone_id: String::new(),
+            is_draft: false,
+            state: "open".to_string(),
+            created_at: 0,
+            merged_at: 0,
+        }
+    }
+
+    fn sample_state() -> AppState {
+        let config = Arc::new(Config::dev());
+        AppState {
+            config: config.clone(),
+            store: Arc::new(InMemoryStore::new()),
+            git: GitOps::new(config.as_ref()),
+            klaxon: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_pull_preview_skips_when_head_is_production_branch() {
+        let state = sample_state();
+        let repo = sample_repo();
+        let deploy = sample_deploy(false);
+        let pull = sample_pull("main");
+
+        start_pull_preview(&state, &repo, &deploy, "alice", &pull)
+            .await
+            .unwrap();
+
+        assert!(state
+            .store
+            .get_pull_preview_comment(&pull.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_preview_deploy_skips_when_deploy_hook_token_is_empty() {
+        let state = sample_state();
+        let repo = sample_repo();
+        let mut deploy = sample_deploy(false);
+        deploy.deploy_hook_token.clear();
+        deploy.deploy_hook_url.clear();
+
+        let result = submit_preview_deploy(&state, &repo, &deploy, "feature", "alice")
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+        assert!(state.store.get_deploy(&repo.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_preview_timed_out_sets_failed_when_build_still_owns_row() {
+        let state = sample_state();
+        let repo = sample_repo();
+        let pull = sample_pull("feature");
+        state
+            .store
+            .upsert_pull_preview_comment(
+                &pull.id,
+                "build_1",
+                "building",
+                "",
+                "deadbeefcafebabe",
+                "building",
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            mark_preview_timed_out(&state, &repo, &pull, "build_1", "deadbeefcafebabe")
+                .await
+                .unwrap()
+        );
+        let comment = state
+            .store
+            .get_pull_preview_comment(&pull.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.deployment_status, "failed");
+        assert!(comment.body.contains("Preview timed out"));
+    }
+
     #[tokio::test]
     async fn provision_guard_skips_already_provisioned_repo() {
         let fake = FakeProvisioner::new(Ok(sample_creds()));
@@ -1162,7 +2060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_seals_three_env_vars_with_correct_scopes() {
+    async fn provision_seals_runtime_and_build_env_vars_with_correct_scopes() {
         let fake = FakeProvisioner::new(Ok(sample_creds()));
         let mut deploy = sample_deploy(false);
         provision_cistern(&fake, "proj_1", "alice", "site", &mut deploy).await;
@@ -1175,9 +2073,19 @@ mod tests {
                     "build".to_string()
                 ),
                 (
+                    "CISTERN_REST_URL".to_string(),
+                    "https://cistern.internal/rest/v1".to_string(),
+                    "runtime".to_string()
+                ),
+                (
                     "CISTERN_ANON_KEY".to_string(),
                     "anon-key-secret".to_string(),
                     "build".to_string()
+                ),
+                (
+                    "CISTERN_ANON_KEY".to_string(),
+                    "anon-key-secret".to_string(),
+                    "runtime".to_string()
                 ),
                 (
                     "CISTERN_SERVICE_KEY".to_string(),
@@ -1185,7 +2093,7 @@ mod tests {
                     "runtime".to_string()
                 ),
             ],
-            "service key must be runtime-scoped; rest_url + anon_key must be build-scoped"
+            "service key must be runtime-scoped only; rest_url + anon_key must be build and runtime scoped"
         );
         assert!(deploy.cistern_provisioned);
         assert_eq!(deploy.cistern_slug, "sf_abc123");
@@ -1203,8 +2111,205 @@ mod tests {
         assert!(deploy.cistern_slug.is_empty());
         assert_eq!(
             fake.sealed().len(),
-            2,
-            "the two build-scope vars sealed before the runtime seal failed"
+            4,
+            "rest_url and anon_key seal in both scopes before the service-key runtime seal failed"
+        );
+    }
+
+    #[test]
+    fn custom_domain_hostname_validation_normalizes_dns_labels() {
+        assert_eq!(
+            clean_domain_hostname("  WWW.Example.COM  ").unwrap(),
+            "www.example.com"
+        );
+        assert!(clean_domain_hostname("").is_err());
+        assert!(clean_domain_hostname("-bad.example.com").is_err());
+        assert!(clean_domain_hostname("bad-.example.com").is_err());
+        assert!(clean_domain_hostname("bad..example.com").is_err());
+        assert!(clean_domain_hostname("bad_example.com").is_err());
+        assert!(clean_domain_hostname("example.com.").is_err());
+    }
+
+    #[test]
+    fn custom_domain_rejects_siteflow_base_domain_suffix() {
+        assert!(
+            clean_custom_domain_hostname("app.siteflow.w33d.xyz", "siteflow.w33d.xyz").is_err()
+        );
+        assert!(clean_custom_domain_hostname("siteflow.w33d.xyz", "siteflow.w33d.xyz").is_err());
+        assert!(
+            clean_custom_domain_hostname("app.example.com", "https://siteflow.w33d.xyz/").is_ok()
+        );
+        assert!(clean_custom_domain_hostname(
+            "siteflow.w33d.xyz.evil.example",
+            "siteflow.w33d.xyz"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn latest_deployment_preview_url_extracts_real_preview_url() {
+        let deployments = json!({
+            "deployments": [
+                { "status": "ready", "previewUrl": " https://preview-1.siteflow.test " },
+                { "status": "ready", "previewUrl": "https://preview-2.siteflow.test" }
+            ]
+        });
+        assert_eq!(
+            latest_deployment_preview_url(&deployments).as_deref(),
+            Some("https://preview-1.siteflow.test")
+        );
+
+        let top_level = json!({ "status": "ready", "previewUrl": "https://top.siteflow.test" });
+        assert_eq!(
+            latest_deployment_preview_url(&top_level).as_deref(),
+            Some("https://top.siteflow.test")
+        );
+
+        let array = json!([{ "status": "ready", "previewUrl": "https://array.siteflow.test" }]);
+        assert_eq!(
+            latest_deployment_preview_url(&array).as_deref(),
+            Some("https://array.siteflow.test")
+        );
+
+        let missing = json!({ "deployments": [{ "status": "ready" }] });
+        assert_eq!(latest_deployment_preview_url(&missing), None);
+
+        let empty = json!({ "deployments": [{ "status": "ready", "previewUrl": "  " }] });
+        assert_eq!(latest_deployment_preview_url(&empty), None);
+    }
+
+    #[test]
+    fn preview_status_terminal_classification_matches_siteflow_states() {
+        for status in ["ready", "error", "failed", "canceled", "READY"] {
+            assert!(
+                is_terminal_preview_status(status),
+                "{status} should be terminal"
+            );
+        }
+        for status in ["building", "queued", "pending", "unknown"] {
+            assert!(
+                !is_terminal_preview_status(status),
+                "{status} should not be terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_status_from_deployments_matches_commit_sha_before_latest() {
+        let deployments = json!({
+            "deployments": [
+                {
+                    "status": "ready",
+                    "source": { "commitSha": "ffffffff" },
+                    "previewUrl": "https://wrong.siteflow.test",
+                    "buildJobId": "build_wrong"
+                },
+                {
+                    "status": "building",
+                    "source": { "commitSha": "deadbeefcafebabe" },
+                    "previewUrl": "https://right.siteflow.test",
+                    "buildJobId": "build_right"
+                }
+            ]
+        });
+        assert_eq!(
+            preview_status_from_deployments(&deployments, "deadbeefcafebabe", "")
+                .map(|(status, url)| (status, url.unwrap())),
+            Some((
+                "building".to_string(),
+                "https://right.siteflow.test".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn preview_status_from_deployments_falls_back_to_build_job_id() {
+        let deployments = json!({
+            "deployments": [
+                { "status": "ready", "previewUrl": "https://wrong.siteflow.test", "buildJobId": "build_wrong" },
+                { "status": "failed", "previewUrl": "https://right.siteflow.test", "buildJobId": "build_right" }
+            ]
+        });
+        assert_eq!(
+            preview_status_from_deployments(&deployments, "deadbeefcafebabe", "build_right")
+                .map(|(status, url)| (status, url.unwrap())),
+            Some((
+                "failed".to_string(),
+                "https://right.siteflow.test".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn production_status_from_deployments_prefers_production_branch_over_latest_preview() {
+        let mut deploy = sample_deploy(false);
+        deploy.production_branch = "main".to_string();
+        deploy.last_build_job_id = "prod_build".to_string();
+        deploy.last_deployed_sha = "prod_sha".to_string();
+        let deployments = json!({
+            "deployments": [
+                {
+                    "branch": "feature",
+                    "status": "ready",
+                    "previewUrl": "https://preview.siteflow.test",
+                    "buildJobId": "preview_build",
+                    "commitSha": "preview_sha"
+                },
+                {
+                    "branch": "main",
+                    "status": "building",
+                    "previewUrl": "https://prod.siteflow.test",
+                    "buildJobId": "prod_build",
+                    "commitSha": "prod_sha"
+                }
+            ]
+        });
+
+        assert_eq!(
+            production_status_from_deployments(&deployments, &deploy)
+                .map(|(status, url)| (status, url.unwrap())),
+            Some((
+                "building".to_string(),
+                "https://prod.siteflow.test".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn siteflow_domains_extracts_hostname_and_verified_flag() {
+        // SiteFlow nests domains under `.project.domains` (the real GET /api/projects/{id} shape).
+        let value = json!({
+            "project": {
+                "domains": [
+                    { "hostname": "www.example.com", "verified": true },
+                    { "hostname": "api.example.com" },
+                    { "verified": true },
+                    { "hostname": "" }
+                ]
+            }
+        });
+        assert_eq!(
+            siteflow_domains(&value),
+            vec![
+                json!({ "hostname": "www.example.com", "verified": true }),
+                json!({ "hostname": "api.example.com", "verified": false }),
+            ]
+        );
+    }
+
+    #[test]
+    fn siteflow_error_message_prefers_json_message_fields() {
+        assert_eq!(
+            siteflow_error_message(r#"{"message":"domain already exists"}"#).as_deref(),
+            Some("domain already exists")
+        );
+        assert_eq!(
+            siteflow_error_message(r#"{"error":{"message":"invalid hostname"}}"#).as_deref(),
+            Some("invalid hostname")
+        );
+        assert_eq!(
+            siteflow_error_message("plain failure").as_deref(),
+            Some("plain failure")
         );
     }
 }

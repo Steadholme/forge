@@ -22,8 +22,8 @@ use thiserror::Error;
 use crate::config::REPO_LIST_LIMIT;
 use crate::model::{
     CommitStatus, Issue, IssueComment, Label, Milestone, Pat, PrFileViewed, PrThreadResolved, Pull,
-    PullReview, PullReviewComment, Reaction, ReactionSummary, Release, Repo, RepoCollaborator,
-    RepoDeploy, Webhook,
+    PullPreviewComment, PullReview, PullReviewComment, Reaction, ReactionSummary, Release, Repo,
+    RepoCollaborator, RepoDeploy, Webhook,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -293,6 +293,13 @@ pub trait Store: Send + Sync {
     /// One pull request by its per-repo number.
     async fn get_pull(&self, repo_id: &str, number: i64) -> Result<Option<Pull>, StoreError>;
 
+    /// Open pull requests on a repo whose head branch matches `head_branch`, newest number first.
+    async fn list_open_pulls_by_head(
+        &self,
+        repo_id: &str,
+        head_branch: &str,
+    ) -> Result<Vec<Pull>, StoreError>;
+
     /// Set a PR's state (`open`/`closed`) by id. Returns whether a row changed.
     async fn set_pull_state(&self, id: &str, state: &str) -> Result<bool, StoreError>;
 
@@ -354,6 +361,38 @@ pub trait Store: Send + Sync {
         &self,
         pr_id: &str,
     ) -> Result<Vec<PrThreadResolved>, StoreError>;
+
+    /// Insert or update the one preview-bot comment row for a PR.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_pull_preview_comment(
+        &self,
+        pull_id: &str,
+        build_job_id: &str,
+        status: &str,
+        preview_url: &str,
+        commit_sha: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<(), StoreError>;
+
+    /// Update the preview-bot row only if it is still owned by `build_job_id`.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_pull_preview_comment_status(
+        &self,
+        pull_id: &str,
+        build_job_id: &str,
+        status: &str,
+        preview_url: &str,
+        commit_sha: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Fetch the preview-bot comment row for a PR, if one exists.
+    async fn get_pull_preview_comment(
+        &self,
+        pull_id: &str,
+    ) -> Result<Option<PullPreviewComment>, StoreError>;
 
     // --- labels + milestones -------------------------------------------------
     /// Create a repo-scoped label. Returns `Ok(None)` when the label name already exists.
@@ -562,6 +601,7 @@ pub struct InMemoryStore {
     pull_labels: Mutex<Vec<(String, String)>>,
     labels: Mutex<Vec<Label>>,
     milestones: Mutex<Vec<Milestone>>,
+    pull_preview_comments: Mutex<Vec<PullPreviewComment>>,
     pull_reviews: Mutex<Vec<PullReview>>,
     pull_review_comments: Mutex<Vec<PullReviewComment>>,
     pr_file_viewed: Mutex<Vec<PrFileViewed>>,
@@ -750,6 +790,10 @@ impl Store for InMemoryStore {
             comments.retain(|c| !pull_ids.iter().any(|id| id == &c.pull_id));
             ids
         };
+        self.pull_preview_comments
+            .lock()
+            .expect("pull_preview_comments lock poisoned")
+            .retain(|c| !pull_ids.iter().any(|id| id == &c.pull_id));
         self.pr_file_viewed
             .lock()
             .expect("pr_file_viewed lock poisoned")
@@ -1368,6 +1412,21 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
+    async fn list_open_pulls_by_head(
+        &self,
+        repo_id: &str,
+        head_branch: &str,
+    ) -> Result<Vec<Pull>, StoreError> {
+        let pulls = self.pulls.lock().expect("pulls lock poisoned");
+        let mut out: Vec<Pull> = pulls
+            .iter()
+            .filter(|p| p.repo_id == repo_id && p.head == head_branch && p.is_open())
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.number));
+        Ok(out)
+    }
+
     async fn set_pull_state(&self, id: &str, state: &str) -> Result<bool, StoreError> {
         let mut pulls = self.pulls.lock().expect("pulls lock poisoned");
         for p in pulls.iter_mut() {
@@ -1571,6 +1630,80 @@ impl Store for InMemoryStore {
             .collect();
         out.sort_by(|a, b| a.thread_key.cmp(&b.thread_key));
         Ok(out)
+    }
+
+    async fn upsert_pull_preview_comment(
+        &self,
+        pull_id: &str,
+        build_job_id: &str,
+        status: &str,
+        preview_url: &str,
+        commit_sha: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let mut comments = self
+            .pull_preview_comments
+            .lock()
+            .expect("pull_preview_comments lock poisoned");
+        if let Some(comment) = comments.iter_mut().find(|c| c.pull_id == pull_id) {
+            comment.build_job_id = build_job_id.to_string();
+            comment.deployment_status = status.to_string();
+            comment.preview_url = preview_url.to_string();
+            comment.commit_sha = commit_sha.to_string();
+            comment.body = body.to_string();
+            comment.updated_at = now;
+            return Ok(());
+        }
+        comments.push(PullPreviewComment {
+            pull_id: pull_id.to_string(),
+            build_job_id: build_job_id.to_string(),
+            deployment_status: status.to_string(),
+            preview_url: preview_url.to_string(),
+            commit_sha: commit_sha.to_string(),
+            body: body.to_string(),
+            updated_at: now,
+        });
+        Ok(())
+    }
+
+    async fn update_pull_preview_comment_status(
+        &self,
+        pull_id: &str,
+        build_job_id: &str,
+        status: &str,
+        preview_url: &str,
+        commit_sha: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mut comments = self
+            .pull_preview_comments
+            .lock()
+            .expect("pull_preview_comments lock poisoned");
+        if let Some(comment) = comments
+            .iter_mut()
+            .find(|c| c.pull_id == pull_id && c.build_job_id == build_job_id)
+        {
+            comment.deployment_status = status.to_string();
+            comment.preview_url = preview_url.to_string();
+            comment.commit_sha = commit_sha.to_string();
+            comment.body = body.to_string();
+            comment.updated_at = now;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn get_pull_preview_comment(
+        &self,
+        pull_id: &str,
+    ) -> Result<Option<PullPreviewComment>, StoreError> {
+        let comments = self
+            .pull_preview_comments
+            .lock()
+            .expect("pull_preview_comments lock poisoned");
+        Ok(comments.iter().find(|c| c.pull_id == pull_id).cloned())
     }
 
     async fn create_label(
@@ -2112,6 +2245,8 @@ const RELEASE_COLS: &str = "id, repo_id, tag_name, target_commit, title, body_md
 const ISSUE_COLS: &str = "id, repo_id, number, title, body, author_sub, assignee_sub, milestone_id, state, created_at, updated_at";
 const COMMENT_COLS: &str = "id, issue_id, author_sub, body, created_at";
 const PULL_COLS: &str = "id, repo_id, number, title, body, base_branch, head_branch, author_sub, assignee_sub, reviewer_sub, milestone_id, is_draft, state, created_at, merged_at";
+const PULL_PREVIEW_COMMENT_COLS: &str =
+    "pull_id, build_job_id, deployment_status, preview_url, commit_sha, body, updated_at";
 const PAT_COLS: &str = "id, owner_sub, name, token_hash, created_at";
 const LABEL_COLS: &str = "id, repo_id, name, color, created_at";
 const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
@@ -2399,6 +2534,20 @@ impl PgStore {
         .await?;
         sqlx::query(
             "ALTER TABLE pulls ADD COLUMN IF NOT EXISTS is_draft BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pull_preview_comments (\
+                 id TEXT PRIMARY KEY, \
+                 pull_id TEXT NOT NULL UNIQUE, \
+                 build_job_id TEXT NOT NULL, \
+                 deployment_status TEXT NOT NULL, \
+                 preview_url TEXT NOT NULL DEFAULT '', \
+                 commit_sha TEXT NOT NULL, \
+                 body TEXT NOT NULL DEFAULT '', \
+                 updated_at BIGINT NOT NULL\
+             )",
         )
         .execute(&self.pool)
         .await?;
@@ -2806,6 +2955,20 @@ impl PgStore {
         })
     }
 
+    fn pull_preview_comment_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<PullPreviewComment, sqlx::Error> {
+        Ok(PullPreviewComment {
+            pull_id: row.try_get("pull_id")?,
+            build_job_id: row.try_get("build_job_id")?,
+            deployment_status: row.try_get("deployment_status")?,
+            preview_url: row.try_get("preview_url")?,
+            commit_sha: row.try_get("commit_sha")?,
+            body: row.try_get("body")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+
     fn review_comment_from_row(
         row: &sqlx::postgres::PgRow,
     ) -> Result<PullReviewComment, sqlx::Error> {
@@ -3054,6 +3217,8 @@ impl Store for PgStore {
             "DELETE FROM issue_comments \
              WHERE issue_id IN (SELECT id FROM issues WHERE repo_id = $1)",
             "DELETE FROM pr_review_comments \
+             WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1)",
+            "DELETE FROM pull_preview_comments \
              WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1)",
             "DELETE FROM pr_reviews \
              WHERE pull_id IN (SELECT id FROM pulls WHERE repo_id = $1)",
@@ -3816,6 +3981,27 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn list_open_pulls_by_head(
+        &self,
+        repo_id: &str,
+        head_branch: &str,
+    ) -> Result<Vec<Pull>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {PULL_COLS} FROM pulls \
+             WHERE repo_id = $1 AND head_branch = $2 AND state = 'open' \
+             ORDER BY number DESC"
+        ))
+        .bind(repo_id)
+        .bind(head_branch)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        rows.iter()
+            .map(Self::pull_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn set_pull_state(&self, id: &str, state: &str) -> Result<bool, StoreError> {
         let result = sqlx::query("UPDATE pulls SET state = $1 WHERE id = $2")
             .bind(state)
@@ -4081,6 +4267,92 @@ impl Store for PgStore {
         rows.iter()
             .map(Self::pr_thread_resolved_from_row)
             .collect::<Result<_, _>>()
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn upsert_pull_preview_comment(
+        &self,
+        pull_id: &str,
+        build_job_id: &str,
+        status: &str,
+        preview_url: &str,
+        commit_sha: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let id = format!("pv_{}", crate::random_alnum(16));
+        sqlx::query(
+            "INSERT INTO pull_preview_comments \
+                 (id, pull_id, build_job_id, deployment_status, preview_url, commit_sha, body, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (pull_id) DO UPDATE SET \
+                 build_job_id = EXCLUDED.build_job_id, \
+                 deployment_status = EXCLUDED.deployment_status, \
+                 preview_url = EXCLUDED.preview_url, \
+                 commit_sha = EXCLUDED.commit_sha, \
+                 body = EXCLUDED.body, \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(id)
+        .bind(pull_id)
+        .bind(build_job_id)
+        .bind(status)
+        .bind(preview_url)
+        .bind(commit_sha)
+        .bind(body)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_pull_preview_comment_status(
+        &self,
+        pull_id: &str,
+        build_job_id: &str,
+        status: &str,
+        preview_url: &str,
+        commit_sha: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE pull_preview_comments \
+             SET deployment_status = $3, \
+                 preview_url = $4, \
+                 commit_sha = $5, \
+                 body = $6, \
+                 updated_at = $7 \
+             WHERE pull_id = $1 AND build_job_id = $2",
+        )
+        .bind(pull_id)
+        .bind(build_job_id)
+        .bind(status)
+        .bind(preview_url)
+        .bind(commit_sha)
+        .bind(body)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn get_pull_preview_comment(
+        &self,
+        pull_id: &str,
+    ) -> Result<Option<PullPreviewComment>, StoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {PULL_PREVIEW_COMMENT_COLS} FROM pull_preview_comments WHERE pull_id = $1"
+        ))
+        .bind(pull_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        row.as_ref()
+            .map(Self::pull_preview_comment_from_row)
+            .transpose()
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
@@ -5390,6 +5662,130 @@ mod tests {
         // A second merge is refused (already non-open) — the double-merge guard.
         assert!(!s.merge_pull("pl1", 100).await.unwrap());
         assert_eq!(s.open_pull_count("r").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_open_pulls_by_head_filters_state_and_branch() {
+        let s = InMemoryStore::new();
+        let open = s
+            .create_pull("pl1", "r", "first", "", "main", "feat", "u", false, 10)
+            .await
+            .unwrap();
+        s.create_pull("pl2", "r", "second", "", "main", "fix", "u", false, 11)
+            .await
+            .unwrap();
+        s.create_pull("pl3", "other", "third", "", "main", "feat", "u", false, 12)
+            .await
+            .unwrap();
+        let closed = s
+            .create_pull("pl4", "r", "closed", "", "main", "feat", "u", false, 13)
+            .await
+            .unwrap();
+        s.set_pull_state(&closed.id, "closed").await.unwrap();
+
+        assert_eq!(
+            s.list_open_pulls_by_head("r", "feat").await.unwrap(),
+            vec![open]
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_preview_comment_upsert_updates_one_row() {
+        let s = InMemoryStore::new();
+        s.upsert_pull_preview_comment(
+            "pl1",
+            "build_1",
+            "building",
+            "",
+            "deadbeefcafebabe",
+            "building",
+            10,
+        )
+        .await
+        .unwrap();
+        s.upsert_pull_preview_comment(
+            "pl1",
+            "build_2",
+            "ready",
+            "https://preview.example",
+            "deadbeefcafebabe",
+            "ready",
+            20,
+        )
+        .await
+        .unwrap();
+
+        let comment = s.get_pull_preview_comment("pl1").await.unwrap().unwrap();
+        assert_eq!(comment.build_job_id, "build_2");
+        assert_eq!(comment.deployment_status, "ready");
+        assert_eq!(comment.preview_url, "https://preview.example");
+        assert_eq!(comment.updated_at, 20);
+        assert_eq!(
+            s.pull_preview_comments
+                .lock()
+                .expect("pull_preview_comments lock poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_preview_status_update_requires_matching_build_owner() {
+        let s = InMemoryStore::new();
+        s.upsert_pull_preview_comment(
+            "pl1",
+            "build_1",
+            "building",
+            "",
+            "olddeadbeef",
+            "building old",
+            10,
+        )
+        .await
+        .unwrap();
+        s.upsert_pull_preview_comment(
+            "pl1",
+            "build_2",
+            "building",
+            "",
+            "newdeadbeef",
+            "building new",
+            20,
+        )
+        .await
+        .unwrap();
+
+        assert!(!s
+            .update_pull_preview_comment_status(
+                "pl1",
+                "build_1",
+                "ready",
+                "https://stale.example",
+                "olddeadbeef",
+                "ready old",
+                30,
+            )
+            .await
+            .unwrap());
+        assert!(s
+            .update_pull_preview_comment_status(
+                "pl1",
+                "build_2",
+                "ready",
+                "https://fresh.example",
+                "newdeadbeef",
+                "ready new",
+                40,
+            )
+            .await
+            .unwrap());
+
+        let comment = s.get_pull_preview_comment("pl1").await.unwrap().unwrap();
+        assert_eq!(comment.build_job_id, "build_2");
+        assert_eq!(comment.deployment_status, "ready");
+        assert_eq!(comment.preview_url, "https://fresh.example");
+        assert_eq!(comment.commit_sha, "newdeadbeef");
+        assert_eq!(comment.updated_at, 40);
     }
 
     #[tokio::test]

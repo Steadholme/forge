@@ -2285,6 +2285,19 @@ mark.code-search-hit {
 .comment-box__meta b { color:var(--ink); font-weight:650; }
 .comment-box__body { padding:16px 18px; }       /* markdown-body + reactions, both stock */
 
+.preview-bot-card { margin-top:16px; }
+.preview-bot-card .card__head { justify-content:space-between; }
+.preview-bot-status { margin-left:auto; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:650; text-transform:uppercase; }
+.preview-bot-status--building { color:var(--warn-ink); background:var(--warn-soft); border:1px solid var(--warn-border); }
+.preview-bot-status--ready { color:var(--ok-ink); background:var(--ok-soft); border:1px solid var(--ok-border); }
+.preview-bot-status--failed { color:var(--down-ink); background:var(--down-soft); border:1px solid var(--down-border); }
+.preview-bot-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:13px; }
+.preview-bot-row + .preview-bot-row { margin-top:8px; }
+.preview-bot-row > span:first-child { min-width:64px; color:var(--ink-3); font-weight:600; }
+.preview-bot-link { min-width:0; max-width:100%; overflow-wrap:anywhere; color:var(--accent-ink); font-family:var(--mono); font-size:12.5px; }
+.preview-bot-empty { color:var(--ink-3); }
+.preview-bot-body { margin:10px 0 0; }
+
 /* --- E. diff card bar ------------------------------------------------------ */
 .diff-card { scroll-margin-top:64px; }          /* #files anchor clears the 56px appbar */
 .diff-card__bar { position:sticky; top:56px; z-index:10;
@@ -2637,11 +2650,12 @@ h3 { font-size:14px; }
   margin-bottom:16px; padding:12px 14px;
   background:var(--surface-2); border:1px solid var(--border);
   border-radius:var(--r-sm); }
-.deploy-preview-url { font-family:var(--mono); font-size:12.5px; line-height:1.5;
-  color:var(--ink-3); word-break:break-all;
-  user-select:all; -webkit-user-select:all; cursor:help;
-  text-decoration:underline dashed; text-decoration-color:var(--border-2);
-  text-underline-offset:3px; }
+.deploy-preview-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.deploy-preview-label { font-size:11px; font-weight:600; text-transform:uppercase;
+  letter-spacing:.04em; color:var(--ink-3); flex:0 0 auto; }
+.deploy-preview-url { flex:1 1 auto; min-width:0; font-family:var(--mono); font-size:12.5px;
+  line-height:1.5; color:var(--accent-ink); word-break:break-all; text-decoration:none; }
+.deploy-preview-url:hover { text-decoration:underline; text-underline-offset:3px; }
 .deploy-build-id { font-size:12px; color:var(--ink-2); }
 .deploy-build-id code { font-family:var(--mono); font-size:11.5px; color:var(--ink-2);
   padding:1px 6px; background:var(--surface-3); border:1px solid var(--hairline);
@@ -2727,3 +2741,16 @@ h3 { font-size:14px; }
   .blame-author{ max-width:88px; margin-left:6px; }
   .blame-time{ display:none; }
 }
+
+/* ── Deploy: custom domains + manage-database link ─────────────────────────── */
+.deploy-database { margin-top:6px; font-size:13px; color:var(--ink-2); }
+.deploy-db-link { font-weight:600; color:var(--accent-ink); }
+.deploy-domains { margin-top:20px; padding-top:16px; border-top:1px solid var(--hairline); }
+.deploy-domains__title { margin:0 0 4px; font-size:13px; font-weight:600; color:var(--ink); }
+.field--inline { display:flex; gap:8px; align-items:center; }
+.field--inline input[type="text"] { flex:1 1 auto; }
+.deploy-domain-list { list-style:none; margin:12px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+.deploy-domain-item { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--r-sm); font-size:13px; }
+.deploy-domain-host { flex:1 1 auto; min-width:0; font-family:var(--mono); color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.deploy-domain-remove { margin:0; }
+.deploy-domain-empty { color:var(--ink-3); font-size:13px; padding:4px 0; }

@@ -62,6 +62,9 @@ pub const APP_JS: &str = include_str!("../../static/app.js");
 /// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
 pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
 
+/// Reserved subject for the PR preview bot. `:` is intentionally invalid for real owner subjects.
+pub const PREVIEW_BOT_SUB: &str = "loom:preview-bot";
+
 /// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
 pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 

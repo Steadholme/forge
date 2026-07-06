@@ -432,6 +432,84 @@
     });
   }
 
+  // --- Deploy custom-domains list (fetch-on-load; add/remove via normal POST) ----
+  function initDeployDomains() {
+    function esc(s) {
+      return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+      });
+    }
+    document.querySelectorAll("[data-domains-poll]").forEach(function (list) {
+      var url = list.getAttribute("data-domains-poll");
+      var action = list.getAttribute("data-domains-action") || "";
+      var csrf = list.getAttribute("data-domains-csrf") || "";
+      function render(domains) {
+        if (!domains || !domains.length) {
+          list.innerHTML = '<li class="deploy-domain-empty muted">No custom domains yet.</li>';
+          return;
+        }
+        list.innerHTML = domains
+          .map(function (d) {
+            var badge = d.verified
+              ? '<span class="pill pill-ok">verified</span>'
+              : '<span class="pill pill-warn">pending</span>';
+            return (
+              '<li class="deploy-domain-item"><span class="deploy-domain-host">' +
+              esc(d.hostname) +
+              "</span> " +
+              badge +
+              '<form class="deploy-domain-remove" method="post" action="' +
+              esc(action) +
+              '"><input type="hidden" name="csrf_token" value="' +
+              esc(csrf) +
+              '"><input type="hidden" name="hostname" value="' +
+              esc(d.hostname) +
+              '"><button class="btn btn-ghost btn-sm" type="submit">Remove</button></form></li>'
+            );
+          })
+          .join("");
+      }
+      fetch(url, { headers: { Accept: "application/json" }, credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : { domains: [] }; })
+        .then(function (data) { render((data && data.domains) || []); })
+        .catch(function () {
+          list.innerHTML = '<li class="deploy-domain-empty muted">Could not load domains.</li>';
+        });
+    });
+  }
+
+  // --- Deploy status + public preview URL live-poll -------------------------
+  function initDeployPreview() {
+    var status = document.querySelector(".deploy-status[data-poll]");
+    if (!status) return;
+    var url = status.getAttribute("data-poll");
+    var link = document.querySelector("[data-preview-link]");
+    var tries = 0;
+    function tick() {
+      tries++;
+      fetch(url, { headers: { Accept: "application/json" }, credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d) return;
+          if (d.status) {
+            status.textContent = d.status;
+            status.className = "deploy-status deploy-status--" + d.status;
+          }
+          // Persist-and-return: status_json swaps the placeholder for the real per-deploy public URL.
+          if (link && d.previewUrl && /^https?:\/\//.test(d.previewUrl)) {
+            link.href = d.previewUrl;
+            link.textContent = d.previewUrl;
+            var copy = document.querySelector("[data-preview-copy]");
+            if (copy) copy.setAttribute("data-copy", d.previewUrl);
+          }
+          var terminal = d.status === "ready" || d.status === "failed" || d.status === "error";
+          if (!terminal && tries < 8) setTimeout(tick, 4000);
+        })
+        .catch(function () {});
+    }
+    tick();
+  }
+
   function init() {
     initCopy();
     initSort();
@@ -442,6 +520,8 @@
     initToggleForms();
     initCharCounters();
     initDeleteConfirm();
+    initDeployDomains();
+    initDeployPreview();
   }
 
   if (document.readyState === "loading") {

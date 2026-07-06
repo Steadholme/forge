@@ -119,6 +119,7 @@ async fn pg_store_full_integration() {
         "issue_labels",
         "pull_labels",
         "issue_comments",
+        "pull_preview_comments",
         "pr_review_comments",
         "pr_reviews",
         "pr_thread_resolved",
@@ -485,6 +486,48 @@ async fn pg_store_full_integration() {
         .map(|p| p.number)
         .collect();
     assert_eq!(listed_pulls, vec![2, 1]); // newest number first
+
+    let open_feat: Vec<i64> = store
+        .list_open_pulls_by_head(&repo_id, "feat")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.number)
+        .collect();
+    assert_eq!(open_feat, vec![1]);
+
+    store
+        .upsert_pull_preview_comment(
+            &pr1.id,
+            "build_1",
+            "building",
+            "",
+            "deadbeefcafebabe",
+            "building",
+            now + 2,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_pull_preview_comment(
+            &pr1.id,
+            "build_2",
+            "ready",
+            "https://preview.example",
+            "deadbeefcafebabe",
+            "ready",
+            now + 3,
+        )
+        .await
+        .unwrap();
+    let preview = store
+        .get_pull_preview_comment(&pr1.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(preview.build_job_id, "build_2");
+    assert_eq!(preview.deployment_status, "ready");
+    assert_eq!(preview.preview_url, "https://preview.example");
 
     assert!(!store.merge_pull("pl2", now + 4).await.unwrap());
     assert!(store.set_pull_draft("pl2", false).await.unwrap());
