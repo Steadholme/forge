@@ -78,6 +78,14 @@ pub struct DeployDomainForm {
     pub hostname: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeployPreviewPasswordForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub password: String,
+}
+
 /// POST /r/{owner}/{name}/deploy
 pub async fn deploy_now(
     State(state): State<AppState>,
@@ -229,6 +237,76 @@ pub async fn remove_domain(
         siteflow_project_id = deploy.siteflow_project_id,
         hostname = hostname,
         "deploy domain removed"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+/// POST /r/{owner}/{name}/settings/deploy/preview-password
+pub async fn set_preview_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<DeployPreviewPasswordForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    if form.password.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Enter a preview password before saving.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    require_deploy_admin(&state, &repo, &who, &headers).await?;
+    ensure_public_repo(&repo)?;
+    let deploy = require_siteflow_deploy(&state, &repo).await?;
+
+    let client = siteflow_client()?;
+    let path = format!(
+        "/api/projects/{}/preview-protection",
+        percent_encode(&deploy.siteflow_project_id)
+    );
+    let body = json!({ "password": form.password });
+    siteflow_put(&client, &state.config, &path, &body, true).await?;
+    tracing::info!(
+        repo = repo.id,
+        siteflow_project_id = deploy.siteflow_project_id,
+        "deploy preview password set"
+    );
+    Ok(redirect(&format!("/r/{owner}/{name}/settings")))
+}
+
+/// POST /r/{owner}/{name}/settings/deploy/preview-password/clear
+pub async fn clear_preview_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Form(form): Form<DeployPreviewPasswordForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    require_deploy_admin(&state, &repo, &who, &headers).await?;
+    ensure_public_repo(&repo)?;
+    let deploy = require_siteflow_deploy(&state, &repo).await?;
+
+    let client = siteflow_client()?;
+    let path = format!(
+        "/api/projects/{}/preview-protection",
+        percent_encode(&deploy.siteflow_project_id)
+    );
+    siteflow_delete(&client, &state.config, &path).await?;
+    tracing::info!(
+        repo = repo.id,
+        siteflow_project_id = deploy.siteflow_project_id,
+        "deploy preview password cleared"
     );
     Ok(redirect(&format!("/r/{owner}/{name}/settings")))
 }
@@ -512,6 +590,28 @@ pub(crate) fn render_deploy_card(
         ""
     };
     let disabled = if repo.is_private { " disabled" } else { "" };
+    let preview_protection_enabled = deploy
+        .and_then(|d| preview_protection_enabled(&state.config, d))
+        .unwrap_or(false);
+    let preview_protection_status = if preview_protection_enabled {
+        "Preview links require a password"
+    } else {
+        "Preview links are public"
+    };
+    let preview_protection_clear = if preview_protection_enabled {
+        format!(
+            r##"<form class="deploy-preview-password-clear" method="post" action="/r/{owner}/{name}/settings/deploy/preview-password/clear">
+        <input type="hidden" name="csrf_token" value="{csrf}">
+        <button class="btn btn-ghost btn-sm" type="submit"{disabled}>Clear</button>
+      </form>"##,
+            owner = esc(&repo.owner_sub),
+            name = esc(&repo.name),
+            csrf = esc(csrf),
+            disabled = disabled,
+        )
+    } else {
+        String::new()
+    };
 
     // TODO(opus): Domains UI section wires POST /r/{owner}/{name}/settings/deploy/domains
     // and GET /r/{owner}/{name}/deploy/domains.
@@ -557,6 +657,18 @@ pub(crate) fn render_deploy_card(
         <button class="btn btn-primary" type="submit" name="action" value="redeploy"{disabled}>Redeploy</button>
       </div>
     </form>
+    <div class="deploy-preview-protection">
+      <h3 class="deploy-preview-protection__title">Preview protection</h3>
+      <p class="hint hint--muted">{preview_protection_status}</p>
+      <form class="deploy-preview-password" method="post" action="/r/{owner}/{name}/settings/deploy/preview-password">
+        <input type="hidden" name="csrf_token" value="{csrf}">
+        <div class="field field--inline">
+          <input type="password" name="password" placeholder="Preview password" maxlength="256" autocomplete="new-password"{disabled}>
+          <button class="btn btn-secondary btn-sm" type="submit"{disabled}>Save</button>
+        </div>
+      </form>
+      {preview_protection_clear}
+    </div>
     <div class="deploy-domains">
       <h3 class="deploy-domains__title">Custom domains</h3>
       <p class="hint hint--muted">Use <code>&lt;name&gt;.{vanity_base}</code> for an instant vanity URL, or add a domain you control and CNAME it to the gateway.</p>
@@ -595,7 +707,40 @@ pub(crate) fn render_deploy_card(
         vanity_base = esc(&vanity_base),
         auto_checked = auto_checked,
         disabled = disabled,
+        preview_protection_status = esc(preview_protection_status),
+        preview_protection_clear = preview_protection_clear,
     )
+}
+
+fn preview_protection_enabled(config: &Config, deploy: &RepoDeploy) -> Option<bool> {
+    let project_id = deploy.siteflow_project_id.trim();
+
+    if project_id.is_empty()
+        || config.siteflow_base_url.trim().is_empty()
+        || config.siteflow_api_token.trim().is_empty()
+    {
+        return None;
+    }
+
+    let config = config.clone();
+    let project_id = project_id.to_string();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime.block_on(async move {
+            let client = siteflow_client().ok()?;
+            let path = format!("/api/projects/{}/settings", percent_encode(&project_id));
+            let value = siteflow_get(&client, &config, &path).await.ok()?;
+            value
+                .get("previewProtectionEnabled")
+                .and_then(Value::as_bool)
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 async fn require_deploy_admin(
@@ -930,9 +1075,14 @@ async fn start_branch_preview(
         }
         if owned && !terminal_seen {
             if let Some(target) = comment.as_ref() {
-                if let Err(e) =
-                    mark_preview_comment_timed_out(&state, &repo, target, &build_job_id, &commit_sha)
-                        .await
+                if let Err(e) = mark_preview_comment_timed_out(
+                    &state,
+                    &repo,
+                    target,
+                    &build_job_id,
+                    &commit_sha,
+                )
+                .await
                 {
                     tracing::warn!(
                         error = %e,
@@ -1452,6 +1602,35 @@ async fn siteflow_post(
     response_json(response).await
 }
 
+async fn siteflow_put(
+    client: &reqwest::Client,
+    config: &Config,
+    path: &str,
+    body: &Value,
+    bearer: bool,
+) -> Result<Value, AppError> {
+    let body = serde_json::to_vec(body).map_err(|_| {
+        AppError::Internal("SiteFlow request body could not be encoded.".to_string())
+    })?;
+    let url = siteflow_url(config, path);
+    let mut req = client
+        .put(url)
+        .header(USER_AGENT, "Loom-SiteFlow/0.1")
+        .header(CONTENT_TYPE, "application/json")
+        .body(body);
+    if bearer {
+        req = req.header(
+            "Authorization",
+            format!("Bearer {}", config.siteflow_api_token),
+        );
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|_| AppError::BadRequest("SiteFlow request failed.".to_string()))?;
+    response_json(response).await
+}
+
 async fn siteflow_get(
     client: &reqwest::Client,
     config: &Config,
@@ -1940,9 +2119,7 @@ fn should_preview_pushed_agent_branch(
     production_branch: &str,
     has_open_pull: bool,
 ) -> bool {
-    branch.starts_with(AGENT_PREVIEW_BRANCH_PREFIX)
-        && branch != production_branch
-        && !has_open_pull
+    branch.starts_with(AGENT_PREVIEW_BRANCH_PREFIX) && branch != production_branch && !has_open_pull
 }
 
 fn push_body_head_branches(body: &[u8]) -> Vec<String> {
@@ -1966,8 +2143,11 @@ mod tests {
     use crate::config::Config;
     use crate::gitops::GitOps;
     use crate::store::InMemoryStore;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
     /// In-memory provisioner double: records sealed env vars and can be told to fail either the
     /// database open or one specific env-var seal, so the guard / fail-open / scope logic runs
@@ -2105,6 +2285,77 @@ mod tests {
             git: GitOps::new(config.as_ref()),
             klaxon: None,
         }
+    }
+
+    fn sample_state_with_config(config: Config) -> AppState {
+        let config = Arc::new(config);
+        AppState {
+            config: config.clone(),
+            store: Arc::new(InMemoryStore::new()),
+            git: GitOps::new(config.as_ref()),
+            klaxon: None,
+        }
+    }
+
+    fn mock_siteflow_settings(enabled: bool) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock siteflow");
+        let addr = listener.local_addr().expect("mock siteflow addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock siteflow");
+            let mut buffer = [0_u8; 4096];
+            let read = stream
+                .read(&mut buffer)
+                .expect("read mock siteflow request");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = format!(r#"{{"previewProtectionEnabled":{enabled}}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write mock siteflow response");
+            request
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn render_deploy_card_includes_public_preview_protection_block() {
+        let state = sample_state();
+        let repo = sample_repo();
+        let mut deploy = sample_deploy(false);
+        deploy.siteflow_project_id.clear();
+
+        let html = render_deploy_card(&state, &repo, "csrf-token", Some(&deploy));
+
+        assert!(html.contains("Preview protection"));
+        assert!(html.contains("Preview links are public"));
+        assert!(html.contains(r#"type="password" name="password""#));
+        assert!(html.contains("/r/alice/site/settings/deploy/preview-password"));
+        assert!(!html.contains("/r/alice/site/settings/deploy/preview-password/clear"));
+    }
+
+    #[test]
+    fn render_deploy_card_reads_preview_protection_status_from_siteflow_settings() {
+        let (base_url, server) = mock_siteflow_settings(true);
+        let mut config = Config::dev();
+        config.siteflow_base_url = base_url;
+        config.siteflow_api_token = "siteflow-token".to_string();
+        let state = sample_state_with_config(config);
+        let repo = sample_repo();
+        let deploy = sample_deploy(false);
+
+        let html = render_deploy_card(&state, &repo, "csrf-token", Some(&deploy));
+        let request = server.join().expect("mock siteflow server joined");
+        let lower_request = request.to_ascii_lowercase();
+
+        assert!(request.starts_with("GET /api/projects/proj_1/settings "));
+        assert!(lower_request.contains("authorization: bearer siteflow-token"));
+        assert!(html.contains("Preview links require a password"));
+        assert!(html.contains("/r/alice/site/settings/deploy/preview-password/clear"));
     }
 
     #[tokio::test]
@@ -2370,7 +2621,8 @@ mod tests {
 
     #[test]
     fn pushed_agent_branch_preview_selection_matches_rules() {
-        let push_body = b"old new refs/heads/agent/multica/issue-123\0old new refs/heads/feature/no-pr\0";
+        let push_body =
+            b"old new refs/heads/agent/multica/issue-123\0old new refs/heads/feature/no-pr\0";
         let selected: Vec<String> = push_body_head_branches(push_body)
             .into_iter()
             .filter(|branch| should_preview_pushed_agent_branch(branch, "main", false))

@@ -155,6 +155,14 @@ pub fn app(state: AppState) -> Router {
             post(handlers::deploy::remove_domain),
         )
         .route(
+            "/r/{owner}/{name}/settings/deploy/preview-password",
+            post(handlers::deploy::set_preview_password),
+        )
+        .route(
+            "/r/{owner}/{name}/settings/deploy/preview-password/clear",
+            post(handlers::deploy::clear_preview_password),
+        )
+        .route(
             "/r/{owner}/{name}/settings/labels",
             post(handlers::settings::create_label),
         )
