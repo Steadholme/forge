@@ -2111,6 +2111,261 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
 }
 
 #[tokio::test]
+async fn pull_request_changes_blocks_merge_until_dismissed() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+    open_pull(
+        &app,
+        "alice/proj",
+        "main",
+        "feature",
+        "Add second line",
+        "",
+        "bob",
+    )
+    .await;
+
+    let alice_detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let alice_csrf = alice_detail.csrf_cookie().unwrap();
+    let requested = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/review",
+            &[
+                ("csrf_token", &alice_csrf),
+                ("verdict", "request_changes"),
+                ("body", "needs work"),
+            ],
+            &alice_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(requested.status, StatusCode::FOUND);
+    let pull = store.get_pull(&repo.id, 1).await.unwrap().unwrap();
+    let review_id = store
+        .list_pull_reviews(&pull.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|review| review.verdict == "request_changes")
+        .unwrap()
+        .id;
+
+    let bob_detail = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    let bob_csrf = bob_detail.csrf_cookie().unwrap();
+    let blocked = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &bob_csrf)],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(blocked.status, StatusCode::BAD_REQUEST);
+    assert!(blocked.body.contains("Changes requested"));
+
+    let forbidden = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/pulls/1/review/{review_id}/dismiss"),
+            &[("csrf_token", &bob_csrf)],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    let bad_csrf = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/pulls/1/review/{review_id}/dismiss"),
+            &[("csrf_token", "wrong")],
+            &alice_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(bad_csrf.status, StatusCode::BAD_REQUEST);
+
+    create_repo(&app, "alice", "other", "").await;
+    let other_repo = store.get_repo("alice", "other").await.unwrap().unwrap();
+    let other_git_dir = git.repo_path("alice", "other").to_string_lossy().to_string();
+    seed_two_branches(&other_git_dir);
+    open_pull(
+        &app,
+        "alice/other",
+        "main",
+        "feature",
+        "Other change",
+        "",
+        "bob",
+    )
+    .await;
+    let other_detail = send(&app, get("/r/alice/other/pulls/1", Some("alice"))).await;
+    let other_csrf = other_detail.csrf_cookie().unwrap();
+    let other_requested = send(
+        &app,
+        post_form(
+            "/r/alice/other/pulls/1/review",
+            &[
+                ("csrf_token", &other_csrf),
+                ("verdict", "request_changes"),
+                ("body", "other repo"),
+            ],
+            &other_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(other_requested.status, StatusCode::FOUND);
+    let other_pull = store.get_pull(&other_repo.id, 1).await.unwrap().unwrap();
+    let other_review_id = store
+        .list_pull_reviews(&other_pull.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|review| review.verdict == "request_changes")
+        .unwrap()
+        .id;
+
+    let isolation = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/pulls/1/review/{other_review_id}/dismiss"),
+            &[("csrf_token", &alice_csrf)],
+            &alice_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(isolation.status, StatusCode::NOT_FOUND);
+    let still_blocked = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &bob_csrf)],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(still_blocked.status, StatusCode::BAD_REQUEST);
+    assert!(still_blocked.body.contains("Changes requested"));
+
+    let dismissed = send(
+        &app,
+        post_form(
+            &format!("/r/alice/proj/pulls/1/review/{review_id}/dismiss"),
+            &[("csrf_token", &alice_csrf)],
+            &alice_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(dismissed.status, StatusCode::FOUND);
+    let after_dismiss = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    assert!(after_dismiss.body.contains("dismissed"));
+    let bob_after_dismiss = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    let bob_csrf = bob_after_dismiss.csrf_cookie().unwrap();
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/1/merge",
+            &[("csrf_token", &bob_csrf)],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(merged.status, StatusCode::FOUND);
+    let main_oid = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_eq!(main_oid, feature_oid);
+
+    let base = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    let followup_oid = commit_files(
+        &git_dir,
+        Some(&base),
+        "C",
+        &[("file.txt", "one\ntwo\nthree\n")],
+    );
+    git_capture(
+        &git_dir,
+        &["update-ref", "refs/heads/followup", &followup_oid],
+        "",
+    );
+    open_pull(
+        &app,
+        "alice/proj",
+        "main",
+        "followup",
+        "Follow up",
+        "",
+        "bob",
+    )
+    .await;
+    let pr2_detail = send(&app, get("/r/alice/proj/pulls/2", Some("alice"))).await;
+    let pr2_csrf = pr2_detail.csrf_cookie().unwrap();
+    let pr2_requested = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/2/review",
+            &[
+                ("csrf_token", &pr2_csrf),
+                ("verdict", "request_changes"),
+                ("body", "one more change"),
+            ],
+            &pr2_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(pr2_requested.status, StatusCode::FOUND);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let pr2_after_request = send(&app, get("/r/alice/proj/pulls/2", Some("alice"))).await;
+    let pr2_csrf = pr2_after_request.csrf_cookie().unwrap();
+    let pr2_approved = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/2/review",
+            &[
+                ("csrf_token", &pr2_csrf),
+                ("verdict", "approve"),
+                ("body", "looks good now"),
+            ],
+            &pr2_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(pr2_approved.status, StatusCode::FOUND);
+    let bob_pr2_detail = send(&app, get("/r/alice/proj/pulls/2", Some("bob"))).await;
+    let bob_pr2_csrf = bob_pr2_detail.csrf_cookie().unwrap();
+    let pr2_merged = send(
+        &app,
+        post_form(
+            "/r/alice/proj/pulls/2/merge",
+            &[("csrf_token", &bob_pr2_csrf)],
+            &bob_pr2_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(pr2_merged.status, StatusCode::FOUND);
+    let main_oid = git_capture(&git_dir, &["rev-parse", "refs/heads/main"], "");
+    assert_eq!(main_oid, followup_oid);
+}
+
+#[tokio::test]
 async fn pull_review_suggestion_renders_and_applies_to_head_branch() {
     let state = temp_state();
     let git = state.git.clone();

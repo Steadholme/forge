@@ -457,6 +457,9 @@ pub trait Store: Send + Sync {
     /// All reviews on a PR, oldest first.
     async fn list_pull_reviews(&self, pull_id: &str) -> Result<Vec<PullReview>, StoreError>;
 
+    /// Dismiss a PR review verdict by id, scoped to its owning PR.
+    async fn dismiss_pull_review(&self, review_id: &str, pull_id: &str) -> Result<bool, StoreError>;
+
     /// Add an inline PR review comment anchored to file + line.
     #[allow(clippy::too_many_arguments)]
     async fn create_pull_review_comment(
@@ -1840,6 +1843,7 @@ impl Store for InMemoryStore {
             verdict: verdict.to_string(),
             body: body.to_string(),
             created_at,
+            dismissed: false,
         };
         self.pull_reviews
             .lock()
@@ -1864,6 +1868,7 @@ impl Store for InMemoryStore {
             verdict: verdict.to_string(),
             body: body.to_string(),
             created_at,
+            dismissed: false,
         };
         self.pull_reviews
             .lock()
@@ -1900,6 +1905,21 @@ impl Store for InMemoryStore {
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(out)
+    }
+
+    async fn dismiss_pull_review(&self, review_id: &str, pull_id: &str) -> Result<bool, StoreError> {
+        let mut reviews = self
+            .pull_reviews
+            .lock()
+            .expect("pull_reviews lock poisoned");
+        let Some(review) = reviews
+            .iter_mut()
+            .find(|review| review.id == review_id && review.pull_id == pull_id)
+        else {
+            return Ok(false);
+        };
+        review.dismissed = true;
+        Ok(true)
     }
 
     async fn create_pull_review_comment(
@@ -2250,7 +2270,7 @@ const PULL_PREVIEW_COMMENT_COLS: &str =
 const PAT_COLS: &str = "id, owner_sub, name, token_hash, created_at";
 const LABEL_COLS: &str = "id, repo_id, name, color, created_at";
 const MILESTONE_COLS: &str = "id, repo_id, title, due, state, created_at";
-const REVIEW_COLS: &str = "id, pull_id, reviewer_sub, verdict, body, created_at";
+const REVIEW_COLS: &str = "id, pull_id, reviewer_sub, verdict, body, created_at, dismissed";
 const REVIEW_COMMENT_COLS: &str =
     "id, pull_id, review_id, path, line, author_sub, body, pending, anchor_head_oid, anchor_text, applied, created_at";
 const PR_FILE_VIEWED_COLS: &str = "pr_id, user_sub, file_path, viewed, updated_at";
@@ -2623,8 +2643,14 @@ impl PgStore {
                  reviewer_sub TEXT NOT NULL, \
                  verdict TEXT NOT NULL, \
                  body TEXT NOT NULL DEFAULT '', \
-                 created_at BIGINT NOT NULL\
+                 created_at BIGINT NOT NULL, \
+                 dismissed BOOLEAN NOT NULL DEFAULT FALSE\
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE pr_reviews ADD COLUMN IF NOT EXISTS dismissed BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&self.pool)
         .await?;
@@ -2952,6 +2978,7 @@ impl PgStore {
             verdict: row.try_get("verdict")?,
             body: row.try_get("body")?,
             created_at: row.try_get("created_at")?,
+            dismissed: row.try_get("dismissed")?,
         })
     }
 
@@ -4540,6 +4567,7 @@ impl Store for PgStore {
             verdict: verdict.to_string(),
             body: body.to_string(),
             created_at,
+            dismissed: false,
         })
     }
 
@@ -4592,6 +4620,7 @@ impl Store for PgStore {
                 verdict: verdict.to_string(),
                 body: body.to_string(),
                 created_at,
+                dismissed: false,
             },
             result.rows_affected() as i64,
         ))
@@ -4610,6 +4639,16 @@ impl Store for PgStore {
             .map(Self::review_from_row)
             .collect::<Result<_, _>>()
             .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn dismiss_pull_review(&self, review_id: &str, pull_id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE pr_reviews SET dismissed = TRUE WHERE id = $1 AND pull_id = $2")
+            .bind(review_id)
+            .bind(pull_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn create_pull_review_comment(

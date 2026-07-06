@@ -382,6 +382,8 @@ pub struct PullReview {
     pub body: String,
     /// Creation time, epoch seconds.
     pub created_at: i64,
+    /// Whether a maintainer dismissed this review verdict.
+    pub dismissed: bool,
 }
 
 /// An inline pull-request review comment anchored to a file path and new-file line number.

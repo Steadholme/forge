@@ -102,12 +102,15 @@ struct ReviewRequirements {
     approval_count: usize,
     required_approvals: usize,
     approval_satisfied: bool,
+    changes_requested: Vec<String>,
     codeowners: CodeOwnerEvaluation,
 }
 
 impl ReviewRequirements {
     fn satisfied(&self) -> bool {
-        self.approval_satisfied && self.codeowners.satisfied()
+        self.approval_satisfied
+            && self.codeowners.satisfied()
+            && self.changes_requested.is_empty()
     }
 }
 
@@ -1077,6 +1080,50 @@ pub async fn review(
         review_body
     };
     notify_pull_author(&state, &who.subject, &repo, &pull, &summary);
+    Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
+}
+
+// ===========================================================================
+// POST /r/{owner}/{name}/pulls/{number}/review/{review_id}/dismiss — dismiss a blocking review
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DismissForm {
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+pub async fn dismiss_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number, review_id)): Path<(String, String, i64, String)>,
+    Form(form): Form<DismissForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let repo = load_visible_repo(&state, &who, &owner, &name).await?;
+    let pull = state
+        .store
+        .get_pull(&repo.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such pull request.".to_string()))?;
+    let repo_writer = can_write_repo(&state, &repo, &who, &headers).await?;
+    if !repo_writer {
+        return Err(AppError::Forbidden(
+            "Only a repository maintainer can dismiss a review.".to_string(),
+        ));
+    }
+    let dismissed = state
+        .store
+        .dismiss_pull_review(&review_id, &pull.id)
+        .await?;
+    if !dismissed {
+        return Err(AppError::NotFound("No such review.".to_string()));
+    }
     Ok(redirect(&format!("/r/{owner}/{name}/pulls/{number}")))
 }
 
@@ -2552,6 +2599,7 @@ async fn render_detail(
         csrf,
         pull,
         can_review_user,
+        repo_writer,
     );
     let mergeability = if pull.is_open() {
         Some(preflight_mergeability(state, repo, pull).await)
@@ -2874,6 +2922,9 @@ struct ReviewSummary {
 fn review_summary(reviews: &[PullReview]) -> ReviewSummary {
     let mut latest: BTreeMap<String, &PullReview> = BTreeMap::new();
     for review in reviews {
+        if review.dismissed {
+            continue;
+        }
         latest.insert(review.reviewer_sub.clone(), review);
     }
     let mut approvals = Vec::new();
@@ -2950,6 +3001,7 @@ async fn evaluate_review_requirements(
         approval_count,
         required_approvals,
         approval_satisfied: approval_count >= required_approvals,
+        changes_requested: summary.changes_requested.clone(),
         codeowners,
     }
 }
@@ -3195,6 +3247,12 @@ fn review_requirement_blockers(requirements: &ReviewRequirements) -> Vec<String>
             ));
         }
     }
+    if !requirements.changes_requested.is_empty() {
+        blockers.push(format!(
+            "Changes requested by {} must be resolved or dismissed before merge.",
+            requirements.changes_requested.join(", ")
+        ));
+    }
     if requirements.codeowners.enabled && !requirements.codeowners.satisfied() {
         blockers.push(format!(
             "Code owner review is required from {}.",
@@ -3231,16 +3289,35 @@ fn render_review_requirements(requirements: &ReviewRequirements) -> String {
     } else {
         "approval-status--blocked"
     };
+    let changes_state = if requirements.changes_requested.is_empty() {
+        "approval-status--satisfied"
+    } else {
+        "approval-status--blocked"
+    };
+    let changes_text = if requirements.changes_requested.is_empty() {
+        "No active requests for changes.".to_string()
+    } else {
+        format!(
+            "Changes requested by {}.",
+            requirements.changes_requested.join(", ")
+        )
+    };
     let codeowners = render_codeowners_requirement(&requirements.codeowners);
     format!(
         r#"<div class="approval-status {approval_state}">
   <strong>Approvals</strong>
   <span class="approval-count">{approvals} of {required} approvals</span>
 </div>
+<div class="approval-status {changes_state}">
+  <strong>Changes requested</strong>
+  <span class="approval-count">{changes_text}</span>
+</div>
 {codeowners}"#,
         approval_state = approval_state,
         approvals = requirements.approval_count,
         required = requirements.required_approvals,
+        changes_state = changes_state,
+        changes_text = esc(&changes_text),
         codeowners = codeowners,
     )
 }
@@ -3361,6 +3438,7 @@ fn render_reviews_card(
     csrf: &str,
     pull: &Pull,
     can_resolve: bool,
+    can_dismiss: bool,
 ) -> String {
     let pending_count = comments.iter().filter(|comment| comment.pending).count();
     let unresolved_count = unresolved_thread_count(comments, thread_resolutions);
@@ -3370,6 +3448,30 @@ fn render_reviews_card(
         reviews
             .iter()
             .map(|review| {
+                let verdict = if review.dismissed {
+                    format!(
+                        "<span class=\"state-badge verdict-pill muted\">{}</span> <span class=\"muted\">&middot; dismissed</span>",
+                        esc(&review.verdict.replace('_', " "))
+                    )
+                } else {
+                    esc(&review.verdict.replace('_', " "))
+                };
+                let dismiss_form =
+                    if can_dismiss && review.verdict == "request_changes" && !review.dismissed {
+                        format!(
+                            r##"<form class="inline-form" method="post" action="/r/{owner}/{name}/pulls/{number}/review/{review_id}/dismiss">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <button class="btn btn-ghost" type="submit">Dismiss review</button>
+</form>"##,
+                            owner = esc(&repo.owner_sub),
+                            name = esc(&repo.name),
+                            number = pull.number,
+                            review_id = esc(&review.id),
+                            csrf = esc(csrf),
+                        )
+                    } else {
+                        String::new()
+                    };
                 let body = if review.body.trim().is_empty() {
                     String::new()
                 } else {
@@ -3380,12 +3482,13 @@ fn render_reviews_card(
                 };
                 format!(
                     r##"<li class="issue-item">
-  <div class="issue-item__meta"><span>{reviewer}</span> {verdict} {when}</div>
+  <div class="issue-item__meta"><span>{reviewer}</span> {verdict} {when}{dismiss_form}</div>
   {body}
 </li>"##,
                     reviewer = esc(&review.reviewer_sub),
-                    verdict = esc(&review.verdict.replace('_', " ")),
+                    verdict = verdict,
                     when = esc(&fmt_ts(review.created_at)),
+                    dismiss_form = dismiss_form,
                     body = body,
                 )
             })
@@ -4605,6 +4708,46 @@ mod tests {
         repo.require_approval = false;
         repo.required_approvals = 0;
         assert_eq!(effective_required_approvals(&repo), 0);
+    }
+
+    #[test]
+    fn review_requirements_block_active_changes_requested() {
+        let requirements = ReviewRequirements {
+            approval_count: 0,
+            required_approvals: 0,
+            approval_satisfied: true,
+            changes_requested: vec!["alice".to_string()],
+            codeowners: CodeOwnerEvaluation::disabled(),
+        };
+
+        assert!(!requirements.satisfied());
+        let blockers = review_requirement_blockers(&requirements);
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("Changes requested by alice"));
+    }
+
+    #[test]
+    fn dismissed_changes_requested_review_does_not_block() {
+        let reviews = vec![PullReview {
+            id: "rv1".to_string(),
+            pull_id: "pr1".to_string(),
+            reviewer_sub: "alice".to_string(),
+            verdict: "request_changes".to_string(),
+            body: String::new(),
+            created_at: 1,
+            dismissed: true,
+        }];
+        let summary = review_summary(&reviews);
+        let requirements = ReviewRequirements {
+            approval_count: summary.approvals.len(),
+            required_approvals: 0,
+            approval_satisfied: true,
+            changes_requested: summary.changes_requested,
+            codeowners: CodeOwnerEvaluation::disabled(),
+        };
+
+        assert!(requirements.satisfied());
+        assert!(review_requirement_blockers(&requirements).is_empty());
     }
 
     #[test]

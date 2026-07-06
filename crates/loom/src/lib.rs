@@ -270,6 +270,10 @@ pub fn app(state: AppState) -> Router {
             post(handlers::pulls::review),
         )
         .route(
+            "/r/{owner}/{name}/pulls/{number}/review/{review_id}/dismiss",
+            post(handlers::pulls::dismiss_review),
+        )
+        .route(
             "/r/{owner}/{name}/pulls/{number}/inline-comment",
             post(handlers::pulls::inline_comment),
         )
