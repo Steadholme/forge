@@ -69,6 +69,10 @@ pub struct Config {
     /// Bearer token for Loom -> cistern provisioning calls (`CISTERN_PROVISION_TOKEN`). Empty
     /// disables lazy database provisioning (no outbound call is made).
     pub cistern_provision_token: String,
+    /// Global estate webhook sink (`ESTATE_WEBHOOK_URL`) for internal bridge delivery.
+    pub estate_webhook_url: Option<String>,
+    /// Shared secret for signing estate webhook deliveries (`ESTATE_WEBHOOK_SECRET`).
+    pub estate_webhook_secret: Option<String>,
 }
 
 impl Config {
@@ -88,6 +92,8 @@ impl Config {
             auto_deploy_default: false,
             cistern_provision_url: DEFAULT_CISTERN_PROVISION_URL.to_string(),
             cistern_provision_token: String::new(),
+            estate_webhook_url: None,
+            estate_webhook_secret: None,
         }
     }
 
@@ -132,6 +138,12 @@ impl Config {
         }
         if let Some(v) = env_nonempty("CISTERN_PROVISION_TOKEN") {
             config.cistern_provision_token = v;
+        }
+        if let Some(v) = env_nonempty("ESTATE_WEBHOOK_URL") {
+            config.estate_webhook_url = Some(v);
+        }
+        if let Some(v) = env_nonempty("ESTATE_WEBHOOK_SECRET") {
+            config.estate_webhook_secret = Some(v);
         }
         config
     }

@@ -23,6 +23,7 @@ use crate::gitops::CommitDetail;
 use crate::handlers::repos::{can_admin_repo, load_visible_repo, validate_branch_name};
 use crate::handlers::{esc, redirect, short_oid};
 use crate::model::{Pull, Repo, RepoDeploy};
+use crate::webhooks;
 use crate::{now_secs, random_alnum, AppState};
 
 const DEPLOY_ID_LEN: usize = 16;
@@ -828,6 +829,17 @@ async fn start_pull_preview(
                         ),
                     }
                     if is_terminal_preview_status(&status) {
+                        if should_emit_deployment_ready(&status, &preview_url) {
+                            webhooks::emit_deployment_ready(
+                                &state,
+                                &repo,
+                                &repo.owner_sub,
+                                &pull.head,
+                                &preview_url,
+                                &commit_sha,
+                                pull.number,
+                            );
+                        }
                         terminal_seen = true;
                         break;
                     }
@@ -1724,6 +1736,10 @@ fn is_terminal_preview_status(status: &str) -> bool {
     )
 }
 
+fn should_emit_deployment_ready(status: &str, preview_url: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("ready") && !preview_url.is_empty()
+}
+
 fn preview_status_label(status: &str) -> &'static str {
     match status.trim().to_ascii_lowercase().as_str() {
         "ready" => "Ready",
@@ -2192,6 +2208,21 @@ mod tests {
                 "{status} should not be terminal"
             );
         }
+    }
+
+    #[test]
+    fn deployment_ready_emit_guard_requires_ready_status_and_url() {
+        assert!(should_emit_deployment_ready(
+            " ready ",
+            "https://preview.siteflow.test"
+        ));
+        for status in ["error", "failed", "canceled", "building", "queued"] {
+            assert!(
+                !should_emit_deployment_ready(status, "https://preview.siteflow.test"),
+                "{status} must not emit deployment_ready"
+            );
+        }
+        assert!(!should_emit_deployment_ready("ready", ""));
     }
 
     #[test]

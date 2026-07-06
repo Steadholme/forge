@@ -315,7 +315,7 @@ pub async fn create(
         ));
     }
 
-    let (assignee, milestone_id, label_ids) = clean_issue_metadata(
+    let (assignee, milestone_id, label_ids, label_names) = clean_issue_metadata(
         &state,
         &repo,
         &form.assignee,
@@ -345,7 +345,7 @@ pub async fn create(
         .set_issue_metadata(&issue.id, &assignee, &milestone_id, &label_ids)
         .await?;
     notify_issue_assigned(&state, &who.subject, &assignee, &repo, &issue);
-    webhooks::emit_issue(&state, &repo, "opened", &who.subject, &issue);
+    webhooks::emit_issue(&state, &repo, "opened", &who.subject, &issue, &label_names);
 
     tracing::info!(
         repo = repo.id,
@@ -365,7 +365,7 @@ async fn clean_issue_metadata(
     assignee: &str,
     milestone_id: &str,
     labels: &[String],
-) -> Result<(String, String, Vec<String>), AppError> {
+) -> Result<(String, String, Vec<String>, Vec<String>), AppError> {
     let assignee = assignee.trim().chars().take(128).collect::<String>();
     let milestones = state.store.list_milestones(&repo.id).await?;
     let clean_milestone = if milestone_id.trim().is_empty()
@@ -388,7 +388,12 @@ async fn clean_issue_metadata(
             clean_labels.push(id.to_string());
         }
     }
-    Ok((assignee, clean_milestone, clean_labels))
+    let label_names = clean_labels
+        .iter()
+        .filter_map(|id| repo_labels.iter().find(|label| label.id == *id))
+        .map(|label| label.name.clone())
+        .collect();
+    Ok((assignee, clean_milestone, clean_labels, label_names))
 }
 
 // ===========================================================================
@@ -737,7 +742,7 @@ pub async fn metadata(
                 .to_string(),
         ));
     }
-    let (assignee, milestone_id, label_ids) = clean_issue_metadata(
+    let (assignee, milestone_id, label_ids, _label_names) = clean_issue_metadata(
         &state,
         &repo,
         &form.assignee,
@@ -855,7 +860,30 @@ async fn apply_issue_toggle(
     } else {
         "reopened"
     };
-    webhooks::emit_issue_state(state, &repo, action, &who.subject, &issue, next);
+    let label_names = match state.store.issue_labels(&issue.id).await {
+        Ok(labels) => labels
+            .into_iter()
+            .map(|label| label.name)
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                repo = repo.id,
+                number,
+                "issue labels lookup failed for webhook payload"
+            );
+            Vec::new()
+        }
+    };
+    webhooks::emit_issue_state(
+        state,
+        &repo,
+        action,
+        &who.subject,
+        &issue,
+        next,
+        &label_names,
+    );
     tracing::info!(
         repo = repo.id,
         number,
