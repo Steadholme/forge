@@ -3579,7 +3579,7 @@ fn render_reviews_card(
   <div class="card__body">
     <ul class="issue-list timeline">{review_rows}</ul>
     <h3 class="section-subhead">Inline comments <span class="review-unresolved-count">{unresolved_count} unresolved</span></h3>
-    <ul class="issue-list timeline" id="pr-inline-thread">{inline_rows}</ul>
+    <ul class="issue-list timeline" id="pr-inline-thread" data-motion-list>{inline_rows}</ul>
     {forms}
   </div>
 </section>"##,

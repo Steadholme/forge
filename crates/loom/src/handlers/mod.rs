@@ -145,7 +145,7 @@ pub fn fmt_rel(now: i64, then: i64) -> String {
 pub fn page(title: &str, email: Option<&str>, body: &str) -> String {
     PAGE_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{JS}}", APP_JS)
+        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{TITLE}}", &esc(title))
         .replace("{{USERBOX}}", &userbox(title, email))

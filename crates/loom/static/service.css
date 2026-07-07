@@ -202,13 +202,19 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 }
 
 /* ---- Tabs (code / issues / pulls) --------------------------------------- */
-.tabs { display:flex; gap:8px; border-bottom:1px solid var(--border); margin-bottom:8px; }
+.tabs { display:flex; gap:8px; border-bottom:1px solid var(--border); margin-bottom:8px; view-transition-name:ody-tabs; }
 .tab {
   padding:8px 12px; font-size:14px; font-weight:500; color:var(--ink-2);
   border-bottom:2px solid transparent; margin-bottom:-1px; height:auto;
+  position:relative;
 }
 .tab:hover { color:var(--ink); border-bottom-color:var(--border); text-decoration:none; }
-.tab--active { color:var(--ink); font-weight:600; border-bottom-color:var(--tab-hot); }
+.tab--active { color:var(--ink); font-weight:600; }
+.tab__ind {
+  position:absolute; left:0; right:0; bottom:-1px; height:2px;
+  background:var(--tab-hot); border-radius:2px;
+  view-transition-name:ody-tab-active;
+}
 .tab__count {
   display:inline-block; background:var(--bg-2); border-radius:var(--r-pill);
   padding:0 8px; font-size:12px; color:var(--ink-2);
@@ -218,9 +224,9 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 .tree-row { display:grid; grid-template-columns:minmax(0,44%) minmax(0,1fr) auto;
   gap:16px; align-items:center; min-height:40px; padding:8px 16px;
   border-top:1px solid var(--hairline);
-  transition:background var(--dur) var(--ease); }
+  transition:background var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
 .tree-row:first-child { border-top:0; }
-.tree-row:hover { background:var(--surface-2); }
+.tree-row:hover { background:var(--surface-2); box-shadow:inset 3px 0 0 var(--accent); }
 .tree-row__name { font-size:14px; font-weight:400; min-width:0;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .tree-row--dir .tree-row__name { color:var(--link); font-weight:400; }
@@ -274,6 +280,7 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 .blob-code {
   width:100%; border-collapse:collapse; background:var(--surface-2);
   font-family:var(--mono); font-size:13px; line-height:1.65; tab-size:4;
+  view-transition-name:ody-blob;
 }
 .blob-line__num {
   width:1%; padding:0 16px; text-align:right; vertical-align:top;
@@ -420,7 +427,7 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 .diff-toolbar{display:flex;justify-content:flex-end;margin-bottom:8px}
 .diff-toolbar:empty{display:none}
 .diff-files{display:flex;flex-direction:column;gap:12px}
-details.diff-file{border:1px solid var(--border);border-radius:var(--r-sm);overflow:hidden;background:var(--surface)}
+details.diff-file{border:1px solid var(--border);border-radius:var(--r-sm);background:var(--surface)}
 .diff-file__summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 12px;background:var(--surface-2);font:600 12.5px/1.2 var(--mono);color:var(--ink-2);user-select:none;transition:background var(--dur) var(--ease)}
 .diff-file__summary::-webkit-details-marker{display:none}
 .diff-file__summary:hover{background:var(--surface-3)}
@@ -430,6 +437,7 @@ details.diff-file{border:1px solid var(--border);border-radius:var(--r-sm);overf
 .diff-add{color:var(--ok-ink)}
 .diff-del{color:var(--down-ink)}
 details.diff-file[open] .diff-file__summary{border-bottom:1px solid var(--border)}
+details.diff-file > .diff{border-radius:0 0 calc(var(--r-sm) - 1px) calc(var(--r-sm) - 1px);overflow:hidden}
 
 .diff-code{position:relative}
 .diff-commentbtn{position:absolute;left:-8px;top:50%;transform:translateY(-50%);width:18px;height:18px;line-height:1;padding:0;border:none;border-radius:var(--r-xs);background:var(--accent);color:#fff;font-weight:700;cursor:pointer;opacity:0;transition:opacity var(--dur) var(--ease);z-index:2}
@@ -1339,6 +1347,9 @@ mark.code-search-hit {
 .blob-line:target      > .blob-line__code {
   background:var(--warn-soft);
 }
+.blob-line:target      > .blob-line__code {
+  animation:ody-line-flash var(--dur-4) var(--ease-out);
+}
 /* The gutter echoes the wash with a warmer ink and a 3px rail painted along its
    left edge (a background gradient, not a box-shadow, so it renders reliably on
    border-collapse cells). The rail is continuous down a range, marking the
@@ -2101,14 +2112,14 @@ mark.code-search-hit {
    Appended last on purpose: .timeline > .issue-item relies on source order
    against equal-specificity issue-item rules above.
    Sticky geometry is keyed to the 56px appbar — if the appbar height ever
-   changes, update these together: .diff-card__bar top:56px, .diff-card
+   changes, update these together: .diff-card__bar top:var(--appbar-h,56px), .diff-card
    scroll-margin-top:64px, .diff-card .diff-file scroll-margin-top:110px,
-   and the P1 .diff-file__summary top:98px.
+   and the P1 .diff-file__summary top:var(--appbar-h,56px).
    Tokens only below this banner — no raw hex, no new keyframes.
    ========================================================================== */
 
 /* --- A. repo pagehead ----------------------------------------------------- */
-.repohead { margin:0 0 14px; display:flex; flex-direction:column; gap:6px; }
+.repohead { margin:0 0 14px; display:flex; flex-direction:column; gap:6px; view-transition-name:ody-masthead; }
 .repohead__row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; }
 .repohead__icon { width:20px; height:20px; color:var(--ink-3); }          /* aria-hidden decoration */
 .repohead__title { margin:0; font-size:20px; font-weight:600; letter-spacing:-.02em;
@@ -2121,7 +2132,7 @@ mark.code-search-hit {
 
 /* tabs: active belt + count pills (markup emits class + aria-current);
    the count pill stays neutral in every state (GitHub idiom) */
-.tab[aria-current="page"] { color:var(--ink); font-weight:600; border-bottom-color:var(--tab-hot); }
+.tab[aria-current="page"] { color:var(--ink); font-weight:600; }
 .tab__count { margin-left:2px; padding:1px 8px; font-weight:600; font-variant-numeric:tabular-nums; }
 
 @media (max-width:560px){
@@ -2196,6 +2207,7 @@ mark.code-search-hit {
 }
 
 /* --- C. file box ---------------------------------------------------------- */
+.filebox { box-shadow:var(--elev-raised); view-transition-name:ody-filebox; }
 .filebox + .card { margin-top:16px; }        /* files -> readme rhythm on the no-release path */
 
 .filebox__commit { display:flex; align-items:center; gap:10px; min-width:0;
@@ -2210,6 +2222,7 @@ mark.code-search-hit {
 .filebox__commit-more { font-size:12.5px; font-weight:550; white-space:nowrap; }
 
 .filebox__head { padding:10px 16px; }        /* holds the .breadcrumb; card__head base draws the rule */
+.filebox__head .breadcrumb { view-transition-name:ody-crumb; }
 
 .card__body--list { padding:0; overflow:hidden;
   border-radius:0 0 calc(var(--r) - 1px) calc(var(--r) - 1px); }
@@ -2299,12 +2312,13 @@ mark.code-search-hit {
 .preview-bot-body { margin:10px 0 0; }
 
 /* --- E. diff card bar ------------------------------------------------------ */
-.diff-card { scroll-margin-top:64px; }          /* #files anchor clears the 56px appbar */
-.diff-card__bar { position:sticky; top:56px; z-index:10;
+.diff-card { scroll-margin-top:64px; view-transition-name:ody-diff; }          /* #files anchor clears the 56px appbar */
+.diff-card__bar { position:sticky; top:var(--appbar-h,56px); z-index:var(--z-sticky);
   display:flex; align-items:center; gap:12px; flex-wrap:wrap;
-  padding:9px 14px; background:var(--surface-2);
+  padding:9px 14px; background:var(--surface);
   border-bottom:1px solid var(--border);
-  border-radius:calc(var(--r) - 1px) calc(var(--r) - 1px) 0 0; }
+  border-radius:calc(var(--r) - 1px) calc(var(--r) - 1px) 0 0;
+  box-shadow:var(--elev-sticky); }
 .diff-card__summary { font-size:13px; color:var(--ink-2); white-space:nowrap; }
 .diff-card__summary b { color:var(--ink); font-weight:650; }
 /* +N / -N counts reuse .diff-add / .diff-del */
@@ -2334,10 +2348,14 @@ mark.code-search-hit {
    closed = all four corners, open = top two (bottom stays square on purpose).
    Regression watch: split view / :target highlight / viewed fold. */
 details.diff-file { overflow:visible; }
-.diff-file__summary { position:sticky; top:98px; z-index:3;      /* 56 appbar + 42 bar */
-  border-radius:calc(var(--r-sm) - 1px); }
+.diff-file__summary { position:sticky; top:var(--appbar-h,56px); z-index:var(--z-sticky);
+  border-radius:calc(var(--r-sm) - 1px); box-shadow:var(--elev-sticky); }
 details.diff-file[open] > .diff-file__summary {
   border-radius:calc(var(--r-sm) - 1px) calc(var(--r-sm) - 1px) 0 0; }
+@supports (backdrop-filter:blur(1px)){
+  .diff-card__bar,
+  .diff-file__summary { background:var(--frost-bg); backdrop-filter:var(--frost-blur); }
+}
 
 /* --- F. timeline ------------------------------------------------------------ */
 .timeline { position:relative; padding:4px 0 4px 22px; }
@@ -2391,7 +2409,7 @@ details.diff-file[open] > .diff-file__summary {
 .list-toolbar__fill { flex:1 1 auto; }
 .list-toolbar .compare-picker { margin:0; }
 
-.tabs--filter { border-bottom:0; margin-bottom:0; gap:4px; }
+.tabs--filter { border-bottom:0; margin-bottom:0; gap:4px; view-transition-name:none; }
 .tabs--filter .tab { height:auto; padding:5px 12px; margin-bottom:0;
   border:1px solid transparent; border-radius:var(--r-pill);
   font-size:12.5px; font-weight:550; color:var(--ink-2); }
@@ -2490,10 +2508,16 @@ h3 { font-size:14px; }
 .commits-head__title { font-size:16px; font-weight:600; }
 .commit-group { margin:16px 0 0; }
 .commit-group__date { font-size:14px; font-weight:600; color:var(--ink-2); margin:0 0 8px; }
-.commit-group__list { list-style:none; margin:0; padding:0;
+.commit-group__list { list-style:none; margin:0; padding:0; position:relative;
   border:1px solid var(--border); border-radius:var(--r); background:var(--surface); }
-.commit-row { display:flex; align-items:center; gap:12px; padding:8px 16px;
+.commit-group__list::before { content:""; position:absolute; left:26px; top:12px; bottom:12px;
+  width:2px; background:var(--border); border-radius:1px; pointer-events:none; }
+.commit-row { position:relative; display:flex; align-items:center; gap:12px; padding:8px 16px;
   border-top:1px solid var(--hairline); }
+.commit-row::before { content:""; position:absolute; left:22px; top:50%;
+  width:8px; height:8px; border-radius:50%; transform:translateY(-50%);
+  background:var(--surface); border:2px solid var(--border-2); pointer-events:none; }
+.commit-row > .avatar--sm { position:relative; z-index:1; }
 .commit-row:first-child { border-top:0; }
 .avatar--sm { width:20px; height:20px; font-size:10px; flex:none; }
 .commit-row__main { min-width:0; flex:1 1 auto; }
@@ -2581,6 +2605,13 @@ h3 { font-size:14px; }
 @media (prefers-reduced-motion:reduce){
   .commit-row__subject, .sha-group__oid, .sha-group__copy,
   .issue-item__title, .pr-item__title { transition:none; }
+}
+
+@media (prefers-reduced-motion:reduce){
+  ::view-transition-group(*),
+  ::view-transition-image-pair(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) { animation:none!important; }
 }
 
 

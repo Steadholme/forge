@@ -1328,16 +1328,21 @@ pub(crate) fn render_repo_header_with_parent(
         .unwrap_or_default();
     let tab = |is_active: bool| {
         if is_active {
-            (" tab--active", " aria-current=\"page\"")
+            (
+                " tab--active",
+                " aria-current=\"page\"",
+                "<span class=\"tab__ind\" aria-hidden=\"true\"></span>",
+            )
         } else {
-            ("", "")
+            ("", "", "")
         }
     };
-    let (code_active, code_current) = tab(matches!(active, "code" | "commits" | "branches"));
-    let (issues_active, issues_current) = tab(active == "issues");
-    let (pulls_active, pulls_current) = tab(active == "pulls");
-    let (releases_active, releases_current) = tab(active == "releases");
-    let (settings_active, settings_current) = tab(active == "settings");
+    let (code_active, code_current, code_ind) =
+        tab(matches!(active, "code" | "commits" | "branches"));
+    let (issues_active, issues_current, issues_ind) = tab(active == "issues");
+    let (pulls_active, pulls_current, pulls_ind) = tab(active == "pulls");
+    let (releases_active, releases_current, releases_ind) = tab(active == "releases");
+    let (settings_active, settings_current, settings_ind) = tab(active == "settings");
     format!(
         r##"<header class="repohead">
   <div class="repohead__row">
@@ -1349,11 +1354,11 @@ pub(crate) fn render_repo_header_with_parent(
   {fork_line}
 </header>
 <nav class="tabs" aria-label="Repository sections">
-  <a class="tab{code_active}"{code_current} href="/r/{owner}/{name}">Code</a>
-  <a class="tab{issues_active}"{issues_current} href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span></a>
-  <a class="tab{pulls_active}"{pulls_current} href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span></a>
-  <a class="tab{releases_active}"{releases_current} href="/r/{owner}/{name}/releases">Releases <span class="tab__count">{release_count}</span></a>
-  <a class="tab{settings_active}"{settings_current} href="/r/{owner}/{name}/settings">Settings</a>
+  <a class="tab{code_active}"{code_current} href="/r/{owner}/{name}">Code{code_ind}</a>
+  <a class="tab{issues_active}"{issues_current} href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span>{issues_ind}</a>
+  <a class="tab{pulls_active}"{pulls_current} href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span>{pulls_ind}</a>
+  <a class="tab{releases_active}"{releases_current} href="/r/{owner}/{name}/releases">Releases <span class="tab__count">{release_count}</span>{releases_ind}</a>
+  <a class="tab{settings_active}"{settings_current} href="/r/{owner}/{name}/settings">Settings{settings_ind}</a>
 </nav>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
@@ -1362,14 +1367,19 @@ pub(crate) fn render_repo_header_with_parent(
         fork_line = fork_line,
         code_active = code_active,
         code_current = code_current,
+        code_ind = code_ind,
         releases_active = releases_active,
         releases_current = releases_current,
+        releases_ind = releases_ind,
         pulls_active = pulls_active,
         pulls_current = pulls_current,
+        pulls_ind = pulls_ind,
         issues_active = issues_active,
         issues_current = issues_current,
+        issues_ind = issues_ind,
         settings_active = settings_active,
         settings_current = settings_current,
+        settings_ind = settings_ind,
         open_issues = open_issues,
         open_pulls = open_pulls,
         release_count = release_count,

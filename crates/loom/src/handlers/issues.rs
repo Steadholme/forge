@@ -1523,7 +1523,7 @@ fn render_detail(
       <div class="comment-box__meta"><b>{author}</b> <span>opened this issue</span> <span title="{created_abs}">{created_rel}</span></div>
       <div class="comment-box__body">{body_html}{issue_reactions}</div>
     </section>
-    <ul class="issue-list timeline">{comment_list}</ul>
+    <ul class="issue-list timeline" data-motion-list>{comment_list}</ul>
     <section class="card composer">
       <div class="card__body">
         <form method="post" action="/r/{owner}/{name}/issues/{number}/comment">
