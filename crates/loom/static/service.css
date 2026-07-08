@@ -2829,3 +2829,17 @@ h3 { font-size:14px; }
 }
 /* Loom 的中绿在暗底承载白标签(accent-lift 惯用法对更亮 accent 才成立)*/
 :root[data-theme="dark"] .btn-primary{ color:#fff; }
+
+.ft-layout{ display:grid; grid-template-columns:minmax(220px, 300px) minmax(0,1fr); gap:20px; align-items:start; }
+.ft-main{ min-width:0; }
+.ft-side{ position:sticky; top:72px; max-height:calc(100vh - 96px); overflow:auto; }
+.filetree{ font-size:13px; }
+.ft-list{ list-style:none; margin:0; padding:0; }
+.ft-list .ft-list{ padding-left:14px; border-left:1px solid var(--hairline); margin-left:6px; }
+.ft-row{ display:flex; align-items:center; gap:6px; padding:3px 8px; border-radius:7px; color:var(--ink-2); text-decoration:none; white-space:nowrap; }
+.ft-row:hover{ background:var(--bg-2); color:var(--ink); }
+.ft-row svg{ width:15px; height:15px; flex:none; color:var(--ink-3); }
+.ft-row--file.is-current{ background:var(--accent-soft); color:var(--accent-ink); font-weight:600; }
+.ft-row--file.is-current svg{ color:var(--accent-ink); }
+.ft-dir.is-open > .ft-row svg{ color:var(--ink-2); }
+@media (max-width:900px){ .ft-layout{ grid-template-columns:1fr; } .ft-side{ display:none; } }

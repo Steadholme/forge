@@ -19,7 +19,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::gitops::{
-    BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, LanguageStat, TreeEntry,
+    BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, GitOps, LanguageStat, TreeEntry,
     TreeLastCommits,
 };
 use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
@@ -295,6 +295,8 @@ pub async fn blob(
         .release_count(&repo.id, false)
         .await
         .unwrap_or(0);
+    let commit_prefix = pinned.then_some(commit.as_str());
+    let tree = render_file_tree(&state.git, &repo, &commit, commit_prefix, &path, true).await;
     let body = render_blob(
         &repo,
         &state.config.public_base_url,
@@ -305,6 +307,7 @@ pub async fn blob(
         &path,
         &bytes,
         pinned,
+        &tree,
     );
     Ok(html_ok(page(
         &format!("{}/{}", owner, name),
@@ -1137,7 +1140,10 @@ async fn render_code_page_at_commit(
         format!("{files}{readme}")
     };
 
-    Ok(format!("{header}{toolbar}{content}"))
+    let tree = render_file_tree(&state.git, repo, commit, commit_prefix, subpath, false).await;
+    Ok(format!(
+        "{header}<div class=\"ft-layout\"><aside class=\"ft-side\">{tree}</aside><div class=\"ft-main\">{toolbar}{content}</div></div>"
+    ))
 }
 
 fn render_code_toolbar(
@@ -1681,6 +1687,168 @@ fn render_file_browser(
     )
 }
 
+async fn render_file_tree(
+    git: &GitOps,
+    repo: &Repo,
+    commit: &str,
+    commit_prefix: Option<&str>,
+    current_path: &str,
+    current_is_blob: bool,
+) -> String {
+    if commit.is_empty() {
+        return String::new();
+    }
+
+    let segs: Vec<&str> = current_path
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .collect();
+    let expanded_len = if current_is_blob {
+        segs.len().saturating_sub(1)
+    } else {
+        segs.len()
+    };
+    let spine = &segs[..expanded_len];
+
+    let mut levels = Vec::with_capacity(spine.len() + 1);
+    levels.push((
+        String::new(),
+        git.list_tree(&repo.owner_sub, &repo.name, commit, "").await,
+    ));
+
+    let mut dir_path = String::new();
+    for seg in spine {
+        if !dir_path.is_empty() {
+            dir_path.push('/');
+        }
+        dir_path.push_str(seg);
+        levels.push((
+            dir_path.clone(),
+            git.list_tree(&repo.owner_sub, &repo.name, commit, &dir_path)
+                .await,
+        ));
+    }
+
+    let rows = render_file_tree_level(
+        &levels,
+        0,
+        spine,
+        current_path,
+        current_is_blob,
+        repo,
+        commit_prefix,
+    );
+    format!(
+        r#"<nav class="filetree" aria-label="Files" style="view-transition-name:loom-filetree">{rows}</nav>"#
+    )
+}
+
+fn render_file_tree_level(
+    levels: &[(String, Vec<TreeEntry>)],
+    level_idx: usize,
+    spine: &[&str],
+    current_path: &str,
+    current_is_blob: bool,
+    repo: &Repo,
+    commit_prefix: Option<&str>,
+) -> String {
+    let Some((dir_path, entries)) = levels.get(level_idx) else {
+        return "<ul class=\"ft-list\"></ul>".to_string();
+    };
+    let mut sorted: Vec<&TreeEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.is_dir()
+            .cmp(&a.is_dir())
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut rows = String::new();
+    for entry in sorted {
+        let entry_path = if dir_path.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{dir_path}/{}", entry.name)
+        };
+
+        if entry.is_dir() {
+            let href = tree_href(repo, &entry_path, commit_prefix);
+            let is_open = spine.get(level_idx) == Some(&entry.name.as_str())
+                && path_has_prefix(current_path, &entry_path);
+            if is_open {
+                let children = render_file_tree_level(
+                    levels,
+                    level_idx + 1,
+                    spine,
+                    current_path,
+                    current_is_blob,
+                    repo,
+                    commit_prefix,
+                );
+                rows.push_str(&format!(
+                    "<li class=\"ft-dir is-open\"><a class=\"ft-row ft-row--dir\" href=\"{href}\">{icon}{name}</a>{children}</li>",
+                    href = esc(&href),
+                    icon = icon_chevron_down(),
+                    name = esc(&entry.name),
+                    children = children,
+                ));
+            } else {
+                rows.push_str(&format!(
+                    "<li class=\"ft-dir\"><a class=\"ft-row ft-row--dir\" href=\"{href}\">{icon}{name}</a></li>",
+                    href = esc(&href),
+                    icon = icon_chevron_right(),
+                    name = esc(&entry.name),
+                ));
+            }
+        } else {
+            let href = blob_href(repo, &entry_path, commit_prefix);
+            let is_current = current_is_blob && entry_path == current_path;
+            let current_class = if is_current { " is-current" } else { "" };
+            let aria_current = if is_current {
+                " aria-current=\"page\""
+            } else {
+                ""
+            };
+            rows.push_str(&format!(
+                "<li class=\"ft-file\"><a class=\"ft-row ft-row--file{current_class}\" href=\"{href}\"{aria_current}>{icon}{name}</a></li>",
+                current_class = current_class,
+                href = esc(&href),
+                aria_current = aria_current,
+                icon = icon_file(),
+                name = esc(&entry.name),
+            ));
+        }
+    }
+
+    format!("<ul class=\"ft-list\">{rows}</ul>")
+}
+
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    if path == prefix {
+        return true;
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+fn icon_chevron_right() -> &'static str {
+    r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 4 4 4-4 4"/></svg>"#
+}
+
+fn icon_chevron_down() -> &'static str {
+    r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>"#
+}
+
+fn icon_file() -> &'static str {
+    r#"<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M3.75 1A1.75 1.75 0 0 0 2 2.75v10.5C2 14.216 2.784 15 3.75 15h8.5A1.75 1.75 0 0 0 14 13.25V5.664c0-.464-.184-.909-.513-1.237L10.573 1.513A1.75 1.75 0 0 0 9.336 1H3.75Zm-.25 1.75a.25.25 0 0 1 .25-.25H9v2.75c0 .966.784 1.75 1.75 1.75h1.75v6.25a.25.25 0 0 1-.25.25h-8.5a.25.25 0 0 1-.25-.25V2.75Zm7 .81L11.94 5.5h-1.19a.25.25 0 0 1-.25-.25V3.56Z"/></svg>"#
+}
+
 fn file_history_href(repo: &Repo, ref_name: &str, path: &str) -> String {
     format!(
         "/r/{}/{}/history/{}/{}",
@@ -1689,6 +1857,7 @@ fn file_history_href(repo: &Repo, ref_name: &str, path: &str) -> String {
 }
 
 fn tree_href(repo: &Repo, path: &str, commit_prefix: Option<&str>) -> String {
+    let path = url_path(path);
     match commit_prefix {
         Some(commit) if path.is_empty() => {
             format!("/r/{}/{}/tree/{}", repo.owner_sub, repo.name, commit)
@@ -1704,6 +1873,7 @@ fn tree_href(repo: &Repo, path: &str, commit_prefix: Option<&str>) -> String {
 }
 
 fn blob_href(repo: &Repo, path: &str, commit_prefix: Option<&str>) -> String {
+    let path = url_path(path);
     match commit_prefix {
         Some(commit) => {
             format!(
@@ -1713,6 +1883,29 @@ fn blob_href(repo: &Repo, path: &str, commit_prefix: Option<&str>) -> String {
         }
         None => format!("/r/{}/{}/blob/{}", repo.owner_sub, repo.name, path),
     }
+}
+
+fn url_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    path.split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_path_segment(input: &str) -> String {
+    let mut out = String::new();
+    for b in input.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// File-view card: repo header + breadcrumb + escaped file content (or a binary/too-large notice).
@@ -1726,6 +1919,7 @@ fn render_blob(
     path: &str,
     bytes: &[u8],
     pinned: bool,
+    file_tree: &str,
 ) -> String {
     let header = render_repo_header(
         repo,
@@ -1769,20 +1963,24 @@ fn render_blob(
             )
         }
     };
-    format!(
-        r##"{header}{search}
-<section class="card">
+    let blob = format!(
+        r##"<section class="card">
   <div class="card__head">{breadcrumb}<span class="blob-actions"><a class="btn btn-ghost btn-sm btn-permalink" href="{permalink_href}" data-permalink="{permalink_href}">Permalink</a><a class="btn btn-ghost btn-sm" href="{history_href}">History</a><a class="btn btn-ghost btn-sm" href="{blame_href}">Blame</a><span class="muted">{size}</span></span></div>
   {content}
 </section>"##,
-        header = header,
-        search = search,
         breadcrumb = render_breadcrumb_at(repo, path, true, pinned.then_some(commit)),
         history_href = esc(&history_href),
         blame_href = esc(&blame_href),
         permalink_href = esc(&permalink_href),
         size = esc(&human_size(bytes.len() as i64)),
         content = content,
+    );
+    format!(
+        r##"{header}<div class="ft-layout"><aside class="ft-side">{file_tree}</aside><div class="ft-main">{search}{blob}</div></div>"##,
+        header = header,
+        file_tree = file_tree,
+        search = search,
+        blob = blob,
     )
 }
 
