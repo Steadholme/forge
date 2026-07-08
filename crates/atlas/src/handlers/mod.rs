@@ -103,7 +103,7 @@ fn user_menu(email: &str) -> String {
 /// Render the shared Odyssey v2 app-bar: a brand lockup (Atlas's network tile + wordmark), the
 /// estate nav (Catalog / Topology, current marked `.is-active`), an "All apps" waffle to the apex
 /// portal, and the avatar menu. `page_title` selects the active nav item.
-pub fn topbar(page_title: &str, email: &str) -> String {
+pub fn topbar(page_title: &str, email: &str, theme: &str) -> String {
     let topology_active = page_title == "Topology";
     let catalog_cls = if topology_active { "appnav" } else { "appnav is-active" };
     let topology_cls = if topology_active { "appnav is-active" } else { "appnav" };
@@ -120,12 +120,42 @@ pub fn topbar(page_title: &str, email: &str) -> String {
   <div class="appbar__spacer"></div>
   <div class="appbar__right">
     <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+    {switcher}
     {user}
   </div>
 </header>"##,
         catalog_cls = catalog_cls,
         topology_cls = topology_cls,
+        switcher = theme_switcher(theme),
         user = user_menu(email),
+    )
+}
+
+fn theme_switcher(current: &str) -> String {
+    let light_active = if current == "light" { " is-active" } else { "" };
+    let dark_active = if current == "dark" { " is-active" } else { "" };
+    let auto_active = if current == "auto" { " is-active" } else { "" };
+    let light_cur = if current == "light" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    let dark_cur = if current == "dark" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    let auto_cur = if current == "auto" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    format!(
+        r##"<div class="themeswitch" role="group" aria-label="Theme">
+  <a class="themeswitch__opt{light_active}" href="/_gw/theme?to=light" title="Light" aria-label="Light"{light_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></a>
+  <a class="themeswitch__opt{dark_active}" href="/_gw/theme?to=dark" title="Dark" aria-label="Dark"{dark_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6.5 6.5 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></a>
+  <a class="themeswitch__opt{auto_active}" href="/_gw/theme?to=auto" title="System" aria-label="System"{auto_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></a>
+</div>"##
     )
 }
 
@@ -213,7 +243,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 </footer>
 </body></html>"#,
         css = app_css(),
-        topbar = topbar("Atlas", "—"),
+        topbar = topbar("Atlas", "—", "light"),
         code = code,
         reason = esc(reason),
         msg = esc(message),

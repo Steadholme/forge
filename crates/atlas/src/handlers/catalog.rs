@@ -73,6 +73,7 @@ async fn load_inventory(state: &AppState) -> Inventory {
 /// and any operator annotation, plus a headline summary.
 pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
     let (_sub, email) = auth::require_viewer(&headers)?;
+    let theme = odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let inv = load_inventory(&state).await;
 
     let banner = if inv.routes_available {
@@ -96,7 +97,9 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
 
     let page = CATALOG_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Catalog", &email))
+        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
+        .replace("{{TOPBAR}}", &topbar("Catalog", &email, theme))
         .replace("{{BANNER}}", &banner)
         .replace("{{SUMMARY}}", &summary)
         .replace("{{SERVICES}}", &rows);
@@ -114,6 +117,7 @@ pub async fn detail(
     Path(key): Path<String>,
 ) -> Result<Response, AppError> {
     let (_sub, email) = auth::require_viewer(&headers)?;
+    let theme = odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let inv = load_inventory(&state).await;
 
     // The discovered entry (from routes), if any.
@@ -158,7 +162,9 @@ pub async fn detail(
 
     let page = DETAIL_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Service", &email))
+        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
+        .replace("{{TOPBAR}}", &topbar("Service", &email, theme))
         .replace("{{KEY}}", &esc(&entry.key))
         .replace("{{DISPLAY_NAME}}", &esc(&entry.display_name))
         .replace("{{STATUS_PILL}}", &status_pill(&entry.status))
@@ -225,12 +231,15 @@ pub async fn annotate(
 /// upstream service, colored by the service's primary auth mode.
 pub async fn graph(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
     let (_sub, email) = auth::require_viewer(&headers)?;
+    let theme = odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let inv = load_inventory(&state).await;
 
     let svg = render_graph_svg(&inv);
     let page = GRAPH_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Topology", &email))
+        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
+        .replace("{{TOPBAR}}", &topbar("Topology", &email, theme))
         .replace("{{COUNT}}", &inv.services_total.to_string())
         .replace("{{SVG}}", &svg);
     Ok(Html(page).into_response())
