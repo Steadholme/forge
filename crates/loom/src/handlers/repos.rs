@@ -63,7 +63,7 @@ pub async fn index(
     let body = render_index(&who, &rows, &query);
     html_with_csrf(
         StatusCode::OK,
-        page("Repositories", Some(&who.email), &body),
+        page("Repositories", Some(&who.email), who.theme, &body),
         &csrf,
     )
 }
@@ -74,7 +74,7 @@ pub async fn new_page(State(_state): State<AppState>, headers: HeaderMap) -> Res
     let body = render_new(&csrf, None, "", "", "main", false);
     html_with_csrf(
         StatusCode::OK,
-        page("Create repository", Some(&who.email), &body),
+        page("Create repository", Some(&who.email), who.theme, &body),
         &csrf,
     )
 }
@@ -173,7 +173,12 @@ pub async fn view(
     let body = render_code_page(&state, &repo, "", &toolbar_actions).await?;
     Ok(html_with_csrf(
         StatusCode::OK,
-        page(&format!("{}/{}", owner, name), Some(&who.email), &body),
+        page(
+            &format!("{}/{}", owner, name),
+            Some(&who.email),
+            who.theme,
+            &body,
+        ),
         &csrf,
     ))
 }
@@ -260,6 +265,7 @@ pub async fn tree(
     Ok(html_ok(page(
         &format!("{}/{}", owner, name),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }
@@ -303,6 +309,7 @@ pub async fn blob(
     Ok(html_ok(page(
         &format!("{}/{}", owner, name),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }
@@ -384,6 +391,7 @@ pub async fn code_search(
     Ok(html_ok(page(
         &format!("{owner}/{name} · Code search"),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }
@@ -415,7 +423,7 @@ pub async fn blame(
             &path,
             "No such ref in this repository.",
         );
-        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+        return Ok(html_ok(page(&title, Some(&who.email), who.theme, &body)));
     };
     let Some(bytes) = state
         .git
@@ -424,7 +432,7 @@ pub async fn blame(
     else {
         let body =
             render_blame_notice(&repo, &header, ref_name, &path, "No such file at this ref.");
-        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+        return Ok(html_ok(page(&title, Some(&who.email), who.theme, &body)));
     };
 
     let body = if bytes.contains(&0) {
@@ -463,7 +471,7 @@ pub async fn blame(
         }
     };
 
-    Ok(html_ok(page(&title, Some(&who.email), &body)))
+    Ok(html_ok(page(&title, Some(&who.email), who.theme, &body)))
 }
 
 // ===========================================================================
@@ -495,7 +503,7 @@ pub async fn file_history(
     let title = format!("{owner}/{name} · File history");
     if path.is_empty() {
         let body = render_file_history_notice(&repo, &header, ref_name, &path, "No file path.");
-        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+        return Ok(html_ok(page(&title, Some(&who.email), who.theme, &body)));
     }
 
     let Some(commit) = resolve_blame_ref(&state, &repo, ref_name).await else {
@@ -506,7 +514,7 @@ pub async fn file_history(
             &path,
             "No such ref in this repository.",
         );
-        return Ok(html_ok(page(&title, Some(&who.email), &body)));
+        return Ok(html_ok(page(&title, Some(&who.email), who.theme, &body)));
     };
 
     let after = match q.after.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -544,7 +552,7 @@ pub async fn file_history(
         "{header}{history}",
         history = render_file_history(&repo, ref_name, &path, &commits, paged, has_next),
     );
-    Ok(html_ok(page(&title, Some(&who.email), &body)))
+    Ok(html_ok(page(&title, Some(&who.email), who.theme, &body)))
 }
 
 // ===========================================================================
@@ -1014,7 +1022,7 @@ async fn render_new_error(who: &Identity, msg: &str, form: &CreateForm) -> Respo
     );
     html_with_csrf(
         StatusCode::BAD_REQUEST,
-        page("Create repository", Some(&who.email), &body),
+        page("Create repository", Some(&who.email), who.theme, &body),
         &csrf,
     )
 }

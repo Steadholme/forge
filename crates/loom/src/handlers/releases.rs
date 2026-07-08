@@ -37,6 +37,7 @@ pub async fn list(
     Ok(html_ok(page(
         &format!("{owner}/{name} · Releases"),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }
@@ -93,6 +94,7 @@ pub async fn new_release(
         page(
             &format!("{owner}/{name} · New release"),
             Some(&who.email),
+            who.theme,
             &body,
         ),
         &csrf,
@@ -298,6 +300,7 @@ async fn render_detail_response(
         page(
             &format!("{}/{} · {}", repo.owner_sub, repo.name, release.title),
             Some(&who.email),
+            who.theme,
             &body,
         ),
         &csrf,
@@ -356,6 +359,7 @@ async fn render_new_error(
         page(
             &format!("{}/{} · New release", repo.owner_sub, repo.name),
             Some(&who.email),
+            who.theme,
             &body,
         ),
         &csrf,

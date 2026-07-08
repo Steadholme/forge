@@ -40,6 +40,7 @@ pub async fn list(
     Ok(html_ok(page(
         &format!("{owner}/{name} · Branches"),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }

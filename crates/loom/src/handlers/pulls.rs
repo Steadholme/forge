@@ -108,9 +108,7 @@ struct ReviewRequirements {
 
 impl ReviewRequirements {
     fn satisfied(&self) -> bool {
-        self.approval_satisfied
-            && self.codeowners.satisfied()
-            && self.changes_requested.is_empty()
+        self.approval_satisfied && self.codeowners.satisfied() && self.changes_requested.is_empty()
     }
 }
 
@@ -390,6 +388,7 @@ pub async fn compare(
         page(
             &format!("{owner}/{name} · Compare"),
             Some(&who.email),
+            who.theme,
             &body,
         ),
         &csrf,
@@ -458,6 +457,7 @@ pub async fn list(
     Ok(crate::handlers::html_ok(page(
         &format!("{owner}/{name} · Pull requests"),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }
@@ -544,6 +544,7 @@ pub async fn create(
             page(
                 &format!("{owner}/{name} · Compare"),
                 Some(&who.email),
+                who.theme,
                 &body,
             ),
             &csrf,
@@ -690,6 +691,7 @@ pub async fn detail(
         page(
             &format!("{owner}/{name} · PR #{number}"),
             Some(&who.email),
+            who.theme,
             &body,
         ),
         &csrf,
@@ -771,6 +773,7 @@ pub async fn merge(
             page(
                 &format!("{owner}/{name} · PR #{number}"),
                 Some(&who.email),
+                who.theme,
                 &body,
             ),
             &csrf,
@@ -832,6 +835,7 @@ pub async fn merge(
                 page(
                     &format!("{owner}/{name} · PR #{number}"),
                     Some(&who.email),
+                    who.theme,
                     &body,
                 ),
                 &csrf,

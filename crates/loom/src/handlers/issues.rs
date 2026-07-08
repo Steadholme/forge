@@ -249,7 +249,12 @@ pub async fn list(
     .await;
     Ok(html_with_csrf(
         StatusCode::OK,
-        page(&format!("{owner}/{name} · Issues"), Some(&who.email), &body),
+        page(
+            &format!("{owner}/{name} · Issues"),
+            Some(&who.email),
+            who.theme,
+            &body,
+        ),
         &csrf,
     ))
 }
@@ -310,7 +315,12 @@ pub async fn create(
         .await;
         return Ok(html_with_csrf(
             StatusCode::BAD_REQUEST,
-            page(&format!("{owner}/{name} · Issues"), Some(&who.email), &body),
+            page(
+                &format!("{owner}/{name} · Issues"),
+                Some(&who.email),
+                who.theme,
+                &body,
+            ),
             &csrf,
         ));
     }
@@ -441,6 +451,7 @@ pub async fn detail(
         page(
             &format!("{owner}/{name} · Issue #{number}"),
             Some(&who.email),
+            who.theme,
             &body,
         ),
         &csrf,
@@ -509,6 +520,7 @@ pub async fn comment(
             page(
                 &format!("{owner}/{name} · Issue #{number}"),
                 Some(&who.email),
+                who.theme,
                 &body,
             ),
             &csrf,

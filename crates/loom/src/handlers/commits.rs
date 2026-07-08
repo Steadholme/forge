@@ -77,6 +77,7 @@ pub async fn history(
         return Ok(html_ok(page(
             &format!("{owner}/{name} · Commits"),
             Some(&who.email),
+            who.theme,
             &body,
         )));
     }
@@ -163,6 +164,7 @@ pub async fn history(
     Ok(html_ok(page(
         &format!("{owner}/{name} · Commits"),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }
@@ -358,6 +360,7 @@ pub async fn detail(
     Ok(html_ok(page(
         &format!("{owner}/{name} · {short}", short = short_oid(&oid)),
         Some(&who.email),
+        who.theme,
         &body,
     )))
 }

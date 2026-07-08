@@ -48,6 +48,8 @@ pub const PAT_PREFIX: &str = "loom_pat_";
 pub struct Identity {
     pub subject: String,
     pub email: String,
+    /// Display-only colour theme, resolved from the __Secure-theme cookie.
+    pub theme: &'static str,
 }
 
 /// Resolve the current user from the gateway-injected headers, falling back to the dev identity
@@ -56,6 +58,7 @@ pub fn identity(headers: &HeaderMap) -> Identity {
     Identity {
         subject: header_value(headers, HEADER_SUBJECT).unwrap_or_else(|| DEV_SUBJECT.to_string()),
         email: header_value(headers, HEADER_EMAIL).unwrap_or_else(|| DEV_EMAIL.to_string()),
+        theme: odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok())),
     }
 }
 

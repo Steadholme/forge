@@ -142,13 +142,15 @@ pub fn fmt_rel(now: i64, then: i64) -> String {
 
 /// Render the shared HTML page shell with the app-bar. `title` is the app-bar page label, `email`
 /// the signed-in identity (shown when known), `body` the already-escaped main content HTML.
-pub fn page(title: &str, email: Option<&str>, body: &str) -> String {
+pub fn page(title: &str, email: Option<&str>, theme: &str, body: &str) -> String {
     PAGE_HTML
         .replace("{{CSS}}", app_css())
         .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{TITLE}}", &esc(title))
-        .replace("{{USERBOX}}", &userbox(title, email))
+        .replace("{{USERBOX}}", &userbox(title, email, theme))
         .replace("{{BODY}}", body)
 }
 
@@ -386,7 +388,7 @@ fn user_menu(email: Option<&str>) -> String {
 /// The Odyssey v2 app-bar: a brand lockup (Loom's git-branch tile + wordmark), the service nav
 /// (Repositories / Tokens, current marked `.is-active`), an "All apps" waffle to the apex portal,
 /// and the avatar menu. Shared by every page so the chrome stays identical across the estate.
-pub fn userbox(title: &str, email: Option<&str>) -> String {
+pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
     let tokens_active = title == "Access tokens";
     let repos_cls = if tokens_active {
         "appnav"
@@ -421,11 +423,41 @@ pub fn userbox(title: &str, email: Option<&str>) -> String {
     </div>
   </details>
   <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+  {switcher}
   {user}
 </div>"##,
         repos_cls = repos_cls,
         tokens_cls = tokens_cls,
+        switcher = theme_switcher(theme),
         user = user_menu(email),
+    )
+}
+
+fn theme_switcher(current: &str) -> String {
+    let light_active = if current == "light" { " is-active" } else { "" };
+    let dark_active = if current == "dark" { " is-active" } else { "" };
+    let auto_active = if current == "auto" { " is-active" } else { "" };
+    let light_cur = if current == "light" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    let dark_cur = if current == "dark" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    let auto_cur = if current == "auto" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    format!(
+        r##"<div class="themeswitch" role="group" aria-label="Theme">
+  <a class="themeswitch__opt{light_active}" href="/_gw/theme?to=light" title="Light" aria-label="Light"{light_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></a>
+  <a class="themeswitch__opt{dark_active}" href="/_gw/theme?to=dark" title="Dark" aria-label="Dark"{dark_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6.5 6.5 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></a>
+  <a class="themeswitch__opt{auto_active}" href="/_gw/theme?to=auto" title="System" aria-label="System"{auto_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></a>
+</div>"##
     )
 }
 
@@ -439,7 +471,7 @@ pub fn render_error(
     let body = ERROR_HTML
         .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Loom", email))
+        .replace("{{USERBOX}}", &userbox("Loom", email, "light"))
         .replace("{{STATUS}}", &status.as_u16().to_string())
         .replace("{{HEADING}}", &esc(heading))
         .replace("{{MESSAGE}}", &esc(message));

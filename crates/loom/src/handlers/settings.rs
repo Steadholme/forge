@@ -75,6 +75,7 @@ pub async fn show(
         page(
             &format!("{owner}/{name} · Settings"),
             Some(&who.email),
+            who.theme,
             &body,
         ),
         &csrf,
@@ -135,6 +136,7 @@ pub async fn update(
                     page(
                         &format!("{owner}/{name} · Settings"),
                         Some(&who.email),
+                        who.theme,
                         &body,
                     ),
                     &csrf,
@@ -162,6 +164,7 @@ pub async fn update(
             page(
                 &format!("{owner}/{name} · Settings"),
                 Some(&who.email),
+                who.theme,
                 &body,
             ),
             &csrf,

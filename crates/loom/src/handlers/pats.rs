@@ -142,7 +142,7 @@ pub async fn revoke(
 // ===========================================================================
 
 fn page_shell(who: &Identity, body: &str) -> String {
-    page("Access tokens", Some(&who.email), body)
+    page("Access tokens", Some(&who.email), who.theme, body)
 }
 
 fn render_pats(
