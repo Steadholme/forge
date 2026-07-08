@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::WebError;
 use crate::handlers::{
-    esc, fmt_ts, human_size, short_digest, time_ago, userbox, app_css, APP_JS, LAYERS_SVG,
+    app_css, esc, fmt_ts, human_size, short_digest, time_ago, userbox, APP_JS, LAYERS_SVG,
     SHIELD_SVG,
 };
 use crate::model::{
@@ -34,7 +34,10 @@ const MANIFEST_HTML: &str = include_str!("../../templates/manifest.html");
 // ---------------------------------------------------------------------------
 
 /// `GET /` — list every repository with its image/tag counts, total size and last-pushed time.
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, WebError> {
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
     let who = auth::identity(&headers);
     let summaries = repo_summaries(&state).await?;
     let host = registry_host(&state.config.public_base);
@@ -122,7 +125,9 @@ pub async fn manifest_detail(
         .store
         .get_manifest(&name, &digest)
         .await?
-        .ok_or_else(|| WebError::NotFound(format!("No manifest {digest} in repository \"{name}\".")))?;
+        .ok_or_else(|| {
+            WebError::NotFound(format!("No manifest {digest} in repository \"{name}\"."))
+        })?;
 
     let view = manifest_view(&state, &name, &reference, &manifest).await?;
     let host = registry_host(&state.config.public_base);
@@ -184,11 +189,19 @@ async fn do_delete_tag(
         ));
     }
     if form.repo.is_empty() || form.tag.is_empty() {
-        return Err(WebError::BadRequest("Missing repository or tag.".to_string()));
+        return Err(WebError::BadRequest(
+            "Missing repository or tag.".to_string(),
+        ));
     }
     let actor = auth::identity(headers);
     let removed = state.store.delete_tag(&form.repo, &form.tag).await?;
-    tracing::info!(repo = form.repo, tag = form.tag, removed, actor = actor.subject, "tag delete");
+    tracing::info!(
+        repo = form.repo,
+        tag = form.tag,
+        removed,
+        actor = actor.subject,
+        "tag delete"
+    );
     Ok(removed)
 }
 
@@ -223,7 +236,11 @@ async fn repo_summaries(state: &AppState) -> Result<Vec<RepoSummary>, WebError> 
         });
     }
     // Most-recently-pushed first.
-    out.sort_by(|a, b| b.last_pushed.cmp(&a.last_pushed).then_with(|| a.name.cmp(&b.name)));
+    out.sort_by(|a, b| {
+        b.last_pushed
+            .cmp(&a.last_pushed)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     Ok(out)
 }
 
@@ -250,7 +267,11 @@ async fn tag_details(state: &AppState, repo: &str) -> Result<Vec<TagDetail>, Web
             }
         })
         .collect();
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.tag.cmp(&b.tag)));
+    out.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.tag.cmp(&b.tag))
+    });
     Ok(out)
 }
 
@@ -307,12 +328,28 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
     };
     INDEX_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{JS}}", APP_JS)
+        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
         .replace("{{HOST}}", &esc(host))
         .replace("{{COUNT}}", &esc(&count))
+        .replace("{{STATBAR}}", &render_index_statbar(repos))
         .replace("{{ROWS}}", &render_repo_rows(repos, host))
+}
+
+fn render_index_statbar(repos: &[RepoSummary]) -> String {
+    let total_size: i64 = repos.iter().map(|r| r.total_size).sum();
+    let total_pulls: i64 = repos.iter().map(|r| r.pulls).sum();
+    format!(
+        "<div class=\"cl-statbar stat-grid\">\
+           <div class=\"stat\"><div class=\"stat__label\">Repositories</div><div class=\"stat__value\">{repos}</div></div>\
+           <div class=\"stat\"><div class=\"stat__label\">Total size</div><div class=\"stat__value\">{size}</div></div>\
+           <div class=\"stat\"><div class=\"stat__label\">Total pulls</div><div class=\"stat__value\">{pulls}</div></div>\
+         </div>",
+        repos = repos.len(),
+        size = esc(&human_size(total_size)),
+        pulls = total_pulls,
+    )
 }
 
 fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
@@ -333,30 +370,51 @@ fn render_repo_rows(repos: &[RepoSummary], host: &str) -> String {
     repos
         .iter()
         .map(|r| {
+            let leaf = r.name.rsplit('/').next().unwrap_or(&r.name);
+            let initial = leaf.chars().next().unwrap_or('#').to_uppercase().to_string();
+            let name_html = render_repo_name(&r.name);
+            let pushed_abs = fmt_ts(r.last_pushed);
+            let pulls = pull_summary(r.pulls, r.last_pulled_at, now);
             format!(
                 "<tr>\
-                   <td class=\"repo-cell\"><a href=\"/r/{name_attr}\"><span class=\"repo-glyph\">{glyph}</span><span class=\"repo-name\">{name}</span></a></td>\
+                   <td class=\"repo-cell\"><a href=\"/r/{name_attr}\"><span class=\"letter-tile cl-repo-tile\" aria-hidden=\"true\">{initial}</span>{name}</a></td>\
                    <td class=\"num\" data-sort-value=\"{images}\">{images}</td>\
-                   <td class=\"num\" data-sort-value=\"{tags}\">{tags}</td>\
+                   <td class=\"num\" data-sort-value=\"{tags}\"><span class=\"chip\"><span class=\"countpill\">{tags}</span> tags</span></td>\
                    <td class=\"num\" data-sort-value=\"{size_bytes}\"><span class=\"pill pill-size\">{size}</span></td>\
-                   <td class=\"muted\" data-sort-value=\"{pushed}\">{date}</td>\
-                   <td class=\"muted\" data-sort-value=\"{pulls_n}\"><span class=\"pill pill-pulls\">{pulls}</span></td>\
+                   <td data-sort-value=\"{pushed}\"><span class=\"cl-when\" title=\"{date}\">{ago}<small>{date}</small></span></td>\
+                   <td data-sort-value=\"{pulls_n}\"><span class=\"cl-pull\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 3v12\"/><path d=\"m7 10 5 5 5-5\"/><path d=\"M5 21h14\"/></svg><span>{pulls}</span></span></td>\
                  </tr>",
                 name_attr = esc(&r.name),
-                glyph = LAYERS_SVG,
-                name = esc(&r.name),
+                initial = esc(&initial),
+                name = name_html,
                 images = r.manifest_count,
                 tags = r.tag_count,
                 size_bytes = r.total_size,
                 size = esc(&human_size(r.total_size)),
                 pushed = r.last_pushed,
-                date = esc(&fmt_ts(r.last_pushed)),
+                ago = esc(&time_ago(r.last_pushed, now)),
+                date = esc(&pushed_abs),
                 pulls_n = r.pulls,
-                pulls = esc(&pull_summary(r.pulls, r.last_pulled_at, now)),
+                pulls = esc(&pulls),
             )
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn render_repo_name(name: &str) -> String {
+    if let Some((ns, leaf)) = name.rsplit_once('/') {
+        format!(
+            "<span class=\"repo-name cl-name-wrap\"><span class=\"cl-ns\">{ns}/</span><span class=\"cl-leaf\">{leaf}</span></span>",
+            ns = esc(ns),
+            leaf = esc(leaf),
+        )
+    } else {
+        format!(
+            "<span class=\"repo-name cl-name-wrap\"><span class=\"cl-leaf\">{leaf}</span></span>",
+            leaf = esc(name),
+        )
+    }
 }
 
 fn render_repo(
@@ -376,7 +434,7 @@ fn render_repo(
     let pull_cmd = format!("docker pull {host}/{name}:{sample_tag}");
     REPO_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{JS}}", APP_JS)
+        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{LAYERS}}", LAYERS_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
@@ -393,7 +451,11 @@ fn arch_badge(platforms: &[String]) -> String {
     if platforms.is_empty() {
         return String::new();
     }
-    let list = platforms.iter().map(|p| esc(p)).collect::<Vec<_>>().join(", ");
+    let list = platforms
+        .iter()
+        .map(|p| esc(p))
+        .collect::<Vec<_>>()
+        .join(", ");
     let label = match platforms.len() {
         1 => "multi-arch · 1 platform".to_string(),
         n => format!("multi-arch · {n} platforms"),
@@ -417,6 +479,7 @@ struct ManifestView {
     /// The resolved manifest digest.
     digest: String,
     media_type: String,
+    created_at: i64,
     /// Aggregate content size (config + layers, or summed child image sizes for a list).
     size: i64,
     is_list: bool,
@@ -476,6 +539,7 @@ async fn manifest_view(
         reference: reference.to_string(),
         digest: manifest.digest.clone(),
         media_type: manifest.media_type.clone(),
+        created_at: manifest.created_at,
         size: resolved_size(&manifests, &manifest.digest),
         is_list,
         tags,
@@ -499,16 +563,23 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
     } else {
         "image manifest".to_string()
     };
+    let stats = render_manifest_stats(v, &kind);
     // The canonical, fully-qualified pull command is by digest.
-    let pull_cmd = format!("docker pull {host}/{name}@{digest}", name = v.name, digest = v.digest);
+    let pull_cmd = format!(
+        "docker pull {host}/{name}@{digest}",
+        name = v.name,
+        digest = v.digest
+    );
     MANIFEST_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{JS}}", APP_JS)
+        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{LAYERS}}", LAYERS_SVG)
         .replace("{{USERBOX}}", &userbox("Registry", Some(&who.email)))
         .replace("{{SUBTITLE}}", &esc(&subtitle))
         .replace("{{PULL_CMD}}", &esc(&pull_cmd))
         .replace("{{KIND}}", &esc(&kind))
+        .replace("{{STATS}}", &stats)
         .replace("{{DIGEST}}", &esc(&v.digest))
         .replace("{{MEDIA_TYPE}}", &esc(&v.media_type))
         .replace("{{SIZE}}", &esc(&human_size(v.size)))
@@ -517,6 +588,28 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
         // Replaced LAST: {{NAME}} appears in the title, the heading, and the back-link href, and
         // no injected value can contain the literal "{{NAME}}" (names carry no braces).
         .replace("{{NAME}}", &esc(&v.name))
+}
+
+fn render_manifest_stats(v: &ManifestView, kind: &str) -> String {
+    let count_label = if v.is_list { "Platforms" } else { "Layers" };
+    let count = if v.is_list {
+        v.children.len()
+    } else {
+        v.layers.len()
+    };
+    format!(
+        "<div class=\"stat-grid\">\
+           <div class=\"stat\"><div class=\"stat__label\">Total size</div><div class=\"stat__value\">{size}</div></div>\
+           <div class=\"stat\"><div class=\"stat__label\">{count_label}</div><div class=\"stat__value\">{count}</div></div>\
+           <div class=\"stat\"><div class=\"stat__label\">Media type</div><div class=\"stat__meta\"><span class=\"chip chip--outline\">{kind}</span></div></div>\
+           <div class=\"stat\"><div class=\"stat__label\">Pushed</div><div class=\"stat__meta\">{pushed}</div></div>\
+         </div>",
+        size = esc(&human_size(v.size)),
+        count_label = count_label,
+        count = count,
+        kind = esc(kind),
+        pushed = esc(&fmt_ts(v.created_at)),
+    )
 }
 
 /// Tag chips linking back to the repository page (where the tag can be managed). "untagged" when a
@@ -545,28 +638,65 @@ fn render_manifest_content(v: &ManifestView) -> String {
     }
 }
 
-/// The config + layers tables of an image manifest.
+/// The config + layer stack of an image manifest.
 fn render_layers(v: &ManifestView) -> String {
-    let config_rows = match &v.config {
+    let config = match &v.config {
         Some(c) => format!(
-            "<tr><td class=\"muted\">{mtype}</td><td class=\"mono\" title=\"{dfull}\">{dshort}</td><td class=\"num\">{size}</td></tr>",
+            "<div class=\"cl-config\">\
+               <span class=\"chip chip--outline\">{mtype}</span>\
+               <span class=\"cl-config__digest\" title=\"{dfull}\"><span>{dshort}</span><button class=\"btn btn-ghost btn-sm copy-btn\" type=\"button\" data-copy=\"{dfull}\" aria-label=\"Copy config digest\">Copy</button></span>\
+               <span class=\"pill pill-size\">{size}</span>\
+             </div>",
             mtype = esc(&c.media_type),
             dfull = esc(&c.digest),
             dshort = esc(&short_digest(&c.digest)),
             size = esc(&human_size(c.size)),
         ),
-        None => "<tr class=\"empty-row\"><td colspan=\"3\">No config recorded for this manifest.</td></tr>".to_string(),
+        None => "<div class=\"cl-config muted\">No config recorded for this manifest.</div>".to_string(),
+    };
+    let max_layer = v.layers.iter().map(|l| l.size).max().unwrap_or(0);
+    let total_size = v.config.as_ref().map(|c| c.size).unwrap_or(0)
+        + v.layers.iter().map(|l| l.size).sum::<i64>();
+    let mut ribbon_parts = Vec::new();
+    if let Some(c) = &v.config {
+        ribbon_parts.push(format!(
+            "<span class=\"cl-ribbon__seg\" style=\"width:{w}%\" title=\"{digest} · {size}\"></span>",
+            w = size_percent(c.size, total_size),
+            digest = esc(&short_digest(&c.digest)),
+            size = esc(&human_size(c.size)),
+        ));
+    }
+    ribbon_parts.extend(v.layers.iter().map(|l| {
+        format!(
+            "<span class=\"cl-ribbon__seg\" style=\"width:{w}%\" title=\"{digest} · {size}\"></span>",
+            w = size_percent(l.size, total_size),
+            digest = esc(&short_digest(&l.digest)),
+            size = esc(&human_size(l.size)),
+        )
+    }));
+    let ribbon = if ribbon_parts.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"cl-ribbon\">{}</div>", ribbon_parts.join(""))
     };
     let layer_rows = if v.layers.is_empty() {
-        "<tr class=\"empty-row\"><td colspan=\"4\">This image has no layers.</td></tr>".to_string()
+        "<li class=\"cl-layer\"><span class=\"cl-layer__idx\">—</span><span class=\"muted\">This image has no layers.</span><span></span></li>".to_string()
     } else {
         v.layers
             .iter()
             .enumerate()
             .map(|(i, l)| {
                 format!(
-                    "<tr><td class=\"num\">{n}</td><td class=\"muted\">{mtype}</td><td class=\"mono\" title=\"{dfull}\">{dshort}</td><td class=\"num\">{size}</td></tr>",
+                    "<li class=\"cl-layer\">\
+                       <span class=\"cl-layer__idx\">{n}</span>\
+                       <span class=\"cl-layer__main\">\
+                         <span class=\"cl-layer__bar\"><i style=\"--cl-frac:{frac}%\"></i></span>\
+                         <span class=\"cl-layer__meta\"><span class=\"chip chip--outline\">{mtype}</span><span class=\"cl-layer__digest\" title=\"{dfull}\">{dshort}</span><button class=\"btn btn-ghost btn-sm copy-btn\" type=\"button\" data-copy=\"{dfull}\" aria-label=\"Copy layer digest\">Copy</button></span>\
+                       </span>\
+                       <span class=\"cl-layer__size\">{size}</span>\
+                     </li>",
                     n = i + 1,
+                    frac = size_percent(l.size, max_layer),
                     mtype = esc(&l.media_type),
                     dfull = esc(&l.digest),
                     dshort = esc(&short_digest(&l.digest)),
@@ -582,17 +712,12 @@ fn render_layers(v: &ManifestView) -> String {
     };
     format!(
         "<div class=\"section-head\"><h2>Config</h2></div>\
-         <div class=\"table-wrap\"><table class=\"data\">\
-           <thead><tr><th>Media type</th><th>Digest</th><th>Size</th></tr></thead>\
-           <tbody>{config_rows}</tbody>\
-         </table></div>\
+         {config}\
          <div class=\"section-head\"><h2>Layers</h2><span class=\"count-badge\">{layer_count}</span></div>\
-         <div class=\"table-wrap\"><table class=\"data\">\
-           <thead><tr><th>#</th><th>Media type</th><th>Digest</th><th>Size</th></tr></thead>\
-           <tbody>{layer_rows}</tbody>\
-         </table></div>",
-        config_rows = config_rows,
+         <div class=\"cl-composition\">{ribbon}<ul class=\"cl-layers\" data-motion-list>{layer_rows}</ul></div>",
+        config = config,
         layer_count = esc(&layer_count),
+        ribbon = ribbon,
         layer_rows = layer_rows,
     )
 }
@@ -600,8 +725,9 @@ fn render_layers(v: &ManifestView) -> String {
 /// The per-platform child manifests of a manifest list / image index. Each child digest links to
 /// its own manifest detail page (linking a list to the image manifests it fans out to).
 fn render_children(v: &ManifestView) -> String {
+    let max_size = v.children.iter().map(|(_, size)| *size).max().unwrap_or(0);
     let rows = if v.children.is_empty() {
-        "<tr class=\"empty-row\"><td colspan=\"4\">This manifest list has no entries.</td></tr>".to_string()
+        "<div class=\"cl-platform muted\">This manifest list has no entries.</div>".to_string()
     } else {
         v.children
             .iter()
@@ -609,14 +735,18 @@ fn render_children(v: &ManifestView) -> String {
                 let platform = if e.platform.is_empty() {
                     "<span class=\"muted\">—</span>".to_string()
                 } else {
-                    format!("<span class=\"tag-pill\">{}</span>", esc(&e.platform))
+                    format!("<span class=\"chip\">{}</span>", esc(&e.platform))
                 };
                 format!(
-                    "<tr><td>{platform}</td>\
-                       <td class=\"mono\"><a href=\"/m/{name}?ref={dref}\" title=\"{dfull}\">{dshort}</a></td>\
-                       <td class=\"muted\">{mtype}</td>\
-                       <td class=\"num\">{size}</td></tr>",
+                    "<div class=\"cl-platform\">\
+                       <div>{platform}</div>\
+                       <div class=\"cl-platform__bar\"><i style=\"--cl-frac:{frac}%\"></i></div>\
+                       <div class=\"muted\">{mtype}</div>\
+                       <div class=\"num\">{size}</div>\
+                       <div class=\"cl-platform__digest\"><a href=\"/m/{name}?ref={dref}\" title=\"{dfull}\">{dshort}</a><button class=\"btn btn-ghost btn-sm copy-btn\" type=\"button\" data-copy=\"{dfull}\" aria-label=\"Copy platform digest\">Copy</button></div>\
+                     </div>",
                     platform = platform,
+                    frac = size_percent(*size, max_size),
                     name = esc(&v.name),
                     dref = esc(&url_query_value(&e.digest)),
                     dfull = esc(&e.digest),
@@ -634,13 +764,18 @@ fn render_children(v: &ManifestView) -> String {
     };
     format!(
         "<div class=\"section-head\"><h2>Platforms</h2><span class=\"count-badge\">{count}</span></div>\
-         <div class=\"table-wrap\"><table class=\"data\">\
-           <thead><tr><th>Platform</th><th>Digest</th><th>Media type</th><th>Size</th></tr></thead>\
-           <tbody>{rows}</tbody>\
-         </table></div>",
+         <div class=\"cl-composition\"><div class=\"cl-matrix\" data-motion-list>{rows}</div></div>",
         count = esc(&count),
         rows = rows,
     )
+}
+
+fn size_percent(part: i64, total: i64) -> String {
+    if part <= 0 || total <= 0 {
+        "0".to_string()
+    } else {
+        format!("{:.3}", (part as f64 / total as f64) * 100.0)
+    }
 }
 
 /// Percent-encode a reference for use as a `?ref=` query value. Only a digest's `:` needs escaping;
@@ -700,7 +835,7 @@ fn render_tag_rows(repo: &str, tags: &[TagDetail], csrf: &str) -> String {
                 "<tr>\
                    <td><a class=\"tag-pill\" href=\"/m/{repo_attr}?ref={tag_ref}\">{tag}</a></td>\
                    <td class=\"mono\" title=\"{digest_full}\"><a href=\"/m/{repo_attr}?ref={digest_ref}\">{digest_short}</a></td>\
-                   <td class=\"muted\">{mtype}{arch}</td>\
+                   <td><span class=\"chip chip--outline\">{mtype}</span>{arch}</td>\
                    <td class=\"num\" data-sort-value=\"{size_bytes}\"><span class=\"pill pill-size\">{size}</span></td>\
                    <td class=\"muted\" data-sort-value=\"{updated}\">{date}</td>\
                    <td class=\"row-action\">\

@@ -20,7 +20,7 @@
       <a class="btn btn-ghost btn-sm" href="/">All repositories</a>
     </div>
 
-    <div class="cmd-strip">
+    <div class="cmd-strip cl-endpoint">
       <span class="cmd-label">Pull</span>
       <code>{{PULL_CMD}}</code>
       <button class="btn btn-ghost btn-sm copy-btn" type="button" data-copy aria-label="Copy pull command">Copy</button>
@@ -31,7 +31,7 @@
       <span class="count-badge">{{COUNT}}</span>
     </div>
 
-    <div class="table-wrap">
+    <div class="table-wrap cl-list">
       <table class="data" data-sortable>
         <thead>
           <tr>
@@ -43,7 +43,7 @@
             <th data-nosort></th>
           </tr>
         </thead>
-        <tbody>
+        <tbody data-motion-list>
           {{TAG_ROWS}}
         </tbody>
       </table>

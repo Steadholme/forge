@@ -24,8 +24,8 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, esc, human_size, userbox, app_css, SHIELD_SVG};
-use crate::model::{is_manifest_list, index_child_digests, manifest_blob_digests, ManifestRec};
+use crate::handlers::{admin_tabs, app_css, esc, human_size, userbox, APP_JS, SHIELD_SVG};
+use crate::model::{index_child_digests, is_manifest_list, manifest_blob_digests, ManifestRec};
 use crate::AppState;
 
 const ADMIN_HTML: &str = include_str!("../../templates/admin.html");
@@ -36,7 +36,10 @@ const ADMIN_HTML: &str = include_str!("../../templates/admin.html");
 
 /// `GET /admin` — the admin panel: per-repository + total storage bytes, and a garbage-collection
 /// control showing the currently reclaimable bytes. Admin-only.
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, WebError> {
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
     auth::require_admin(&headers)?;
     let who = auth::identity(&headers);
     let view = analyze(&state).await?.view();
@@ -167,7 +170,10 @@ impl Analysis {
         let mut manifests: Vec<(String, String, i64)> = Vec::new();
         for (repo, recs, _) in &self.repos {
             for rec in recs {
-                if !self.live_manifests.contains(&(repo.clone(), rec.digest.clone())) {
+                if !self
+                    .live_manifests
+                    .contains(&(repo.clone(), rec.digest.clone()))
+                {
                     manifests.push((repo.clone(), rec.digest.clone(), rec.size));
                 }
             }
@@ -207,8 +213,11 @@ impl Analysis {
         }
         rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
 
-        let total_manifest_bytes: i64 =
-            self.repos.iter().flat_map(|(_, recs, _)| recs.iter().map(|m| m.size)).sum();
+        let total_manifest_bytes: i64 = self
+            .repos
+            .iter()
+            .flat_map(|(_, recs, _)| recs.iter().map(|m| m.size))
+            .sum();
         let total_blob_bytes: i64 = self.blob_sizes.values().sum();
 
         let orphans = self.orphans();
@@ -332,16 +341,44 @@ fn render_admin(who: &Identity, view: &AdminView, csrf: &str, notice: &str) -> S
     };
     ADMIN_HTML
         .replace("{{CSS}}", app_css())
+        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
         .replace("{{TABS}}", &admin_tabs("overview"))
         .replace("{{NOTICE}}", notice)
+        .replace("{{SUMMARY}}", &render_summary(view))
         .replace("{{TOTAL_SIZE}}", &esc(&human_size(view.total_bytes)))
         .replace("{{BLOB_COUNT}}", &esc(&view.blob_count.to_string()))
         .replace("{{REPO_COUNT}}", &esc(&repo_count))
         .replace("{{RECLAIM_LINE}}", &esc(&reclaim_line))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{ROWS}}", &render_rows(&view.rows))
+}
+
+fn render_summary(view: &AdminView) -> String {
+    let repo_count = view.rows.len();
+    let image_count: i64 = view.rows.iter().map(|r| r.image_count).sum();
+    let reclaim_frac = if view.total_bytes <= 0 || view.reclaimable_bytes <= 0 {
+        "0".to_string()
+    } else {
+        format!(
+            "{:.3}",
+            (view.reclaimable_bytes as f64 / view.total_bytes as f64) * 100.0
+        )
+    };
+    format!(
+        "<div class=\"cl-summary stat-grid\">\
+           <div class=\"stat\"><div class=\"stat__label\">Repositories</div><div class=\"stat__value\">{repos}</div></div>\
+           <div class=\"stat\"><div class=\"stat__label\">Images</div><div class=\"stat__value\">{images}</div></div>\
+           <div class=\"stat\"><div class=\"stat__label\">On disk</div><div class=\"stat__value\">{total}</div></div>\
+           <div class=\"stat cl-stat--reclaim\"><div class=\"stat__label\">Reclaimable</div><div class=\"stat__value stat__val--warn\">{reclaim}</div><div class=\"cl-quota\"><i style=\"--cl-frac:{reclaim_frac}%\"></i></div></div>\
+         </div>",
+        repos = repo_count,
+        images = image_count,
+        total = esc(&human_size(view.total_bytes)),
+        reclaim = esc(&human_size(view.reclaimable_bytes)),
+        reclaim_frac = reclaim_frac,
+    )
 }
 
 fn render_rows(rows: &[RepoStorage]) -> String {
@@ -354,14 +391,15 @@ fn render_rows(rows: &[RepoStorage]) -> String {
             format!(
                 "<tr>\
                    <td class=\"repo-cell\"><a href=\"/r/{name_attr}\"><span class=\"repo-name\">{name}</span></a></td>\
-                   <td>{images}</td>\
-                   <td>{tags}</td>\
-                   <td class=\"num\">{size}</td>\
+                   <td class=\"num\" data-sort-value=\"{images}\">{images}</td>\
+                   <td class=\"num\" data-sort-value=\"{tags}\">{tags}</td>\
+                   <td class=\"num\" data-sort-value=\"{bytes}\">{size}</td>\
                  </tr>",
                 name_attr = esc(&r.name),
                 name = esc(&r.name),
                 images = r.image_count,
                 tags = r.tag_count,
+                bytes = r.bytes,
                 size = esc(&human_size(r.bytes)),
             )
         })

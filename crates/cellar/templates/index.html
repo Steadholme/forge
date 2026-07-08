@@ -12,14 +12,18 @@
 
   <main class="console">
     <div class="console__head">
+      <p class="eyebrow">SOVEREIGN OCI REGISTRY</p>
       <h1>Container registry</h1>
       <p class="sub">A sovereign OCI registry for the keep. Sign in to browse images; push and pull
         over the Docker Registry V2 protocol with <code>docker login {{HOST}}</code>.</p>
     </div>
 
-    <div class="cmd-strip">
+    {{STATBAR}}
+
+    <div class="cmd-strip cl-endpoint">
       <span class="cmd-label">Endpoint</span>
       <code>{{HOST}}</code>
+      <button class="btn btn-ghost btn-sm copy-btn" type="button" data-copy="docker login {{HOST}}" aria-label="Copy docker login command">Copy</button>
       <span class="cmd-label">Push</span>
       <code>docker push {{HOST}}/&lt;name&gt;:&lt;tag&gt;</code>
     </div>
@@ -29,7 +33,15 @@
       <span class="count-badge">{{COUNT}}</span>
     </div>
 
-    <div class="table-wrap">
+    <div class="cl-toolbar">
+      <div class="input-group">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <input type="search" data-cl-repo-filter placeholder="Filter repositories..." aria-label="Filter repositories">
+      </div>
+    </div>
+    <div class="cl-filter-empty" hidden>No repositories match this filter.</div>
+
+    <div class="table-wrap cl-list">
       <table class="data" data-sortable>
         <thead>
           <tr>
@@ -41,7 +53,7 @@
             <th data-sort="num">Pulls</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody data-motion-list>
           {{ROWS}}
         </tbody>
       </table>

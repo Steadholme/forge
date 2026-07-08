@@ -295,11 +295,37 @@
     target.appendChild(wrap);
   }
 
+  // --- Repository filter -----------------------------------------------------
+  function initRepoFilter() {
+    var input = document.querySelector("[data-cl-repo-filter]");
+    if (!input) return;
+    var table = document.querySelector(".cl-list table.data");
+    var body = table && table.tBodies ? table.tBodies[0] : null;
+    if (!body) return;
+    var empty = document.querySelector(".cl-filter-empty");
+    function run() {
+      var q = input.value.trim().toLowerCase();
+      var shown = 0;
+      Array.prototype.forEach.call(body.rows, function (row) {
+        if (row.classList.contains("empty-row")) return;
+        var name = row.querySelector(".repo-name");
+        var text = (name ? name.textContent : row.textContent).toLowerCase();
+        var match = !q || text.indexOf(q) !== -1;
+        row.hidden = !match;
+        if (match) shown += 1;
+      });
+      if (empty) empty.hidden = !q || shown > 0;
+    }
+    input.addEventListener("input", run);
+    run();
+  }
+
   function init() {
     initCopy();
     initSort();
     initDeleteRows();
     initRetentionPreview();
+    initRepoFilter();
   }
 
   if (document.readyState === "loading") {

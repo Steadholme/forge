@@ -13,32 +13,43 @@
   <main class="console">
     <div class="console__head console__head--row">
       <div>
-        <h1 class="detail-title">{{NAME}}</h1>
+        <div class="cl-masthead-lead">
+          <span class="letter-tile cl-tile" aria-hidden="true">{{LAYERS}}</span>
+          <div>
+            <p class="eyebrow">{{KIND}}</p>
+            <h1 class="detail-title">{{NAME}}</h1>
+          </div>
+        </div>
         <p class="sub">{{SUBTITLE}}</p>
       </div>
       <a class="btn btn-ghost btn-sm" href="/r/{{NAME}}">Back to repository</a>
     </div>
 
-    <div class="cmd-strip">
+    {{STATS}}
+
+    <div class="cmd-strip cl-endpoint">
       <span class="cmd-label">Pull</span>
       <code>{{PULL_CMD}}</code>
       <button class="btn btn-ghost btn-sm copy-btn" type="button" data-copy aria-label="Copy pull command">Copy</button>
     </div>
 
-    <div class="section-head">
-      <h2>Manifest</h2>
-      <span class="count-badge">{{KIND}}</span>
-    </div>
-
-    <div class="table-wrap">
-      <table class="data">
-        <tbody>
-          <tr><td class="muted">Digest</td><td class="mono">{{DIGEST}}</td></tr>
-          <tr><td class="muted">Media type</td><td class="muted">{{MEDIA_TYPE}}</td></tr>
-          <tr><td class="muted">Size</td><td class="num">{{SIZE}}</td></tr>
-          <tr><td class="muted">Tags</td><td>{{TAGS}}</td></tr>
-        </tbody>
-      </table>
+    <div class="cl-idcard">
+      <div class="cl-idcard__item">
+        <span class="cl-idcard__label">Digest</span>
+        <div class="cl-idcard__digest"><code>{{DIGEST}}</code><button class="btn btn-ghost btn-sm copy-btn" type="button" data-copy="{{DIGEST}}" aria-label="Copy manifest digest">Copy</button></div>
+      </div>
+      <div class="cl-idcard__item">
+        <span class="cl-idcard__label">Media type</span>
+        <span class="chip chip--outline">{{MEDIA_TYPE}}</span>
+      </div>
+      <div class="cl-idcard__item">
+        <span class="cl-idcard__label">Size</span>
+        <span class="pill pill-size">{{SIZE}}</span>
+      </div>
+      <div class="cl-idcard__item">
+        <span class="cl-idcard__label">Tags</span>
+        <span>{{TAGS}}</span>
+      </div>
     </div>
 
     {{CONTENT}}

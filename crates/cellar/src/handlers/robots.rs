@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, esc, fmt_ts, time_ago, userbox, app_css};
+use crate::handlers::{admin_tabs, app_css, esc, fmt_ts, time_ago, userbox, APP_JS};
 use crate::model::{is_valid_robot_scope, RobotAccount, ROBOT_SCOPE_PUSHPULL};
 use crate::names::{is_valid_repo_pattern, is_valid_robot_name};
 use crate::{now_secs, random_alnum, AppState};
@@ -29,7 +29,10 @@ const ROBOTS_HTML: &str = include_str!("../../templates/robots.html");
 // ---------------------------------------------------------------------------
 
 /// `GET /admin/robots` — list robot accounts with a mint form.
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, WebError> {
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
     auth::require_admin(&headers)?;
     let who = auth::identity(&headers);
     let robots = state.store.list_robots().await?;
@@ -79,7 +82,8 @@ pub async fn create(
     let pattern = form.repo_pattern.trim();
     if !is_valid_repo_pattern(pattern) {
         return Err(WebError::BadRequest(
-            "Enter a valid repository pattern (lowercase name, or a prefix ending in *).".to_string(),
+            "Enter a valid repository pattern (lowercase name, or a prefix ending in *)."
+                .to_string(),
         ));
     }
     if state.store.get_robot_by_name(name).await?.is_some() {
@@ -145,11 +149,20 @@ pub async fn toggle(
     let who = auth::identity(&headers);
     let enabled = form.enabled == "true";
     state.store.set_robot_enabled(&form.id, enabled).await?;
-    tracing::warn!(actor = who.subject, id = form.id, enabled, "robot account toggled");
+    tracing::warn!(
+        actor = who.subject,
+        id = form.id,
+        enabled,
+        "robot account toggled"
+    );
 
     let robots = state.store.list_robots().await?;
     let csrf = auth::new_csrf_token();
-    let notice = notice_ok(if enabled { "Robot enabled." } else { "Robot disabled." });
+    let notice = notice_ok(if enabled {
+        "Robot enabled."
+    } else {
+        "Robot disabled."
+    });
     Ok(page(render(&who, &robots, &csrf, &notice, ""), &csrf))
 }
 
@@ -171,11 +184,19 @@ pub async fn delete(
     csrf_guard(&headers, &form.csrf_token)?;
     let who = auth::identity(&headers);
     let removed = state.store.delete_robot(&form.id).await?;
-    tracing::warn!(actor = who.subject, id = form.id, removed, "robot account deleted");
+    tracing::warn!(
+        actor = who.subject,
+        id = form.id,
+        removed,
+        "robot account deleted"
+    );
 
     let robots = state.store.list_robots().await?;
     let csrf = auth::new_csrf_token();
-    Ok(page(render(&who, &robots, &csrf, &notice_ok("Robot deleted."), ""), &csrf))
+    Ok(page(
+        render(&who, &robots, &csrf, &notice_ok("Robot deleted."), ""),
+        &csrf,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +250,7 @@ fn render(
     };
     ROBOTS_HTML
         .replace("{{CSS}}", app_css())
+        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
         .replace("{{TABS}}", &admin_tabs("robots"))
         .replace("{{NOTICE}}", notice)
@@ -248,11 +270,11 @@ fn render_token(state: &AppState, robot: &RobotAccount, token: &str) -> String {
         "pull"
     };
     format!(
-        "<div class=\"card\"><div class=\"card__head\"><h2>Robot “{name}” created</h2></div>\
+        "<div class=\"card cl-keycard\"><div class=\"card__head\"><h2>Robot '{name}' created</h2></div>\
          <div class=\"card__body\">\
-           <p class=\"sub\">Copy this token now — it is shown <b>once</b> and cannot be retrieved again. \
-             It grants <b>{scope}</b> on <code>{pattern}</code>.</p>\
-           <div class=\"cmd-strip\"><span class=\"cmd-label\">Token</span><code data-token=\"{token_attr}\">{token}</code></div>\
+           <p class=\"cl-keycard__warn\">Copy now — shown once and cannot be retrieved.</p>\
+           <p class=\"sub\">It grants <b>{scope}</b> on <code>{pattern}</code>.</p>\
+           <div class=\"cl-token\"><span class=\"cmd-label\">Token</span><code data-token=\"{token_attr}\">{token}</code><button class=\"btn btn-ghost btn-sm copy-btn\" type=\"button\" data-copy=\"{token_attr}\" aria-label=\"Copy robot token\">Copy</button></div>\
            <div class=\"cmd-strip\"><span class=\"cmd-label\">docker login</span><code>docker login -u robot${name} -p {token} {host}</code></div>\
          </div></div>",
         name = esc(&robot.name),
@@ -266,16 +288,17 @@ fn render_token(state: &AppState, robot: &RobotAccount, token: &str) -> String {
 
 fn render_robot_rows(robots: &[RobotAccount], csrf: &str) -> String {
     if robots.is_empty() {
-        return "<tr class=\"empty-row\"><td colspan=\"7\">No robot accounts yet.</td></tr>".to_string();
+        return "<tr class=\"empty-row\"><td colspan=\"7\">No robot accounts yet.</td></tr>"
+            .to_string();
     }
     let now = now_secs();
     robots
         .iter()
         .map(|r| {
             let scope = if r.scope == ROBOT_SCOPE_PUSHPULL {
-                "<span class=\"pill pill-accent\">push + pull</span>"
+                "<span class=\"pill pill-accent cl-scope\">push + pull</span>"
             } else {
-                "<span class=\"pill\">pull</span>"
+                "<span class=\"pill pill-neutral cl-scope\">pull</span>"
             };
             let (status, toggle_label, toggle_to) = if r.enabled {
                 ("<span class=\"pill pill-ok\">Enabled</span>", "Disable", "false")

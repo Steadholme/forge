@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, esc, human_size, userbox, app_css, APP_JS};
+use crate::handlers::{admin_tabs, app_css, esc, human_size, userbox, APP_JS};
 use crate::model::{repo_pattern_matches, RetentionRule};
 use crate::names::is_valid_repo_pattern;
 use crate::{now_secs, random_alnum, AppState};
@@ -34,7 +34,10 @@ const RETENTION_HTML: &str = include_str!("../../templates/retention.html");
 // ---------------------------------------------------------------------------
 
 /// `GET /admin/retention` — list keep-rules with a create form and Preview / Apply controls.
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, WebError> {
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
     auth::require_admin(&headers)?;
     let who = auth::identity(&headers);
     let rules = state.store.list_retention_rules().await?;
@@ -72,14 +75,16 @@ pub async fn create(
     let pattern = form.repo_pattern.trim();
     if !is_valid_repo_pattern(pattern) {
         return Err(WebError::BadRequest(
-            "Enter a valid repository pattern (lowercase name, or a prefix ending in *).".to_string(),
+            "Enter a valid repository pattern (lowercase name, or a prefix ending in *)."
+                .to_string(),
         ));
     }
     let keep_last = parse_nonneg(&form.keep_last)?;
     let keep_days = parse_nonneg(&form.keep_days)?;
     if keep_last == 0 && keep_days == 0 {
         return Err(WebError::BadRequest(
-            "A rule must keep at least one condition: keep newest ≥ 1, or keep days ≥ 1.".to_string(),
+            "A rule must keep at least one condition: keep newest ≥ 1, or keep days ≥ 1."
+                .to_string(),
         ));
     }
 
@@ -133,11 +138,20 @@ pub async fn toggle(
     let who = auth::identity(&headers);
     let enabled = form.enabled == "true";
     state.store.set_retention_enabled(&form.id, enabled).await?;
-    tracing::info!(actor = who.subject, id = form.id, enabled, "retention rule toggled");
+    tracing::info!(
+        actor = who.subject,
+        id = form.id,
+        enabled,
+        "retention rule toggled"
+    );
 
     let rules = state.store.list_retention_rules().await?;
     let csrf = auth::new_csrf_token();
-    let notice = notice_ok(if enabled { "Rule enabled." } else { "Rule disabled." });
+    let notice = notice_ok(if enabled {
+        "Rule enabled."
+    } else {
+        "Rule disabled."
+    });
     Ok(page(render(&who, &rules, &csrf, &notice, ""), &csrf))
 }
 
@@ -159,11 +173,19 @@ pub async fn delete(
     csrf_guard(&headers, &form.csrf_token)?;
     let who = auth::identity(&headers);
     let removed = state.store.delete_retention_rule(&form.id).await?;
-    tracing::info!(actor = who.subject, id = form.id, removed, "retention rule deleted");
+    tracing::info!(
+        actor = who.subject,
+        id = form.id,
+        removed,
+        "retention rule deleted"
+    );
 
     let rules = state.store.list_retention_rules().await?;
     let csrf = auth::new_csrf_token();
-    Ok(page(render(&who, &rules, &csrf, &notice_ok("Rule deleted."), ""), &csrf))
+    Ok(page(
+        render(&who, &rules, &csrf, &notice_ok("Rule deleted."), ""),
+        &csrf,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +313,11 @@ async fn plan_retention(state: &AppState, now: i64) -> Result<Vec<(String, Strin
 
         let mut tags = state.store.tags_for(&repo.name).await?;
         // Newest first (ties broken by name for determinism).
-        tags.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.tag.cmp(&b.tag)));
+        tags.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.tag.cmp(&b.tag))
+        });
 
         let mut keep: HashSet<String> = HashSet::new();
         keep.insert("latest".to_string()); // `latest` is never deleted
@@ -363,7 +389,13 @@ fn page(html: String, csrf: &str) -> Response {
         .into_response()
 }
 
-fn render(who: &Identity, rules: &[RetentionRule], csrf: &str, notice: &str, preview: &str) -> String {
+fn render(
+    who: &Identity,
+    rules: &[RetentionRule],
+    csrf: &str,
+    notice: &str,
+    preview: &str,
+) -> String {
     let count = match rules.len() {
         0 => "No rules".to_string(),
         1 => "1 rule".to_string(),
@@ -371,7 +403,7 @@ fn render(who: &Identity, rules: &[RetentionRule], csrf: &str, notice: &str, pre
     };
     RETENTION_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{JS}}", APP_JS)
+        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
         .replace("{{TABS}}", &admin_tabs("retention"))
         .replace("{{NOTICE}}", notice)
@@ -394,16 +426,21 @@ fn render_rule_rows(rules: &[RetentionRule], csrf: &str) -> String {
             } else {
                 ("<span class=\"pill\">Disabled</span>", "Enable", "true")
             };
+            let keep_last = if r.keep_last == 0 {
+                "<span class=\"muted\">—</span>".to_string()
+            } else {
+                format!("<span class=\"chip\">newest {}</span>", r.keep_last)
+            };
             let keep_days = if r.keep_days == 0 {
                 "—".to_string()
             } else {
-                format!("{} days", r.keep_days)
+                format!("<span class=\"chip chip--outline\">within {}d</span>", r.keep_days)
             };
             format!(
                 "<tr>\
                    <td class=\"mono\">{pattern}</td>\
-                   <td class=\"num\">{keep_last}</td>\
-                   <td>{keep_days}</td>\
+                   <td><span class=\"cl-keep\">{keep_last}</span></td>\
+                   <td><span class=\"cl-keep\">{keep_days}</span></td>\
                    <td>{status}</td>\
                    <td class=\"row-action\"><div class=\"rowactions\">\
                      <form method=\"post\" action=\"/admin/retention/toggle\">\
@@ -418,10 +455,10 @@ fn render_rule_rows(rules: &[RetentionRule], csrf: &str) -> String {
                        <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete</button>\
                      </form>\
                    </div></td>\
-                 </tr>",
+                </tr>",
                 pattern = esc(&r.repo_pattern),
-                keep_last = r.keep_last,
-                keep_days = esc(&keep_days),
+                keep_last = keep_last,
+                keep_days = keep_days,
                 status = status,
                 id = esc(&r.id),
                 toggle_to = toggle_to,

@@ -24,16 +24,9 @@
 
     {{NOTICE}}
 
-    <div class="cmd-strip">
-      <span class="cmd-label">On disk</span>
-      <code>{{TOTAL_SIZE}}</code>
-      <span class="cmd-label">Blobs</span>
-      <code>{{BLOB_COUNT}}</code>
-      <span class="cmd-label">Repositories</span>
-      <code>{{REPO_COUNT}}</code>
-    </div>
+    {{SUMMARY}}
 
-    <div class="card card--message">
+    <div class="card">
       <div class="card__head">
         <h2>Garbage collection</h2>
       </div>
@@ -52,17 +45,17 @@
       <span class="count-badge">{{REPO_COUNT}}</span>
     </div>
 
-    <div class="table-wrap">
-      <table class="data">
+    <div class="table-wrap cl-list">
+      <table class="data" data-sortable>
         <thead>
           <tr>
-            <th>Repository</th>
-            <th>Images</th>
-            <th>Tags</th>
-            <th>Storage</th>
+            <th data-sort="text">Repository</th>
+            <th data-sort="num">Images</th>
+            <th data-sort="num">Tags</th>
+            <th data-sort="num">Storage</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody data-motion-list>
           {{ROWS}}
         </tbody>
       </table>
@@ -73,5 +66,6 @@
     <span>HOLDFAST · Cellar</span>
     <span>Container registry · part of the HOLDFAST estate</span>
   </footer>
+  <script>{{JS}}</script>
 </body>
 </html>
