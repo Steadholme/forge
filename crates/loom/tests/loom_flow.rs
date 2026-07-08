@@ -291,17 +291,17 @@ async fn web_create_repo_issues_and_xss_escaping() {
     assert_eq!(home.status, StatusCode::OK);
     assert!(home
         .body
-        .contains(r#"class="repo-row__name" href="/r/alice/proj""#));
+        .contains(r#"class="repo-card__link" href="/r/alice/proj""#));
     assert!(home.body.contains(r#"name="q" value="""#));
     let filtered = send(&app, get("/?q=proj", Some("alice"))).await;
     assert!(filtered.body.contains("alice/proj"));
     let filtered_empty = send(&app, get("/?q=missing", Some("alice"))).await;
     assert!(filtered_empty.body.contains("No repositories matched"));
-    // Anchor to the rendered row link, not the bare class token — app.css is inlined into every
-    // page and carries a `.repo-row__name` selector that a substring test would always match.
+    // Anchor to the rendered card link, not the bare class token — app.css is inlined into every
+    // page and carries a `.repo-card__link` selector that a substring test would always match.
     assert!(!filtered_empty
         .body
-        .contains(r#"class="repo-row__name" href="#));
+        .contains(r#"class="repo-card__link" href="#));
 
     // Repo page: empty repo quick-start + clone URL + escaped description.
     let view = send(&app, get("/r/alice/proj", Some("alice"))).await;

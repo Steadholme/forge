@@ -844,7 +844,7 @@ async fn repo_rows(state: &AppState, repos: Vec<Repo>) -> Vec<RepoRow> {
     rows
 }
 
-fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
+fn render_index(_who: &Identity, rows: &[RepoRow], q: &str) -> String {
     let now = now_secs();
     let list = if rows.is_empty() {
         let title = if q.trim().is_empty() {
@@ -874,20 +874,20 @@ fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
             .map(|row| {
                 let r = &row.repo;
                 let chip = if r.is_private {
-                    "<span class=\"vis-chip\">Private</span>"
+                    "<span class=\"vis-chip vis-chip--private\">Private</span>"
                 } else {
                     "<span class=\"vis-chip\">Public</span>"
                 };
                 let desc = if r.description.trim().is_empty() {
-                    String::new()
+                    "<p class=\"repo-card__desc repo-card__desc--empty\">No description</p>".to_string()
                 } else {
-                    format!("<p class=\"repo-row__desc\">{}</p>", esc(&r.description))
+                    format!("<p class=\"repo-card__desc\">{}</p>", esc(&r.description))
                 };
                 let lang = row
                     .language
                     .map(|language| {
                         format!(
-                            "<span class=\"lang-dot\" style=\"--lang-color:#{color}\" aria-hidden=\"true\"></span><span>{name}</span><span class=\"repo-row__dot\" aria-hidden=\"true\">&middot;</span>",
+                            "<span class=\"repo-card__lang\"><span class=\"lang-dot\" style=\"--lang-color:#{color}\" aria-hidden=\"true\"></span>{name}</span>",
                             color = language.color,
                             name = esc(language.name),
                         )
@@ -898,14 +898,15 @@ fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
                     None => ("Created", fmt_ts(r.created_at), fmt_rel(now, r.created_at)),
                 };
                 format!(
-                    r##"<li class="repo-row">
-  <div class="repo-row__title">
-    <a class="repo-row__name" href="/r/{owner}/{name}">{owner_e}/{name_e}</a>
+                    r##"<li class="repo-card"><a class="repo-card__link" href="/r/{owner}/{name}">
+  <div class="repo-card__head">
+    <span class="repo-card__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
+    <span class="repo-card__name">{owner_e}/<b>{name_e}</b></span>
     {chip}
   </div>
   {desc}
-  <div class="repo-row__meta">{lang}<span title="{time_abs}">{time_label} {time_rel}</span></div>
-</li>"##,
+  <div class="repo-card__meta">{lang}<span title="{time_abs}">{time_label} {time_rel}</span></div>
+</a></li>"##,
                     owner = esc(&r.owner_sub),
                     name = esc(&r.name),
                     owner_e = esc(&r.owner_sub),
@@ -919,19 +920,56 @@ fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
                 )
             })
             .collect::<String>();
-        format!("<ul class=\"repo-rows\">{items}</ul>")
+        format!("<ul class=\"repo-grid\">{items}</ul>")
+    };
+
+    // The full branded hero is the landing masthead; a search collapses it to a compact head so
+    // results dominate. Stats reflect the unfiltered estate (rows == everything when q is empty).
+    let head = if q.trim().is_empty() {
+        let repo_count = rows.len();
+        let mut langs: Vec<&str> = rows.iter().filter_map(|r| r.language.map(|l| l.name)).collect();
+        langs.sort_unstable();
+        langs.dedup();
+        let lang_count = langs.len();
+        let repo_label = if repo_count == 1 { "Repository" } else { "Repositories" };
+        let lang_label = if lang_count == 1 { "Language" } else { "Languages" };
+        format!(
+            r##"<section class="home-hero">
+  <div class="home-hero__body">
+    <p class="eyebrow">HOLDFAST · SOVEREIGN ESTATE</p>
+    <h1 class="home-hero__title">Built in the open.</h1>
+    <p class="home-hero__lede">A sovereign, self-hosted estate — identity, mail, git, registry, search, AI and dozens more services, engineered from the ground up. Every service, open source. Clone any repository over HTTPS.</p>
+    <div class="home-hero__actions">
+      <a class="btn btn-primary" href="/new">New repository</a>
+      <a class="btn" href="/pats">Access tokens</a>
+    </div>
+  </div>
+  <dl class="home-stats" aria-label="Estate at a glance">
+    <div class="home-stat"><dt>{repo_label}</dt><dd>{repo_count}</dd></div>
+    <div class="home-stat"><dt>{lang_label}</dt><dd>{lang_count}</dd></div>
+    <div class="home-stat"><dt>License</dt><dd class="home-stat__word">Open</dd></div>
+  </dl>
+</section>"##,
+            repo_count = repo_count,
+            repo_label = repo_label,
+            lang_count = lang_count,
+            lang_label = lang_label,
+        )
+    } else {
+        r##"<div class="console__head console__head--row">
+  <div><p class="eyebrow">HOLDFAST · SOVEREIGN ESTATE</p><h1>Repositories</h1></div>
+  <a class="btn btn-primary" href="/new">New repository</a>
+</div>"##
+            .to_string()
     };
 
     format!(
-        r##"<div class="console__head console__head--row">
-  <div><h1>Repositories</h1><p class="sub">Self-hosted git for the estate. Clone over HTTPS with a personal access token; browse here with single sign-on as {email}.</p></div>
-  <a class="btn btn-primary" href="/new">New repository</a>
-</div>
+        r##"{head}
 <form class="repo-filter" method="get" action="/">
   <input class="input repo-filter__q" type="search" name="q" value="{q}" placeholder="Find a repository&hellip;" aria-label="Filter repositories">
 </form>
 {list}"##,
-        email = esc(&who.email),
+        head = head,
         q = esc(q),
         list = list,
     )
