@@ -30,9 +30,11 @@ pub mod repos;
 pub mod settings;
 pub mod smart_http;
 
+use axum::extract::Query;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use serde::de::{SeqAccess, Visitor};
+use serde::Deserialize;
 use serde::Deserializer;
 use std::fmt;
 
@@ -178,6 +180,25 @@ pub fn redirect(location: &str) -> Response {
         [(header::LOCATION, location.to_string())],
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SigninQuery {
+    #[serde(rename = "return")]
+    pub return_to: Option<String>,
+}
+
+/// SSO bounce target. The gateway authenticates `/signin` before Loom sees it; Loom only redirects
+/// back to a same-origin relative path and rejects absolute/protocol-relative targets.
+pub async fn signin(Query(q): Query<SigninQuery>) -> Response {
+    redirect(safe_signin_return(q.return_to.as_deref()))
+}
+
+fn safe_signin_return(return_to: Option<&str>) -> &str {
+    match return_to {
+        Some(path) if path.starts_with('/') && !path.starts_with("//") => path,
+        _ => "/",
+    }
 }
 
 /// GitHub-compatible reaction glyphs accepted by Loom. Escapes keep this source ASCII-only.
@@ -389,6 +410,29 @@ fn user_menu(email: Option<&str>) -> String {
 /// (Repositories / Tokens, current marked `.is-active`), an "All apps" waffle to the apex portal,
 /// and the avatar menu. Shared by every page so the chrome stays identical across the estate.
 pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
+    if email.map_or(true, |e| e.is_empty()) {
+        return format!(
+            r##"<a class="appbar__brand" href="/" aria-label="HOLDFAST Loom">
+  <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
+  <span class="appbar__name"><b>Loom</b></span>
+</a>
+<form class="appbar__search" method="get" action="/" role="search">
+  <svg class="appbar__search-ico" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"/></svg>
+  <input class="appbar__search-q" type="search" name="q" placeholder="Find a repository&hellip;" aria-label="Find a repository">
+</form>
+<nav class="appbar__nav" aria-label="Loom sections">
+  <a class="appnav is-active" href="/">Repositories</a>
+</nav>
+<div class="appbar__spacer"></div>
+<div class="appbar__right">
+  <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+  {switcher}
+  <a class="btn" href="/signin">Sign in</a>
+</div>"##,
+            switcher = theme_switcher(theme),
+        );
+    }
+
     let tokens_active = title == "Access tokens";
     let repos_cls = if tokens_active {
         "appnav"
@@ -651,5 +695,14 @@ mod tests {
         // Future / zero timestamps fall back to the absolute form.
         assert_eq!(fmt_rel(now, now + 10), fmt_ts(now + 10));
         assert_eq!(fmt_rel(now, 0), fmt_ts(0));
+    }
+
+    #[test]
+    fn signin_return_is_same_origin_relative() {
+        assert_eq!(safe_signin_return(Some("/r/w33d/x")), "/r/w33d/x");
+        assert_eq!(safe_signin_return(Some("/")), "/");
+        assert_eq!(safe_signin_return(Some("https://evil")), "/");
+        assert_eq!(safe_signin_return(Some("//evil")), "/");
+        assert_eq!(safe_signin_return(None), "/");
     }
 }

@@ -70,6 +70,7 @@ pub fn app(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route("/signin", get(handlers::signin))
         .route("/", get(handlers::repos::index))
         .route(
             "/new",
@@ -320,12 +321,49 @@ pub fn app(state: AppState) -> Router {
             get(handlers::pats::index).post(handlers::pats::create),
         )
         .route("/pats/{id}/revoke", post(handlers::pats::revoke))
+        // Authenticated identity is verified by the outer gateway-signature layer first. Once a
+        // request is known not to be a forged identity, anonymous visitors may read public pages but
+        // every mutation/auth-only page bounces through the gateway SSO trigger.
+        .layer(axum::middleware::from_fn(require_auth_for_writes))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (git smart-HTTP / dev).
         .layer(axum::middleware::from_fn(require_gateway_sig))
         .with_state(state)
         .merge(git)
+}
+
+/// Gate anonymous visitors away from mutations and auth-only pages while preserving public reads.
+async fn require_auth_for_writes(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    if path.starts_with("/git/") {
+        return next.run(req).await;
+    }
+
+    let who = auth::identity(req.headers());
+    if who.is_authenticated() {
+        return next.run(req).await;
+    }
+
+    let method = req.method();
+    let is_read = (*method == axum::http::Method::GET || *method == axum::http::Method::HEAD)
+        && path != "/new"
+        && !path.starts_with("/pats")
+        && !path.ends_with("/settings")
+        && !path.contains("/settings/");
+    if is_read {
+        return next.run(req).await;
+    }
+
+    let return_to = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    handlers::redirect(&format!("/signin?return={}", url_encode(return_to)))
 }
 
 /// Middleware enforcing [`auth::gateway_identity_ok`] — 401 on a missing/invalid signature.
@@ -343,6 +381,19 @@ async fn require_gateway_sig(
         )
             .into_response()
     }
+}
+
+fn url_encode(input: &str) -> String {
+    let mut out = String::new();
+    for b in input.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Construct dev state: dev [`Config`] + an empty [`InMemoryStore`], with repo bytes under a

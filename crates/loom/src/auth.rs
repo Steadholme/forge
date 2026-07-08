@@ -25,9 +25,14 @@ pub const HEADER_GROUPS: &str = "x-auth-groups";
 pub const HEADER_SIG: &str = "x-auth-sig";
 
 /// Dev/test fallback identity used ONLY when no gateway headers are present (local `cargo run`
-/// or the DB-free test suite). In production every request arrives with `X-Auth-*` injected.
+/// or the DB-free test suite). In production an sso-optional gateway route can intentionally reach
+/// Loom with no `X-Auth-*` headers; those requests are represented by [`ANON_SUBJECT`], never this
+/// privileged local identity.
 pub const DEV_SUBJECT: &str = "dev-user";
 pub const DEV_EMAIL: &str = "dev@loom.local";
+/// Anonymous public viewer. Empty subject is never a valid repo owner, so writes are guarded before
+/// handlers can try to use it as an ownership key.
+pub const ANON_SUBJECT: &str = "";
 
 /// Double-submit CSRF cookie. `__Host-` prefix => Secure + Path=/ + no Domain, so the browser
 /// only ever returns it over TLS to this exact host.
@@ -52,13 +57,36 @@ pub struct Identity {
     pub theme: &'static str,
 }
 
-/// Resolve the current user from the gateway-injected headers, falling back to the dev identity
-/// when none are present (so the service still runs DB-free locally and in tests).
+impl Identity {
+    pub fn is_authenticated(&self) -> bool {
+        !self.subject.is_empty()
+    }
+}
+
+/// Resolve the current user from the gateway-injected headers. Local dev / tests keep the legacy
+/// dev fallback when gateway signature verification is disabled. In production, the sso-optional
+/// public route reaches Loom without `X-Auth-*` for anonymous visitors, so absence of a subject must
+/// be treated as anonymous instead of granting the privileged dev identity.
 pub fn identity(headers: &HeaderMap) -> Identity {
+    let theme = odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
+    let Some(subject) = header_value(headers, HEADER_SUBJECT) else {
+        if gateway_key().is_empty() {
+            return Identity {
+                subject: DEV_SUBJECT.to_string(),
+                email: DEV_EMAIL.to_string(),
+                theme,
+            };
+        }
+        return Identity {
+            subject: ANON_SUBJECT.to_string(),
+            email: String::new(),
+            theme,
+        };
+    };
     Identity {
-        subject: header_value(headers, HEADER_SUBJECT).unwrap_or_else(|| DEV_SUBJECT.to_string()),
+        subject,
         email: header_value(headers, HEADER_EMAIL).unwrap_or_else(|| DEV_EMAIL.to_string()),
-        theme: odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok())),
+        theme,
     }
 }
 
@@ -320,6 +348,7 @@ mod tests {
         let id = identity(&HeaderMap::new());
         assert_eq!(id.subject, DEV_SUBJECT);
         assert_eq!(id.email, DEV_EMAIL);
+        assert!(id.is_authenticated());
     }
 
     #[test]
@@ -330,6 +359,7 @@ mod tests {
         let id = identity(&h);
         assert_eq!(id.subject, "u_admin");
         assert_eq!(id.email, "a@w33d.xyz");
+        assert!(id.is_authenticated());
     }
 
     #[test]

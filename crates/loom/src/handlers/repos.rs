@@ -844,7 +844,7 @@ async fn repo_rows(state: &AppState, repos: Vec<Repo>) -> Vec<RepoRow> {
     rows
 }
 
-fn render_index(_who: &Identity, rows: &[RepoRow], q: &str) -> String {
+fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
     let now = now_secs();
     let list = if rows.is_empty() {
         let title = if q.trim().is_empty() {
@@ -852,10 +852,12 @@ fn render_index(_who: &Identity, rows: &[RepoRow], q: &str) -> String {
         } else {
             format!("No repositories matched &ldquo;{}&rdquo;", esc(q))
         };
-        let cta = if q.trim().is_empty() {
+        let cta = if !q.trim().is_empty() {
+            ""
+        } else if who.is_authenticated() {
             "<a class=\"btn btn-primary\" href=\"/new\">New repository</a>"
         } else {
-            ""
+            "<a class=\"btn btn-primary\" href=\"/signin\">Sign in</a>"
         };
         let text = if q.trim().is_empty() {
             "Create your first repository to get started."
@@ -927,12 +929,29 @@ fn render_index(_who: &Identity, rows: &[RepoRow], q: &str) -> String {
     // results dominate. Stats reflect the unfiltered estate (rows == everything when q is empty).
     let head = if q.trim().is_empty() {
         let repo_count = rows.len();
-        let mut langs: Vec<&str> = rows.iter().filter_map(|r| r.language.map(|l| l.name)).collect();
+        let mut langs: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.language.map(|l| l.name))
+            .collect();
         langs.sort_unstable();
         langs.dedup();
         let lang_count = langs.len();
-        let repo_label = if repo_count == 1 { "Repository" } else { "Repositories" };
-        let lang_label = if lang_count == 1 { "Language" } else { "Languages" };
+        let repo_label = if repo_count == 1 {
+            "Repository"
+        } else {
+            "Repositories"
+        };
+        let lang_label = if lang_count == 1 {
+            "Language"
+        } else {
+            "Languages"
+        };
+        let actions = if who.is_authenticated() {
+            r##"<a class="btn btn-primary" href="/new">New repository</a>
+      <a class="btn" href="/pats">Access tokens</a>"##
+        } else {
+            r##"<a class="btn btn-primary" href="/signin">Sign in</a>"##
+        };
         format!(
             r##"<section class="home-hero">
   <div class="home-hero__body">
@@ -940,8 +959,7 @@ fn render_index(_who: &Identity, rows: &[RepoRow], q: &str) -> String {
     <h1 class="home-hero__title">Built in the open.</h1>
     <p class="home-hero__lede">A sovereign, self-hosted estate — identity, mail, git, registry, search, AI and dozens more services, engineered from the ground up. Every service, open source. Clone any repository over HTTPS.</p>
     <div class="home-hero__actions">
-      <a class="btn btn-primary" href="/new">New repository</a>
-      <a class="btn" href="/pats">Access tokens</a>
+      {actions}
     </div>
   </div>
   <dl class="home-stats" aria-label="Estate at a glance">
@@ -954,13 +972,21 @@ fn render_index(_who: &Identity, rows: &[RepoRow], q: &str) -> String {
             repo_label = repo_label,
             lang_count = lang_count,
             lang_label = lang_label,
+            actions = actions,
         )
     } else {
-        r##"<div class="console__head console__head--row">
+        let action = if who.is_authenticated() {
+            r##"<a class="btn btn-primary" href="/new">New repository</a>"##
+        } else {
+            r##"<a class="btn btn-primary" href="/signin">Sign in</a>"##
+        };
+        format!(
+            r##"<div class="console__head console__head--row">
   <div><p class="eyebrow">HOLDFAST · SOVEREIGN ESTATE</p><h1>Repositories</h1></div>
-  <a class="btn btn-primary" href="/new">New repository</a>
-</div>"##
-            .to_string()
+  {action}
+</div>"##,
+            action = action,
+        )
     };
 
     format!(
