@@ -421,7 +421,7 @@ pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
   <input class="appbar__search-q" type="search" name="q" placeholder="Find a repository&hellip;" aria-label="Find a repository">
 </form>
 <nav class="appbar__nav" aria-label="Loom sections">
-  <a class="appnav is-active" href="/">Repositories</a>
+  <a class="appnav is-active" href="/" data-wire-off>Repositories</a>
 </nav>
 <div class="appbar__spacer"></div>
 <div class="appbar__right">
@@ -454,16 +454,16 @@ pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
   <input class="appbar__search-q" type="search" name="q" placeholder="Find a repository&hellip;" aria-label="Find a repository">
 </form>
 <nav class="appbar__nav" aria-label="Loom sections">
-  <a class="{repos_cls}" href="/">Repositories</a>
-  <a class="{tokens_cls}" href="/pats">Tokens</a>
+  <a class="{repos_cls}" href="/" data-wire-off>Repositories</a>
+  <a class="{tokens_cls}" href="/pats" data-wire-off>Tokens</a>
 </nav>
 <div class="appbar__spacer"></div>
 <div class="appbar__right">
   <details class="create-menu">
     <summary class="iconbtn" aria-label="Create new" title="Create new&hellip;"><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg><svg class="create-menu__caret" viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="m4.427 7.427 3.396 3.396a.25.25 0 0 0 .354 0l3.396-3.396A.25.25 0 0 0 11.396 7H4.604a.25.25 0 0 0-.177.427Z"/></svg></summary>
     <div class="create-menu__pop">
-      <a class="menuitem" href="/new">New repository</a>
-      <a class="menuitem" href="/pats">New access token</a>
+      <a class="menuitem" href="/new" data-wire-off>New repository</a>
+      <a class="menuitem" href="/pats" data-wire-off>New access token</a>
     </div>
   </details>
   <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
