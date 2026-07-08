@@ -17,9 +17,27 @@
     if(/(^|\s)external(\s|$)/.test(a.getAttribute('rel')||''))return null;
     var region=boostRegion(a);if(!region)return null;
     var u=urlOf(a.getAttribute('href'));if(!u||u.href===w.location.href)return null;
+    // Gateway control endpoints (/_gw/theme, /_gw/lang, /_gw/auth/*) set a cookie + redirect; they
+    // repaint <html>/<head> which a region inner-swap never touches. Never boost them — full nav.
+    if(u.pathname.indexOf('/_gw/')===0)return null;
     if(u.pathname===w.location.pathname&&u.search===w.location.search&&u.hash)return null;
     return{u:u,region:region};
   }
+  function reduced(){return w.matchMedia&&w.matchMedia('(prefers-reduced-motion:reduce)').matches;}
+  // Run the DOM mutation inside a View Transition when boost-navigating: prefer OdysseyMotion
+  // (shared timing) but fall back to a direct startViewTransition so boost animates even if the
+  // motion module was not loaded; plain call when VT is unsupported or motion is reduced.
+  function vtCommit(commit,vt){
+    if(vt&&!reduced()){
+      if(w.OdysseyMotion&&w.OdysseyMotion.swap){w.OdysseyMotion.swap(commit);return;}
+      if(d.startViewTransition){d.startViewTransition(commit);return;}
+    }
+    commit();
+  }
+  // Scroll: forward boost nav lands at the top (like a normal link); back/forward restores the
+  // saved position. history.scrollRestoration=manual so the browser does not fight us.
+  try{if('scrollRestoration' in history)history.scrollRestoration='manual';}catch(e){}
+  function saveScroll(){try{history.replaceState(Object.assign({},history.state||{},{owy:w.pageYOffset||0}),'');}catch(e){}}
   function markCurrent(){
     var links=d.querySelectorAll('[data-wire-nav] a[href]'),here=w.location.pathname+w.location.search,i,a,lu;
     for(i=0;i<links.length;i++){a=links[i];if(a.hasAttribute('data-wire-off')){a.removeAttribute('aria-current');continue;}
@@ -115,14 +133,14 @@
         for(var i=0;i<c.t.length;i++){cur=q(d,c.t[i]);fresh=q(doc,c.s[i]);if(!cur||!fresh){w.location.assign(ru.href);return null;}pairs.push([cur,fresh,c.t[i]]);}
         var active=focusedIn(pairs.map(function(p){return p[0];})),ins=[];
         function commit(){pairs.forEach(function(p){var n=apply(c.m,p[0],p[1]);ins.push(n);fire(n,'odyssey:swap',{url:res.url,mode:c.m,selector:p[2]});});restoreFocus(active,ins);}
-        if(c.vt&&w.OdysseyMotion&&w.OdysseyMotion.swap)w.OdysseyMotion.swap(commit);else commit();
+        vtCommit(commit,c.vt);
         return{res:res,nodes:ins};
       });
     }).then(function(out){
       if(!out)return;
       finish(trigger,'wire:after',{url:out.res.url,status:out.res.status,redirected:out.res.redirected,targets:c.t},out.nodes);
       toast(trigger.getAttribute('data-wire-ok'),true);
-      if(push)history.pushState({odysseyWire:{t:c.t,s:c.s,m:c.m,vt:c.vt}},'',out.res.url);
+      if(push){history.pushState({odysseyWire:{t:c.t,s:c.s,m:c.m,vt:c.vt}},'',out.res.url);if(c.vt)w.scrollTo(0,0);}
     }).catch(function(err){
       if(snaps)rollback(snaps);
       fire(trigger,'wire:error',{status:err&&err.status||0,error:err});
@@ -148,6 +166,7 @@
       return;
     }
     b=boostable(link);if(!b)return;
+    saveScroll();
     if(run(link,{url:b.u,method:'GET',body:null,headers:H},{t:[b.region],s:[b.region],m:'inner',vt:true},null,true))e.preventDefault();
   });
   w.addEventListener('popstate',function(e){
@@ -157,8 +176,8 @@
       var doc=new DOMParser().parseFromString(text,'text/html'),ok=true,nodes=[];
       s.t.forEach(function(t,i){var cur=q(d,t),fresh=q(doc,s.s[i]);if(!cur||!fresh)ok=false;else nodes.push([cur,fresh,t]);});
       if(!ok){w.location.reload();return;}
-      function commit(){nodes.forEach(function(p){var n=apply(s.m,p[0],p[1]);fire(n,'odyssey:swap',{url:w.location.href,mode:s.m,selector:p[2]});});markCurrent();}
-      if(s.vt&&w.OdysseyMotion&&w.OdysseyMotion.swap)w.OdysseyMotion.swap(commit);else commit();
+      function commit(){nodes.forEach(function(p){var n=apply(s.m,p[0],p[1]);fire(n,'odyssey:swap',{url:w.location.href,mode:s.m,selector:p[2]});});markCurrent();w.scrollTo(0,(e.state&&e.state.owy)||0);}
+      vtCommit(commit,s.vt);
     }).catch(function(){w.location.reload();});
   });
   d.addEventListener('wire:after',function(){markCurrent();});

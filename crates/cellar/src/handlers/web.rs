@@ -330,7 +330,10 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
         .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
-        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
+        .replace(
+            "{{JS}}",
+            &format!("{}\n{}\n{}", odyssey::MOTION_JS, odyssey::WIRE_JS, APP_JS),
+        )
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace(
             "{{USERBOX}}",
@@ -441,7 +444,10 @@ fn render_repo(
         .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
-        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
+        .replace(
+            "{{JS}}",
+            &format!("{}\n{}\n{}", odyssey::MOTION_JS, odyssey::WIRE_JS, APP_JS),
+        )
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{LAYERS}}", LAYERS_SVG)
         .replace(
@@ -584,7 +590,10 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
         .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
-        .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
+        .replace(
+            "{{JS}}",
+            &format!("{}\n{}\n{}", odyssey::MOTION_JS, odyssey::WIRE_JS, APP_JS),
+        )
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{LAYERS}}", LAYERS_SVG)
         .replace(
