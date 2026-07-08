@@ -250,8 +250,13 @@ fn render(
     };
     ROBOTS_HTML
         .replace("{{CSS}}", app_css())
+        .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
-        .replace("{{USERBOX}}", &userbox("Registry admin", Some(&who.email)))
+        .replace(
+            "{{USERBOX}}",
+            &userbox("Registry admin", Some(&who.email), who.theme),
+        )
         .replace("{{TABS}}", &admin_tabs("robots"))
         .replace("{{NOTICE}}", notice)
         .replace("{{TOKEN}}", token_block)

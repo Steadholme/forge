@@ -249,3 +249,9 @@ table.data tbody[data-motion-list] tr[hidden]{display:none}
 @media (prefers-reduced-motion:reduce){
   table.data tbody tr,.cl-platform,.copy-btn{transition:none}
 }
+
+/* ============ 暗色品牌:抬亮青铜(value-only remap;light :root 不变)============ */
+:root[data-theme="dark"]{
+  --accent:#cf9b4e; --accent-2:#e0b366; --accent-ink:#e6b866;
+  --accent-soft:#2a2012; --accent-soft-2:#3a2c17; --ring:rgba(207,155,78,.40);
+}
