@@ -2,7 +2,7 @@
 name = "cellar"
 version = "0.1.0"
 edition = "2021"
-description = "Cellar — an OCI / Docker Registry HTTP API V2 container registry for the HOLDFAST stack (SSO web UI; Basic-auth /v2/ protocol; content-addressed blobs on a volume, metadata in Postgres)."
+description = "Cellar — an OCI / Docker Registry HTTP API V2 container registry for the Steadholme stack (SSO web UI; Basic-auth /v2/ protocol; content-addressed blobs on a volume, metadata in Postgres)."
 license = "MIT OR Apache-2.0"
 
 [lib]

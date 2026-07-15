@@ -1,4 +1,4 @@
-//! Atlas — infrastructure catalog & topology map for the HOLDFAST estate.
+//! Atlas — infrastructure catalog & topology map for the Steadholme estate.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory annotation store + the demo route seed, no database) and

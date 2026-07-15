@@ -65,7 +65,7 @@ impl InMemoryRoutes {
         }
     }
 
-    /// A representative seed of the live HOLDFAST route table — so dev/`cargo run` (and the
+    /// A representative seed of the live Steadholme route table — so dev/`cargo run` (and the
     /// integration tests) show a meaningful catalog with no database configured.
     pub fn demo() -> Self {
         Self::new(demo_routes())

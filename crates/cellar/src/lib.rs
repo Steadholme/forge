@@ -1,4 +1,4 @@
-//! Cellar — an OCI / Docker Registry HTTP API V2 container registry for the HOLDFAST stack.
+//! Cellar — an OCI / Docker Registry HTTP API V2 container registry for the Steadholme stack.
 //!
 //! Two surfaces on one subdomain (`registry.w33d.xyz`), split at the gateway:
 //! - **`/` web console — `auth=sso`.** The browser UI: list repositories, drill into a repo's

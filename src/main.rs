@@ -1,4 +1,4 @@
-//! Forge — one container hosting the HOLDFAST devplatform surfaces (git forge / container
+//! Forge — one container hosting the Steadholme devplatform surfaces (git forge / container
 //! registry / infrastructure catalog).
 //!
 //! Each surface is its OWN library crate (Loom/Cellar/Atlas), reused verbatim: same schema, same

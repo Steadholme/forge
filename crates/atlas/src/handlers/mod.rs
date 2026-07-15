@@ -34,7 +34,7 @@ pub fn app_css() -> &'static str {
 /// Cross-subdomain gateway logout (Atlas lives at atlas.w33d.xyz; the IdP is at id.w33d.xyz).
 pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
-/// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
+/// The Steadholme shield glyph (small, for the app-bar brand lockup).
 pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
 
 /// Minimal HTML escaping for text/attribute interpolation (defense-in-depth on every field).
@@ -77,7 +77,7 @@ fn user_menu(email: &str) -> String {
         (
             "·".to_string(),
             String::new(),
-            "<b>Signed in</b><span>HOLDFAST estate</span>".to_string(),
+            "<b>Signed in</b><span>Steadholme estate</span>".to_string(),
         )
     };
     format!(
@@ -109,7 +109,7 @@ pub fn topbar(page_title: &str, email: &str, theme: &str) -> String {
     let topology_cls = if topology_active { "appnav is-active" } else { "appnav" };
     format!(
         r##"<header class="appbar">
-  <a class="appbar__brand" href="/" aria-label="HOLDFAST Atlas">
+  <a class="appbar__brand" href="/" aria-label="Steadholme Atlas">
     <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span>
     <span class="appbar__name"><b>Atlas</b><span>atlas.w33d.xyz</span></span>
   </a>
@@ -238,8 +238,8 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
   </div>
 </main>
 <footer class="site-foot">
-  <span>HOLDFAST · Atlas</span>
-  <span>Estate ops atlas · part of the HOLDFAST estate</span>
+  <span>Steadholme · Atlas</span>
+  <span>Estate ops atlas · part of the Steadholme estate</span>
 </footer>
 </body></html>"#,
         css = app_css(),

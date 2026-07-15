@@ -1,6 +1,6 @@
 # Atlas — infrastructure catalog & topology map
 
-Atlas is the IaC/portal **capstone** of the HOLDFAST estate: a single _"what is in my
+Atlas is the IaC/portal **capstone** of the Steadholme estate: a single _"what is in my
 estate"_ catalog and dependency view, built over the gateway's route table and live
 component status. Rust + axum, rustls (no OpenSSL), sqlx runtime queries (no compile-time
 macros, no database needed to build). Boots zero-config on the in-memory defaults.

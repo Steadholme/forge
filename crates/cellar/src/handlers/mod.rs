@@ -5,7 +5,7 @@
 //! - [`web`] — the SSO web console (repository list + detail; the browser surface).
 //!
 //! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
-//! matching the HOLDFAST enterprise brand (brand gradient, indigo accent, cards, app-bar with the
+//! matching the Steadholme enterprise brand (brand gradient, indigo accent, cards, app-bar with the
 //! shield + the signed-in email + the gateway logout). All producer-supplied text (repo names,
 //! tags, media types, digests) is HTML-escaped on render.
 
@@ -40,7 +40,7 @@ pub fn app_css() -> &'static str {
 /// additive: every form route + server-rendered markup still works with JavaScript disabled.
 pub const APP_JS: &str = include_str!("../../static/app.js");
 
-/// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
+/// The Steadholme shield glyph (small, for the app-bar brand lockup).
 pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="currentColor" fill-opacity=".18" stroke="currentColor" stroke-opacity=".72" stroke-width="2" stroke-linejoin="round"/><rect x="20" y="19" width="8" height="13" rx="1" fill="currentColor" fill-opacity=".62"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="currentColor" stroke-width="2" stroke-opacity=".9" fill="none"/></svg>"##;
 
 /// A stacked-layers glyph used on repository cards / the detail header.
@@ -165,7 +165,7 @@ fn user_menu(email: Option<&str>) -> String {
         _ => (
             "·".to_string(),
             String::new(),
-            "<b>Signed in</b><span>HOLDFAST estate</span>".to_string(),
+            "<b>Signed in</b><span>Steadholme estate</span>".to_string(),
         ),
     };
     format!(
@@ -193,7 +193,7 @@ fn user_menu(email: Option<&str>) -> String {
 /// stays identical across the estate. (`_title` is retained for a uniform signature.)
 pub fn userbox(_title: &str, email: Option<&str>, theme: &str) -> String {
     format!(
-        r##"<a class="appbar__brand" href="/" aria-label="HOLDFAST Registry">
+        r##"<a class="appbar__brand" href="/" aria-label="Steadholme Registry">
   <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg></span>
   <span class="appbar__name"><b>Cellar</b><span>registry.w33d.xyz</span></span>
 </a>

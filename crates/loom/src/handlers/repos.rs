@@ -955,7 +955,7 @@ fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
         format!(
             r##"<section class="home-hero">
   <div class="home-hero__body">
-    <p class="eyebrow">HOLDFAST · SOVEREIGN ESTATE</p>
+    <p class="eyebrow">Steadholme · SOVEREIGN ESTATE</p>
     <h1 class="home-hero__title">Built in the open.</h1>
     <p class="home-hero__lede">A sovereign, self-hosted estate — identity, mail, git, registry, search, AI and dozens more services, engineered from the ground up. Every service, open source. Clone any repository over HTTPS.</p>
     <div class="home-hero__actions">
@@ -982,7 +982,7 @@ fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
         };
         format!(
             r##"<div class="console__head console__head--row">
-  <div><p class="eyebrow">HOLDFAST · SOVEREIGN ESTATE</p><h1>Repositories</h1></div>
+  <div><p class="eyebrow">Steadholme · SOVEREIGN ESTATE</p><h1>Repositories</h1></div>
   {action}
 </div>"##,
             action = action,

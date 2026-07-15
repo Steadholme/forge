@@ -12,7 +12,7 @@
 //! - [`smart_http`] — the git smart-HTTP protocol (`/git/...`) with PAT Basic auth.
 //!
 //! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
-//! matching the HOLDFAST enterprise brand. All producer-supplied text (repo names, descriptions,
+//! matching the Steadholme enterprise brand. All producer-supplied text (repo names, descriptions,
 //! file contents, commit subjects) is HTML-escaped on render. Markdown surfaces (README files,
 //! `.md` blobs, issue bodies) are rendered through the sanitising [`crate::markdown`] pipeline
 //! (raw HTML downgraded to text, unsafe link schemes defused) — Loom serves no executable file
@@ -61,7 +61,7 @@ pub fn app_css() -> &'static str {
 /// additive: every form route + server-rendered markup still works with JavaScript disabled.
 pub const APP_JS: &str = include_str!("../../static/app.js");
 
-/// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
+/// The Steadholme shield glyph (small, for the app-bar brand lockup).
 pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
 
 /// Reserved subject for the PR preview bot. `:` is intentionally invalid for real owner subjects.
@@ -386,7 +386,7 @@ fn user_menu(email: Option<&str>) -> String {
         _ => (
             "·".to_string(),
             String::new(),
-            "<b>Signed in</b><span>HOLDFAST estate</span>".to_string(),
+            "<b>Signed in</b><span>Steadholme estate</span>".to_string(),
         ),
     };
     format!(
@@ -415,7 +415,7 @@ fn user_menu(email: Option<&str>) -> String {
 pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
     if email.map_or(true, |e| e.is_empty()) {
         return format!(
-            r##"<a class="appbar__brand" href="/" aria-label="HOLDFAST Loom">
+            r##"<a class="appbar__brand" href="/" aria-label="Steadholme Loom">
   <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
   <span class="appbar__name"><b>Loom</b></span>
 </a>
@@ -448,7 +448,7 @@ pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
         "appnav"
     };
     format!(
-        r##"<a class="appbar__brand" href="/" aria-label="HOLDFAST Loom">
+        r##"<a class="appbar__brand" href="/" aria-label="Steadholme Loom">
   <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
   <span class="appbar__name"><b>Loom</b></span>
 </a>

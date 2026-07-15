@@ -2,7 +2,7 @@
 name = "loom"
 version = "0.1.0"
 edition = "2021"
-description = "Loom — self-hosted git forge for the HOLDFAST stack (SSO web UI + git smart-HTTP with PAT auth)."
+description = "Loom — self-hosted git forge for the Steadholme stack (SSO web UI + git smart-HTTP with PAT auth)."
 license = "MIT OR Apache-2.0"
 
 [lib]

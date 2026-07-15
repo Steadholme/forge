@@ -2,7 +2,7 @@
 name = "forge"
 version = "0.1.0"
 edition = "2021"
-description = "Forge — one deployable hosting the HOLDFAST devplatform surfaces (git forge / container registry / infrastructure catalog) behind a Host-based vhost demux. Each surface keeps its own database, routes, subdomain and on-disk data volume; this binary just composes the three library crates so the estate runs one container instead of three."
+description = "Forge — one deployable hosting the Steadholme devplatform surfaces (git forge / container registry / infrastructure catalog) behind a Host-based vhost demux. Each surface keeps its own database, routes, subdomain and on-disk data volume; this binary just composes the three library crates so the estate runs one container instead of three."
 license = "MIT OR Apache-2.0"
 
 [[bin]]

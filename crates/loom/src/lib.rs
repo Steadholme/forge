@@ -1,4 +1,4 @@
-//! Loom — self-hosted git forge for the HOLDFAST stack.
+//! Loom — self-hosted git forge for the Steadholme stack.
 //!
 //! Loom serves TWO surfaces on one subdomain (`git.w33d.xyz`), split at the Sluice gateway:
 //!

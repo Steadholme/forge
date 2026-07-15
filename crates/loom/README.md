@@ -1,6 +1,6 @@
-# Loom — 自托管 Git 代码托管（HOLDFAST 编织机）
+# Loom — 自托管 Git 代码托管（Steadholme 编织机）
 
-Loom 是 HOLDFAST 主权基础设施中的 **自托管 Git 代码托管服务（git forge）**，落子域
+Loom 是 Steadholme 主权基础设施中的 **自托管 Git 代码托管服务（git forge）**，落子域
 `git.w33d.xyz`，内网监听 `9030`。它在同一个子域上提供两个面，并在 Sluice 网关按路径切分认证：
 
 - **Web 控制台（`/`，`auth=sso`）**：仓库列表 / 新建、仓库浏览（默认分支文件树 + 提交历史 +

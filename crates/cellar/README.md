@@ -1,6 +1,6 @@
 # Cellar — 主权 OCI 容器镜像仓库
 
-Cellar 是 HOLDFAST 主权基础设施中的**容器镜像仓库**（OCI / Docker Registry HTTP API V2），
+Cellar 是 Steadholme 主权基础设施中的**容器镜像仓库**（OCI / Docker Registry HTTP API V2），
 落子域 `registry.w33d.xyz`，内网端口 `9040`。它把整套架构的核心挑战做成范式：
 **Web 控制台走浏览器 SSO，CLI 协议走仓库自有的 HTTP Basic 认证**——因为 `docker` 客户端
 不会做浏览器的 OIDC/Cookie 单点登录。
@@ -46,7 +46,7 @@ Cellar 是 HOLDFAST 主权基础设施中的**容器镜像仓库**（OCI / Docke
 
 仓库列表（镜像数 / tag 数 / 体积 / 最近推送时间）+ 仓库详情（各 tag 的 manifest 摘要、媒体
 类型、镜像体积、更新时间）。提供一个**带 CSRF 的删除 tag** 操作（删除指针；manifest 与 blob
-保留，回收为延后的 GC）。企业级 HOLDFAST UI（内联 CSS、app-bar、登录邮箱、网关登出）。所有
+保留，回收为延后的 GC）。企业级 Steadholme UI（内联 CSS、app-bar、登录邮箱、网关登出）。所有
 生产者文本均做 HTML 转义。
 
 ## 配置（环境变量）
