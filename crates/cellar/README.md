@@ -66,7 +66,7 @@ Cellar 是 Steadholme 主权基础设施中的**容器镜像仓库**（OCI / Doc
 ```bash
 cargo test                 # 内存端到端 + 单元（无库、无卷）
 cargo clippy --all-targets -- -D warnings
-docker build -t holdfast/cellar:dev .
+docker build -t steadholme/cellar:dev .
 
 # 部署：网关在 HTTPS 之后，docker login/push/pull 直接可用：
 docker login registry.w33d.xyz

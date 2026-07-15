@@ -83,7 +83,7 @@ pats(id TEXT PK, owner_sub TEXT, name TEXT, token_hash TEXT, created_at BIGINT)
 cargo run
 
 # 生产：Postgres + 持久卷
-LOOM_STORE=postgres DATABASE_URL=postgres://holdfast:***@postgres:5432/loom \
+LOOM_STORE=postgres DATABASE_URL=postgres://steadholme:***@postgres:5432/loom \
 LOOM_DATA=/data PUBLIC_BASE_URL=https://git.w33d.xyz cargo run --release
 
 # 容器健康探针（镜像 HEALTHCHECK 复用此子命令，无需 curl）
@@ -143,7 +143,7 @@ cargo clippy --all-targets -- -D warnings
 ## 构建镜像
 
 ```bash
-docker build -t holdfast/loom:dev .
+docker build -t steadholme/loom:dev .
 ```
 
 多阶段、非 root（uid 10001）；运行镜像安装 `git`（提供 `git-http-backend`）与 `ca-certificates`；
