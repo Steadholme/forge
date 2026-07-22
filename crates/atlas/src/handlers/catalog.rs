@@ -18,8 +18,10 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::beacon;
 use crate::error::AppError;
-use crate::handlers::{app_css, auth_badge, esc, fmt_date, status_pill, topbar};
-use crate::inventory::{self, auth_color, Inventory, ServiceEntry};
+use crate::handlers::{
+    app_css, auth_cat, auth_word, esc, fmt_date, status_label, status_pill, status_slug, topbar,
+};
+use crate::inventory::{self, auth_slug, Inventory, ServiceEntry};
 use crate::store::Service;
 use crate::{now_secs, AppState};
 
@@ -71,7 +73,10 @@ async fn load_inventory(state: &AppState) -> Inventory {
 
 /// `GET /` — every host grouped by upstream service, with auth mode, WAF flag, live status pill,
 /// and any operator annotation, plus a headline summary.
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
     let (_sub, email) = auth::require_viewer(&headers)?;
     let theme = odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let inv = load_inventory(&state).await;
@@ -82,16 +87,16 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
         r#"<div class="banner banner--warn">The gateway route table is unavailable — the catalog is degraded. Live status and inventory will return once the route DB is reachable.</div>"#.to_string()
     };
 
-    let summary = render_summary(&inv);
+    let summary = render_cartouche(&inv);
 
     let mut rows = String::new();
     if inv.services.is_empty() {
         rows.push_str(
-            r#"<div class="empty-state"><h2>No services discovered</h2><p>The gateway route table is empty or unavailable.</p></div>"#,
+            r#"<tr class="ledger__row ledger__row--empty"><td class="ledger__empty" colspan="9">No services discovered — the gateway route table is empty or unavailable.</td></tr>"#,
         );
     } else {
         for s in &inv.services {
-            rows.push_str(&render_service_card(s));
+            rows.push_str(&ledger_row(s));
         }
     }
 
@@ -149,9 +154,9 @@ pub async fn detail(
 </tr>"#,
                     url = esc(&safe_link(&r.public_url)),
                     url_txt = esc(&r.public_url),
-                    auth = auth_badge(&r.auth),
+                    auth = auth_cat(&r.auth),
                     waf = if r.waf {
-                        r#"<span class="abadge" style="--abadge:#D97706">WAF</span>"#
+                        r#"<span class="wafflag">WAF</span>"#
                     } else {
                         r#"<span class="muted">—</span>"#
                     },
@@ -194,10 +199,14 @@ pub async fn annotate(
 
     let key = form.key.trim();
     if key.is_empty() {
-        return Err(AppError::InvalidRequest("service key is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "service key is required".to_string(),
+        ));
     }
     if key.chars().count() > MAX_KEY {
-        return Err(AppError::InvalidRequest("service key is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "service key is too long".to_string(),
+        ));
     }
 
     let service = Service {
@@ -227,9 +236,12 @@ pub async fn annotate(
 // GET /graph — inline-SVG topology
 // ---------------------------------------------------------------------------
 
-/// `GET /graph` — a simple inline-SVG topology: the gateway in the center with one edge to each
-/// upstream service, colored by the service's primary auth mode.
-pub async fn graph(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+/// `GET /graph` — an inline-SVG topology: the gateway in the center with one edge to each upstream
+/// service, classified by the service's primary auth mode.
+pub async fn graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
     let (_sub, email) = auth::require_viewer(&headers)?;
     let theme = odyssey::resolve_theme(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let inv = load_inventory(&state).await;
@@ -263,22 +275,15 @@ pub async fn api_inventory(
 // Render helpers
 // ---------------------------------------------------------------------------
 
-/// The headline metric strip.
-fn render_summary(inv: &Inventory) -> String {
+/// Compact survey provenance derived only from the assembled inventory.
+fn render_cartouche(inv: &Inventory) -> String {
     let online = if inv.beacon_reached {
-        format!("{} / {}", inv.beacon_up, inv.beacon_total)
+        format!("Beacon {} / {} online", inv.beacon_up, inv.beacon_total)
     } else {
-        "—".to_string()
+        "Beacon status unavailable".to_string()
     };
     format!(
-        r#"<div class="metrics">
-  <div class="metric"><div class="metric__val">{services}</div><div class="metric__label">Services</div></div>
-  <div class="metric"><div class="metric__val">{routes}</div><div class="metric__label">Routes</div></div>
-  <div class="metric"><div class="metric__val">{sso}</div><div class="metric__label">SSO routes</div></div>
-  <div class="metric"><div class="metric__val">{public}</div><div class="metric__label">Public routes</div></div>
-  <div class="metric"><div class="metric__val">{bearer}</div><div class="metric__label">Bearer routes</div></div>
-  <div class="metric"><div class="metric__val">{online}</div><div class="metric__label">Systems online</div></div>
-</div>"#,
+        r#"<p class="survey__cartouche">Survey of {services} services · {routes} routes — {sso} SSO · {public} public · {bearer} bearer · {online}</p>"#,
         services = inv.services_total,
         routes = inv.routes_total,
         sso = inv.sso_count,
@@ -288,74 +293,75 @@ fn render_summary(inv: &Inventory) -> String {
     )
 }
 
-/// One service card on the catalog: header (name + key + status), route rows, owner/tier/notes.
-fn render_service_card(s: &ServiceEntry) -> String {
-    let mut routes = String::new();
-    for r in &s.routes {
-        let waf = if r.waf {
-            r#" <span class="abadge" style="--abadge:#D97706">WAF</span>"#
-        } else {
-            ""
-        };
-        routes.push_str(&format!(
-            r#"<li class="route-row">
-  <a class="route-row__url" href="{url}" rel="noopener noreferrer">{url_txt}</a>
-  <span class="route-row__meta">{auth}{waf}</span>
-</li>"#,
-            url = esc(&safe_link(&r.public_url)),
-            url_txt = esc(&r.public_url),
-            auth = auth_badge(&r.auth),
-            waf = waf,
-        ));
-    }
-
-    let mut meta = String::new();
-    if !s.owner.trim().is_empty() {
-        meta.push_str(&format!(
-            r#"<span class="svc__tag">Owner: {}</span>"#,
-            esc(&s.owner)
-        ));
-    }
-    if !s.tier.trim().is_empty() {
-        meta.push_str(&format!(
-            r#"<span class="svc__tag">Tier: {}</span>"#,
-            esc(&s.tier)
-        ));
-    }
-    let notes = if s.notes.trim().is_empty() {
-        String::new()
+/// One semantic ledger row. The K3-owned template supplies the table, caption, and column heads.
+pub fn ledger_row(s: &ServiceEntry) -> String {
+    let exposure = if let Some(route) = s.routes.first() {
+        format!(
+            r#"<a class="ledger__url" href="{url}" rel="noopener noreferrer">{label}</a>"#,
+            url = esc(&safe_link(&route.public_url)),
+            label = esc(&route.public_url),
+        )
     } else {
-        format!(r#"<p class="svc__notes">{}</p>"#, esc(&s.notes))
+        "—".to_string()
     };
+    let waf = if s.waf_any {
+        r#"<span class="wafflag">WAF</span>"#
+    } else {
+        ""
+    };
+    let auth = if s.auth_modes.is_empty() {
+        "—".to_string()
+    } else {
+        s.auth_modes.iter().map(|mode| auth_cat(mode)).collect()
+    };
+    let owner = if s.owner.trim().is_empty() {
+        "—".to_string()
+    } else {
+        format!("Owner: {}", esc(&s.owner))
+    };
+    let tier = if s.tier.trim().is_empty() {
+        "—".to_string()
+    } else {
+        format!("Tier: {}", esc(&s.tier))
+    };
+    let notes = if s.notes.trim().is_empty() {
+        "—".to_string()
+    } else {
+        esc(&s.notes)
+    };
+    let waf_attr = if s.waf_any { r#" data-waf="true""# } else { "" };
 
     format!(
-        r#"<article class="svc-card">
-  <div class="svc-card__head">
-    <div class="svc-card__id">
-      <h2 class="svc-card__name"><a href="/service/{key_url}">{name}</a></h2>
-      <span class="svc-card__key">{key}</span>
-    </div>
-    <div class="svc-card__status">{status}</div>
-  </div>
-  <ul class="route-list">{routes}</ul>
-  <div class="svc-card__foot">
-    <div class="svc__tags">{meta}</div>
-    <a class="btn btn-secondary btn-sm" href="/service/{key_url}">Edit annotation</a>
-  </div>
-  {notes}
-</article>"#,
+        r#"<tr class="ledger__row" data-status="{status_slug}" data-annotated="{annotated}"{waf_attr}>
+  <td class="ledger__status">{status}</td>
+  <td class="ledger__svc"><a class="ledger__svclink" href="/service/{key_url}">{name}</a><span class="ledger__key">{key}</span></td>
+  <td class="ledger__exposure">{exposure}{waf}</td>
+  <td class="ledger__auth">{auth}</td>
+  <td class="ledger__routes">{routes}</td>
+  <td class="ledger__owner">{owner}</td>
+  <td class="ledger__tier">{tier}</td>
+  <td class="ledger__notes">{notes}</td>
+  <td class="ledger__act"><a class="ledger__actlink" href="/service/{key_url}">Annotate</a></td>
+</tr>"#,
         key_url = esc(&urlpath(&s.key)),
         name = esc(&s.display_name),
         key = esc(&s.key),
         status = status_pill(&s.status),
-        routes = routes,
-        meta = meta,
+        status_slug = status_slug(&s.status),
+        annotated = s.annotated,
+        waf_attr = waf_attr,
+        exposure = exposure,
+        waf = waf,
+        auth = auth,
+        routes = s.routes.len(),
+        owner = owner,
+        tier = tier,
         notes = notes,
     )
 }
 
 /// Build the topology SVG: the gateway hub center, one spoke + node per service around a circle,
-/// each colored by its primary auth mode. Labels flip to the outside of the ring for legibility.
+/// with auth encoded by bounded semantic hooks and redundant node shapes.
 fn render_graph_svg(inv: &Inventory) -> String {
     let w = 820.0_f64;
     let h = 560.0_f64;
@@ -367,38 +373,69 @@ fn render_graph_svg(inv: &Inventory) -> String {
     let mut edges = String::new();
     let mut nodes = String::new();
     for (i, s) in inv.services.iter().enumerate() {
-        let angle =
-            (i as f64) / (n as f64) * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
+        let angle = (i as f64) / (n as f64) * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
         let x = cx + radius * angle.cos();
         let y = cy + radius * angle.sin();
-        let color = auth_color(&s.primary_auth);
+        let auth = auth_slug(&s.primary_auth);
 
         edges.push_str(&format!(
-            r#"<line x1="{cx:.1}" y1="{cy:.1}" x2="{x:.1}" y2="{y:.1}" stroke="{color}" stroke-width="2" opacity="0.55"/>"#
+            r#"<line class="gedge" data-auth="{auth}" x1="{cx:.1}" y1="{cy:.1}" x2="{x:.1}" y2="{y:.1}"/>"#
         ));
 
         // Place the label just outside the node, anchored away from the hub.
         let on_left = x < cx;
         let lx = if on_left { x - 11.0 } else { x + 11.0 };
         let anchor = if on_left { "end" } else { "start" };
+        let shape = match auth {
+            "sso" => format!(r#"<circle class="gnode__mark" cx="{x:.1}" cy="{y:.1}" r="7"/>"#),
+            "public" => format!(
+                r#"<rect class="gnode__mark" x="{sx:.1}" y="{sy:.1}" width="14" height="14" rx="1"/>"#,
+                sx = x - 7.0,
+                sy = y - 7.0,
+            ),
+            "bearer" => format!(
+                r#"<rect class="gnode__mark gnode__mark--diamond" x="{sx:.1}" y="{sy:.1}" width="14" height="14" transform="rotate(45 {x:.1} {y:.1})"/>"#,
+                sx = x - 7.0,
+                sy = y - 7.0,
+            ),
+            _ => format!(
+                r#"<polygon class="gnode__mark" points="{x:.1},{top:.1} {right:.1},{bottom:.1} {left:.1},{bottom:.1}"/>"#,
+                top = y - 8.0,
+                right = x + 8.0,
+                bottom = y + 7.0,
+                left = x - 8.0,
+            ),
+        };
+        let waf = if s.waf_any { " · WAF" } else { "" };
+        let title = format!(
+            "{} — {}{} · {}",
+            s.display_name,
+            auth_word(&s.primary_auth),
+            waf,
+            status_label(&s.status)
+        );
         nodes.push_str(&format!(
-            r#"<g class="gnode"><circle cx="{x:.1}" cy="{y:.1}" r="7" fill="{color}"/><text x="{lx:.1}" y="{ly:.1}" text-anchor="{anchor}" class="glabel">{label}</text></g>"#,
+            r#"<g class="gnode" data-auth="{auth}"><title>{title}</title>{shape}<text x="{lx:.1}" y="{ly:.1}" text-anchor="{anchor}" class="glabel">{label}</text></g>"#,
             ly = y + 4.0,
+            title = esc(&title),
             label = esc(&s.display_name),
         ));
     }
 
     format!(
-        r##"<svg viewBox="0 0 {w:.0} {h:.0}" class="topology" role="img" aria-label="Estate topology">
+        r##"<svg class="topology" viewBox="0 0 {w:.0} {h:.0}" role="img" aria-labelledby="topo-title topo-desc">
+  <title id="topo-title">Estate topology</title>
+  <desc id="topo-desc">Sluice gateway connects to {count} discovered services. Node shape and line style encode the auth category; status is stated in each node title.</desc>
   <g class="gedges">{edges}</g>
   <g class="gnodes">{nodes}</g>
   <g class="ghub">
-    <circle cx="{cx:.1}" cy="{cy:.1}" r="34" fill="#0F172A"/>
-    <circle cx="{cx:.1}" cy="{cy:.1}" r="34" fill="none" stroke="#4F46E5" stroke-width="2"/>
+    <circle class="ghub__disc" cx="{cx:.1}" cy="{cy:.1}" r="34"/>
+    <circle class="ghub__ring" cx="{cx:.1}" cy="{cy:.1}" r="34" fill="none"/>
     <text x="{cx:.1}" y="{ty:.1}" text-anchor="middle" class="ghub__label">Sluice</text>
     <text x="{cx:.1}" y="{ty2:.1}" text-anchor="middle" class="ghub__sub">gateway</text>
   </g>
 </svg>"##,
+        count = inv.services.len(),
         ty = cy - 2.0,
         ty2 = cy + 12.0,
     )
@@ -454,7 +491,9 @@ fn urlpath(key: &str) -> String {
     let mut o = String::with_capacity(key.len());
     for b in key.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
             _ => o.push_str(&format!("%{b:02X}")),
         }
     }

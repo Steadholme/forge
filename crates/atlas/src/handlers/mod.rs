@@ -12,7 +12,7 @@ pub mod health;
 
 use axum::http::StatusCode;
 
-use crate::inventory::auth_color;
+use crate::inventory::auth_slug;
 
 /// Atlas-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
@@ -35,7 +35,7 @@ pub fn app_css() -> &'static str {
 pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
 /// The Steadholme shield glyph (small, for the app-bar brand lockup).
-pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
+pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop class="shield__stop shield__stop--a"/><stop class="shield__stop shield__stop--b" offset="1"/></linearGradient></defs><path class="shield__body" d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect class="shield__lock" x="20" y="19" width="8" height="13" rx="1" fill-opacity="0.92"/><path class="shield__shackle" d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
 
 /// Minimal HTML escaping for text/attribute interpolation (defense-in-depth on every field).
 pub fn esc(s: &str) -> String {
@@ -105,8 +105,16 @@ fn user_menu(email: &str) -> String {
 /// portal, and the avatar menu. `page_title` selects the active nav item.
 pub fn topbar(page_title: &str, email: &str, theme: &str) -> String {
     let topology_active = page_title == "Topology";
-    let catalog_cls = if topology_active { "appnav" } else { "appnav is-active" };
-    let topology_cls = if topology_active { "appnav is-active" } else { "appnav" };
+    let catalog_cls = if topology_active {
+        "appnav"
+    } else {
+        "appnav is-active"
+    };
+    let topology_cls = if topology_active {
+        "appnav is-active"
+    } else {
+        "appnav"
+    };
     format!(
         r##"<header class="appbar">
   <a class="appbar__brand" href="/" aria-label="Steadholme Atlas">
@@ -191,29 +199,64 @@ fn month_abbr(m: time::Month) -> &'static str {
 
 /// A live-status pill (one of `operational` | `degraded` | `down` | `unknown` | `unavailable`).
 pub fn status_pill(status: &str) -> String {
-    let (cls, label) = match status {
-        "operational" => ("pill--ok", "Operational"),
-        "degraded" => ("pill--warn", "Degraded"),
-        "down" => ("pill--down", "Down"),
-        "unavailable" => ("pill--muted", "Unavailable"),
-        _ => ("pill--muted", "Unknown"),
-    };
-    format!(r#"<span class="pill {cls}">{label}</span>"#)
+    let slug = status_slug(status);
+    format!(
+        r#"<span class="pill" data-status="{slug}">{label}</span>"#,
+        label = status_label(slug)
+    )
 }
 
-/// An auth-mode badge (`sso` | `public` | `bearer` | other), colored by the design token.
-pub fn auth_badge(auth: &str) -> String {
-    let color = auth_color(auth);
-    let label = match auth {
-        "sso" => "SSO",
-        "public" => "Public",
-        "bearer" => "Bearer",
-        other if other.is_empty() => "—",
-        other => other,
+/// Normalize every live-status token before it enters semantic markup.
+pub fn status_slug(status: &str) -> &'static str {
+    match status {
+        "operational" => "operational",
+        "degraded" => "degraded",
+        "down" => "down",
+        "unknown" => "unknown",
+        "unavailable" => "unavailable",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn status_label(status: &str) -> &'static str {
+    match status_slug(status) {
+        "operational" => "Operational",
+        "degraded" => "Degraded",
+        "down" => "Down",
+        "unavailable" => "Unavailable",
+        _ => "Unknown",
+    }
+}
+
+/// Human-readable auth text. Unknown modes retain their escaped-at-render provenance.
+pub fn auth_word(auth: &str) -> String {
+    match auth_slug(auth) {
+        "sso" => "SSO".to_string(),
+        "public" => "Public".to_string(),
+        "bearer" => "Bearer".to_string(),
+        _ => {
+            let token = auth.trim();
+            if token.is_empty() {
+                "Unclassified".to_string()
+            } else {
+                token.to_string()
+            }
+        }
+    }
+}
+
+/// Redundant word + glyph auth classification with a bounded semantic slug.
+pub fn auth_cat(auth: &str) -> String {
+    let slug = auth_slug(auth);
+    let glyph = match slug {
+        "sso" => "●",
+        "public" => "■",
+        "bearer" => "◆",
+        _ => "▲",
     };
     format!(
-        r#"<span class="abadge" style="--abadge:{color}">{label}</span>"#,
-        label = esc(label)
+        r#"<span class="authcat" data-auth="{slug}"><span class="authcat__glyph" aria-hidden="true">{glyph}</span><span class="authcat__word">{word}</span></span>"#,
+        word = esc(&auth_word(auth)),
     )
 }
 

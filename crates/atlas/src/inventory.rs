@@ -41,7 +41,7 @@ pub struct ServiceEntry {
     pub routes: Vec<RouteView>,
     /// Distinct effective auth modes across this service's routes (e.g. `["sso","public"]`).
     pub auth_modes: Vec<String>,
-    /// Representative auth mode used to color the topology edge (the root `/` route's, else first).
+    /// Representative auth mode used to classify the topology edge (the root `/` route's, else first).
     pub primary_auth: String,
     /// True when any route fronting this service has the inline WAF engaged.
     pub waf_any: bool,
@@ -111,13 +111,16 @@ pub fn public_url(host: &str, path_prefix: &str) -> String {
     }
 }
 
-/// The SVG/edge color for an auth mode (matches the design tokens).
-pub fn auth_color(auth: &str) -> &'static str {
+/// Stable presentation category for an auth mode.
+///
+/// The inventory authority keeps the original auth token. Renderers consume this bounded slug so
+/// an unknown token can never become a CSS value or a `data-*` attribute.
+pub fn auth_slug(auth: &str) -> &'static str {
     match auth {
-        "sso" => "#4F46E5",
-        "public" => "#16A34A",
-        "bearer" => "#D97706",
-        _ => "#64748B",
+        "sso" => "sso",
+        "public" => "public",
+        "bearer" => "bearer",
+        _ => "other",
     }
 }
 
@@ -298,10 +301,38 @@ mod tests {
     #[test]
     fn build_groups_routes_by_upstream_and_counts() {
         let routes = vec![
-            route("drive-share", "drive.w33d.xyz", "/s/", "http://aperture:8900", "public", false),
-            route("drive-root", "drive.w33d.xyz", "/", "http://aperture:8900", "sso", false),
-            route("blog", "blog.w33d.xyz", "/", "http://inkwell:8700", "sso", false),
-            route("id-api", "id.w33d.xyz", "/api", "http://whoami:80", "bearer", false),
+            route(
+                "drive-share",
+                "drive.w33d.xyz",
+                "/s/",
+                "http://aperture:8900",
+                "public",
+                false,
+            ),
+            route(
+                "drive-root",
+                "drive.w33d.xyz",
+                "/",
+                "http://aperture:8900",
+                "sso",
+                false,
+            ),
+            route(
+                "blog",
+                "blog.w33d.xyz",
+                "/",
+                "http://inkwell:8700",
+                "sso",
+                false,
+            ),
+            route(
+                "id-api",
+                "id.w33d.xyz",
+                "/api",
+                "http://whoami:80",
+                "bearer",
+                false,
+            ),
         ];
         let inv = build(routes, true, &[], &Statuses::default());
         assert_eq!(inv.routes_total, 4);
@@ -323,7 +354,14 @@ mod tests {
 
     #[test]
     fn build_layers_annotation_and_display_name() {
-        let routes = vec![route("blog", "blog.w33d.xyz", "/", "http://inkwell:8700", "sso", false)];
+        let routes = vec![route(
+            "blog",
+            "blog.w33d.xyz",
+            "/",
+            "http://inkwell:8700",
+            "sso",
+            false,
+        )];
         let ann = Service {
             key: "inkwell".to_string(),
             display_name: "Inkwell Blog".to_string(),
@@ -332,7 +370,12 @@ mod tests {
             notes: "personal CMS".to_string(),
             updated_at: 42,
         };
-        let inv = build(routes, true, std::slice::from_ref(&ann), &Statuses::default());
+        let inv = build(
+            routes,
+            true,
+            std::slice::from_ref(&ann),
+            &Statuses::default(),
+        );
         let s = &inv.services[0];
         assert_eq!(s.display_name, "Inkwell Blog");
         assert!(s.annotated);
@@ -349,7 +392,20 @@ mod tests {
 
     #[test]
     fn public_url_includes_host_and_prefix() {
-        assert_eq!(public_url("drive.w33d.xyz", "/s/"), "https://drive.w33d.xyz/s/");
+        assert_eq!(
+            public_url("drive.w33d.xyz", "/s/"),
+            "https://drive.w33d.xyz/s/"
+        );
         assert_eq!(public_url("", "/x"), "/x");
+    }
+
+    #[test]
+    fn auth_slug_normalizes_to_four_buckets() {
+        assert_eq!(auth_slug("sso"), "sso");
+        assert_eq!(auth_slug("public"), "public");
+        assert_eq!(auth_slug("bearer"), "bearer");
+        assert_eq!(auth_slug(""), "other");
+        assert_eq!(auth_slug("mtls"), "other");
+        assert_eq!(auth_slug("<x>"), "other");
     }
 }
