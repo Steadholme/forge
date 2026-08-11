@@ -780,7 +780,8 @@ th.th-sort[aria-sort="descending"]::after{content:"\2193";opacity:1}
 .pr-filetree__item:hover .pr-file-viewed--tree,
 .pr-file-viewed--tree:focus-within { opacity:1; }
 .pr-file-viewed--tree .pr-file-viewed__submit {
-  height:24px; padding:0 8px; font-size:11px; border-radius:var(--r-xs);
+  min-width:44px; min-height:44px; height:auto;
+  padding:0 10px; font-size:11px; border-radius:var(--r-xs);
 }
 
 /* Viewed rows recede so unseen files stand out at a glance. */
@@ -2886,3 +2887,405 @@ h3 { font-size:14px; }
 .ft-row--file.is-current svg{ color:var(--accent-ink); }
 .ft-dir.is-open > .ft-row svg{ color:var(--ink-2); }
 @media (max-width:900px){ .ft-layout{ grid-template-columns:1fr; } .ft-side{ display:none; } }
+
+/* ==========================================================================
+   Change Weave — pull-request truth floor
+   --------------------------------------------------------------------------
+   The eight cw-* regions are one ordered instrument: branch warp, the five
+   authoritative merge facts, non-blocking inspection signals, commits, files,
+   reviews, metadata, and the terminal splice. These rules are presentation
+   only and stay namespaced to the server-rendered Change Weave hooks.
+   ========================================================================== */
+:root {
+  --cw-track:var(--border-2);
+  --cw-track-strong:var(--accent);
+  --cw-station:var(--surface);
+  --cw-ticket:var(--surface-2);
+}
+
+.cw-floor {
+  display:grid;
+  gap:18px;
+  width:100%;
+  max-width:100%;
+  min-width:0;
+}
+
+.cw-floor > .cw-region {
+  min-width:0;
+  border-inline-start:3px solid var(--cw-track);
+}
+
+.cw-floor > .cw-region:not(.card) {
+  padding-inline-start:14px;
+}
+
+.cw-floor > .cw-weave,
+.cw-floor > .cw-splice {
+  border-inline-start-color:var(--cw-track-strong);
+}
+
+.cw-floor :is(
+  .detail-head,
+  .detail-head__title,
+  .detail-head__meta,
+  .cw-gate__sub,
+  .cw-advisory,
+  .cw-signal,
+  .cw-signal__fact,
+  .approval-status,
+  .approval-count,
+  .codeowners-req,
+  .pr-mergeability,
+  .side__value,
+  .merge-strategy,
+  .merge-strategy__note
+) {
+  min-width:0;
+  overflow-wrap:anywhere;
+}
+
+.cw-floor :is(.detail-head__meta code,.side__value code) {
+  white-space:normal;
+  word-break:break-word;
+}
+
+.cw-eyebrow {
+  margin:0 0 9px;
+  color:var(--ink-2);
+  font-size:12px;
+  font-weight:700;
+  letter-spacing:.04em;
+  line-height:1.35;
+}
+
+.cw-weave .detail-head {
+  margin-bottom:12px;
+}
+
+.cw-warp {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(56px,2fr) auto minmax(0,1fr);
+  align-items:center;
+  gap:10px;
+  margin:0 0 16px;
+  padding:10px 12px;
+  background:var(--cw-ticket);
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+}
+
+.cw-warp__end {
+  min-width:0;
+}
+
+.cw-warp__end:last-child {
+  text-align:right;
+}
+
+.cw-warp__end .branch-badge {
+  max-width:100%;
+  white-space:normal;
+  overflow-wrap:anywhere;
+}
+
+.cw-warp__lines {
+  display:grid;
+  gap:4px;
+}
+
+.cw-warp__lines i {
+  display:block;
+  border-top:1px solid var(--cw-track);
+}
+
+.cw-warp__dir {
+  color:var(--accent-ink);
+  font-size:18px;
+  font-weight:700;
+}
+
+.cw-gate .card__head,
+.cw-signals .card__head,
+.cw-splice .card__head {
+  flex-wrap:wrap;
+}
+
+.cw-gate__sub,
+.cw-advisory,
+.cw-splice__sub {
+  margin-left:auto;
+  color:var(--ink-3);
+  font-size:12px;
+  line-height:1.45;
+}
+
+.cw-gate__lanes {
+  display:grid;
+  grid-template-columns:repeat(5,minmax(0,1fr));
+  gap:10px;
+}
+
+.cw-gate__verdict {
+  grid-column:1 / -1;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  min-width:0;
+  padding:10px 12px;
+  color:var(--ok-ink);
+  background:var(--ok-soft);
+  border:1px solid var(--ok-border);
+  border-inline-start:3px solid var(--ok);
+  border-radius:var(--r-sm);
+}
+
+.cw-gate__verdict strong {
+  flex:none;
+}
+
+.cw-gate__verdict span {
+  color:var(--ink-2);
+  overflow-wrap:anywhere;
+}
+
+.cw-gate .approval-status,
+.cw-gate .codeowners-req,
+.cw-gate .pr-mergeability {
+  align-content:start;
+  align-items:flex-start;
+  margin:0;
+}
+
+.cw-gate .approval-status {
+  flex-direction:column;
+}
+
+.cw-gate .approval-count {
+  height:auto;
+  min-height:28px;
+  margin-left:0;
+  padding-block:4px;
+  white-space:normal;
+}
+
+.cw-signals__body {
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+}
+
+.cw-signals__note {
+  grid-column:1 / -1;
+  margin:0;
+  color:var(--ink-2);
+  line-height:1.55;
+}
+
+.cw-signal {
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr);
+  gap:10px;
+  align-items:start;
+  padding:10px 12px;
+  background:var(--cw-ticket);
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+}
+
+.cw-signal__kind {
+  color:var(--accent-ink);
+  font-size:11px;
+  font-weight:700;
+  letter-spacing:.04em;
+  text-transform:uppercase;
+}
+
+.cw-signal__fact {
+  color:var(--ink-2);
+  font-size:13px;
+  line-height:1.5;
+}
+
+.cw-meta__grid {
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:0 18px;
+}
+
+.cw-splice {
+  border-color:var(--accent-border);
+}
+
+.cw-splice .card__body {
+  background:var(--cw-station);
+}
+
+/* Representative controls keep a 44 CSS-pixel pointer and keyboard target. */
+.pr-list-floor .tabs--filter .tab {
+  min-width:44px;
+  min-height:44px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+}
+
+.cw-floor .diff-commentbtn {
+  left:-22px;
+  width:44px;
+  height:44px;
+}
+
+.cw-floor .pr-file-viewed__label,
+.cw-floor .pr-file-viewed__submit,
+.cw-floor .verdict-picker label,
+.cw-floor .btn-resolve,
+.cw-floor .btn-unresolve,
+.cw-floor .reactions__list .reaction,
+.cw-floor .merge-method-select {
+  min-width:44px;
+  min-height:44px;
+}
+
+.cw-floor .pr-file-viewed__label,
+.cw-floor .verdict-picker label {
+  padding-block:6px;
+}
+
+.cw-floor .pr-file-viewed__label:has(.pr-file-viewed__checkbox:focus-visible),
+.cw-floor .verdict-picker label:has(input:focus-visible) {
+  outline:3px solid var(--accent);
+  outline-offset:2px;
+}
+
+.cw-floor .merge-method-select {
+  height:44px;
+}
+
+.pr-compare-floor :focus-visible,
+.pr-list-floor :focus-visible,
+.cw-floor :focus-visible {
+  outline:3px solid var(--accent);
+  outline-offset:2px;
+}
+
+.cw-floor .reaction-picker:not([open]) > .reaction-picker__menu {
+  display:none;
+}
+
+@media (max-width:1100px) {
+  .cw-gate__lanes {
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+
+  .cw-meta__grid {
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+}
+
+@media (max-width:640px) {
+  .cw-floor {
+    gap:14px;
+    width:calc(100% - 2px);
+  }
+
+  .cw-floor > .cw-region {
+    width:100%;
+    max-width:100%;
+    box-sizing:border-box;
+  }
+
+  .cw-floor > .cw-region:not(.card) {
+    padding-inline-start:10px;
+  }
+
+  .cw-floor :is(
+    .review-forms,
+    .review-forms > *,
+    .composer,
+    .composer .card__body,
+    form,
+    input,
+    textarea,
+    select
+  ) {
+    min-width:0;
+    max-width:100%;
+    box-sizing:border-box;
+  }
+
+  .cw-floor .actions {
+    flex-wrap:wrap;
+  }
+
+  .cw-warp {
+    grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);
+  }
+
+  .cw-warp__lines {
+    display:none;
+  }
+
+  .cw-gate__lanes,
+  .cw-signals__body,
+  .cw-meta__grid {
+    grid-template-columns:minmax(0,1fr);
+  }
+
+  .cw-gate__verdict,
+  .cw-signals__note {
+    grid-column:1;
+  }
+
+  .cw-gate__verdict {
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+  .cw-gate__sub,
+  .cw-advisory,
+  .cw-splice__sub {
+    flex-basis:100%;
+    margin-left:0;
+  }
+
+  .cw-floor .diff-commentbtn {
+    left:-18px;
+  }
+}
+
+@media (forced-colors:active) {
+  .cw-floor > .cw-region,
+  .cw-warp,
+  .cw-gate__verdict,
+  .cw-signal,
+  .cw-gate .approval-status,
+  .cw-gate .codeowners-req,
+  .cw-gate .pr-mergeability {
+    border:1px solid CanvasText;
+    box-shadow:none;
+  }
+
+  .cw-warp__lines i {
+    border-color:CanvasText;
+  }
+
+  .pr-compare-floor :focus-visible,
+  .pr-list-floor :focus-visible,
+  .cw-floor :focus-visible {
+    outline-width:3px !important;
+    outline-style:solid !important;
+    outline-color:Highlight !important;
+    outline-offset:2px !important;
+    box-shadow:none !important;
+  }
+}
+
+@media (prefers-reduced-motion:reduce) {
+  .cw-floor *,
+  .cw-floor *::before,
+  .cw-floor *::after {
+    transition-duration:0s !important;
+    animation-duration:0s !important;
+  }
+}

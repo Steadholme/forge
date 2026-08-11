@@ -239,7 +239,7 @@
       if (!files.length) { bar.remove(); return; }
       var btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "btn btn-ghost btn-sm";
+      btn.className = "btn btn-ghost btn-sm diff-toggle-all";
       function label() {
         var anyOpen = scope.querySelector("details.diff-file[open]");
         btn.textContent = anyOpen ? "Collapse all" : "Expand all";
@@ -259,9 +259,8 @@
     var cfg = document.getElementById("pr-inline");
     if (!cfg) return;
     var endpoint = cfg.getAttribute("data-endpoint");
-    var thread = document.getElementById("pr-inline-thread");
 
-    document.querySelectorAll("details.diff-file table.diff tr.diff-row").forEach(function (row) {
+    document.querySelectorAll("details.diff-file table.diff tr.diff-row").forEach(function (row, rowIndex) {
       var line = row.getAttribute("data-line");
       if (!line) return; // only real code lines carry a line number
       var code = row.querySelector(".diff-code");
@@ -269,6 +268,7 @@
       var add = document.createElement("button");
       add.type = "button";
       add.className = "diff-commentbtn";
+      add.id = "diff-comment-" + (rowIndex + 1);
       add.setAttribute("aria-label", "Comment on line " + line);
       add.title = "Comment on this line";
       add.textContent = "+";
@@ -323,10 +323,10 @@
             if (!res.ok) throw new Error("http " + res.status);
             return res.json();
           })
-          .then(function (j) {
-            appendComment(j);
+          .then(function () {
             if (tr.parentNode) tr.parentNode.removeChild(tr);
-            toast("Comment added", "ok");
+            toast("Comment saved. Reloading canonical review state…", "ok");
+            window.location.reload();
           })
           .catch(function () {
             save.disabled = false;
@@ -346,25 +346,12 @@
       ta.focus();
     }
 
-    function appendComment(j) {
-      if (!thread) return;
-      var empty = thread.querySelector(".issue-item--empty");
-      if (empty) thread.removeChild(empty);
-      var li = document.createElement("li");
-      li.className = "issue-item";
-      var meta = document.createElement("div");
-      meta.className = "issue-item__meta";
-      var loc = document.createElement("span");
-      loc.textContent = (j.path || "") + ":" + (j.line != null ? j.line : "");
-      meta.appendChild(loc);
-      meta.appendChild(document.createTextNode(" · " + (j.author || "") + " commented just now"));
-      var bodyEl = document.createElement("div");
-      bodyEl.className = "issue-item__body";
-      bodyEl.textContent = j.body || "";
-      li.appendChild(meta);
-      li.appendChild(bodyEl);
-      thread.appendChild(li);
-    }
+  }
+
+  function initReactionPickerIds() {
+    document.querySelectorAll(".reaction-picker__button").forEach(function (button, index) {
+      if (!button.id) button.id = "reaction-picker-" + (index + 1);
+    });
   }
 
   // --- Optimistic toggle forms (no full-page reload) -----------------------
@@ -567,6 +554,7 @@
     initBlobPermalinks();
     initDiffToggleAll();
     initInlineComments();
+    initReactionPickerIds();
     initToggleForms();
     initCharCounters();
     initDeleteConfirm();

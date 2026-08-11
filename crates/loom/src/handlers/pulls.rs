@@ -55,6 +55,27 @@ enum PrMergeability {
     Unknown,
 }
 
+/// Presentation state of a PR diff on the detail floor. A `GitOps::diff()` read failure (`None`)
+/// is NOT a known empty diff, and an oversized diff has unknown totals (never a fake
+/// `0 files / +0 / -0`). Only the current diff read distinguishes these; the frozen CODEOWNERS
+/// evaluation still receives the collapsed `&str`, exactly as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrDiffState {
+    Unavailable,
+    Empty,
+    Oversized,
+    Ready,
+}
+
+fn pr_diff_state(diff: Option<&str>) -> PrDiffState {
+    match diff {
+        None => PrDiffState::Unavailable,
+        Some(diff) if diff.trim().is_empty() => PrDiffState::Empty,
+        Some(diff) if diff.len() > MAX_BLOB_RENDER_BYTES => PrDiffState::Oversized,
+        Some(_) => PrDiffState::Ready,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CodeOwnerRule {
     pattern: String,
@@ -172,6 +193,7 @@ impl DiffQuery {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DiffControls {
     action: String,
     hidden: Vec<(String, String)>,
@@ -2124,7 +2146,8 @@ async fn render_compare(
 
     format!(
         r##"{header}
-<section class="card">
+<div class="pr-compare-floor">
+<section class="card compare-card">
   <div class="card__head"><h2>Compare branches</h2></div>
   <div class="card__body">
     <form method="get" action="/r/{owner}/{name}/compare" class="compare-picker">
@@ -2138,7 +2161,8 @@ async fn render_compare(
     </form>
   </div>
 </section>
-{comparison}"##,
+{comparison}
+</div>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         diff_query_inputs = diff_query_inputs,
@@ -2210,6 +2234,7 @@ fn render_list(
     };
     format!(
         r##"{header}
+<div class="pr-list-floor">
 	<div class="list-toolbar">
 	  <span class="list-toolbar__fill"></span>
 	  {filters}
@@ -2218,7 +2243,8 @@ fn render_list(
 	<section class="card">
 	  <div class="card__head card__head--list">{tabs}</div>
 	  <div class="card__body card__body--list"><ul class="pr-list">{list}</ul></div>
-	</section>"##,
+	</section>
+</div>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         tabs = tabs,
@@ -2524,7 +2550,9 @@ async fn render_detail(
         csrf,
     );
 
-    // Commits + diff for the (still current) base..head range.
+    // Commits + diff for the (still current) base..head range. The diff Option is kept intact
+    // so the floor can distinguish a read failure from a known empty diff; only the collapsed
+    // `&str` is fed to the frozen CODEOWNERS evaluation, byte-identical to before.
     let commits = state
         .git
         .commits_between(
@@ -2535,7 +2563,7 @@ async fn render_detail(
             COMMIT_LIMIT,
         )
         .await;
-    let diff = state
+    let diff_result = state
         .git
         .diff(
             &repo.owner_sub,
@@ -2544,33 +2572,57 @@ async fn render_detail(
             &pull.head,
             diff_options.ignore_whitespace(),
         )
-        .await
-        .unwrap_or_default();
+        .await;
+    let diff_text: &str = diff_result.as_deref().unwrap_or("");
+    let diff_state = pr_diff_state(diff_result.as_deref());
     let viewed_files = state
         .store
         .list_pr_file_viewed_for_pr(&pull.id, &who.subject)
         .await?;
-    let checks_card = match state
+    let head_oid = state
         .git
         .branch_oid(&repo.owner_sub, &repo.name, &pull.head)
-        .await
-    {
+        .await;
+    let (checks_card, checks_note) = match &head_oid {
         Some(head_oid) => {
-            let statuses = state
-                .store
-                .list_commit_statuses(&repo.id, &head_oid)
-                .await?;
+            let statuses = state.store.list_commit_statuses(&repo.id, head_oid).await?;
             let aggregate = state
                 .store
-                .aggregate_state_for_commit(&repo.id, &head_oid)
+                .aggregate_state_for_commit(&repo.id, head_oid)
                 .await?;
-            render_checks_card(&head_oid, aggregate.as_deref(), &statuses)
+            let note = if statuses.is_empty() {
+                format!(
+                    "No checks reported for {}. Missing checks are not success.",
+                    short_oid(head_oid)
+                )
+            } else {
+                String::new()
+            };
+            (
+                render_checks_card(head_oid, aggregate.as_deref(), &statuses),
+                note,
+            )
         }
-        None => String::new(),
+        None => (
+            String::new(),
+            "Checks could not be read for the current head.".to_string(),
+        ),
     };
+    let (viewed_count, viewed_total) = if matches!(diff_state, PrDiffState::Ready) {
+        let files = parse_diff_files(diff_text);
+        let viewed_by_path: BTreeMap<String, bool> = viewed_files
+            .iter()
+            .map(|row| (row.file_path.clone(), row.viewed))
+            .collect();
+        let metas = diff_file_metas(&files, &viewed_by_path);
+        (metas.iter().filter(|meta| meta.viewed).count(), metas.len())
+    } else {
+        (0, 0)
+    };
+    let unresolved_count = unresolved_thread_count(review_comments, thread_resolutions);
     let commits_card = render_commits_card(&commits);
     let diff_card = render_pr_diff_card(
-        &diff,
+        diff_result.as_deref(),
         &viewed_files,
         repo,
         pull,
@@ -2584,16 +2636,11 @@ async fn render_detail(
         )),
     );
     let review_requirements =
-        evaluate_review_requirements(state, repo, pull, &summary, Some(&diff)).await;
-    let review_requirements_html = render_review_requirements(&review_requirements);
+        evaluate_review_requirements(state, repo, pull, &summary, Some(diff_text)).await;
     let repo_writer = can_write_repo(state, repo, who, headers).await?;
     let can_gate_user = can_gate(pull, who, repo_writer);
     let can_review_user = can_review(pull, who, repo_writer);
     let preview_comment = state.store.get_pull_preview_comment(&pull.id).await?;
-    let preview_bot_card = preview_comment
-        .as_ref()
-        .map(render_preview_bot_card)
-        .unwrap_or_default();
     let reviews_card = render_reviews_card(
         repo,
         reviews,
@@ -2610,9 +2657,6 @@ async fn render_detail(
     } else {
         None
     };
-    let mergeability_bar = mergeability
-        .map(render_mergeability_bar)
-        .unwrap_or_default();
     let metadata_edit = if can_gate_user {
         let fields = render_pull_metadata_fields(
             labels,
@@ -2625,11 +2669,11 @@ async fn render_detail(
         format!(
             r##"<section class="side__block side__block--edit">
   <details class="side-edit">
-    <summary class="btn btn-ghost btn-sm">Edit metadata</summary>
+    <summary class="btn btn-ghost btn-sm btn-edit-metadata">Edit metadata</summary>
     <form method="post" action="/r/{owner}/{name}/pulls/{number}/metadata">
       <input type="hidden" name="csrf_token" value="{csrf}">
       {fields}
-      <div class="actions"><button class="btn btn-secondary btn-sm" type="submit">Save metadata</button></div>
+      <div class="actions"><button class="btn btn-secondary btn-sm btn-save-metadata" type="submit">Save metadata</button></div>
     </form>
   </details>
 </section>"##,
@@ -2767,44 +2811,44 @@ async fn render_detail(
         name = esc(&repo.name),
         number = pull.number,
     );
-    let merge_panel = format!(
-        r##"<section class="card merge-panel">
-  <div class="card__body">
-    {checks_card}
-    {review_requirements_html}
-    {mergeability_bar}
-    {actions}
-  </div>
-</section>"##,
-        checks_card = checks_card,
-        review_requirements_html = review_requirements_html,
-        mergeability_bar = mergeability_bar,
-        actions = actions,
-    );
 
-    Ok(format!(
-        r##"{header}
-{pr_inline}
-<div class="detail-head detail-head--pr">
-  <div class="detail-head__badges"><span class="state-badge {cls}" id="state-badge-main">{label}</span>{draft_badge_html}</div>
-  <h1 class="detail-head__title">{title} <span class="detail-head__number">#{number}</span></h1>
-  <p class="detail-head__meta"><code>{head}</code> &rarr; <code>{base}</code> · opened <span title="{created_abs}">{created_rel}</span> by <b>{author}</b></p>
-</div>
-{error_block}
-<div class="detail-layout">
-  <div class="detail-layout__main">
-    <section class="card comment-box">
-      <div class="comment-box__meta"><b>{author}</b> <span>opened this pull request</span> <span title="{created_abs}">{created_rel}</span></div>
-      <div class="comment-box__body">{body_html}{pull_reactions}</div>
-    </section>
-    {preview_bot_card}
-    {commits_card}
+    // Change Weave floor: one stable reading order. The Tension Gate holds only the five
+    // authoritative server-side merge blockers; checks/preview/viewed/unresolved live in the
+    // explicitly non-blocking Signals & Inspection ledger; commit passes, file strips, review
+    // knots, and metadata lead to the terminal Splice.
+    let tension_gate = render_tension_gate(pull, &review_requirements, mergeability);
+    let signals_ledger = render_signals_ledger(
+        &checks_card,
+        &checks_note,
+        preview_comment.as_ref(),
+        diff_state,
+        viewed_count,
+        viewed_total,
+        unresolved_count,
+    );
+    let base_badge_class = if pull.base == repo.default_branch {
+        "branch-badge branch-badge--default"
+    } else {
+        "branch-badge"
+    };
+    let weave = format!(
+        r##"<section class="cw-region cw-weave" id="cw-weave" aria-labelledby="cw-weave-title">
+  <div class="detail-head detail-head--pr">
+    <div class="detail-head__badges"><span class="state-badge {cls}" id="state-badge-main">{label}</span>{draft_badge_html}</div>
+    <h2 class="detail-head__title" id="cw-weave-title">{title} <span class="detail-head__number">#{number}</span></h2>
+    <p class="detail-head__meta"><code>{head}</code> &rarr; <code>{base}</code> · opened <span title="{created_abs}">{created_rel}</span> by <b>{author}</b></p>
   </div>
-  <aside class="side">{sidebar}</aside>
-</div>
-{diff_card}
-{reviews_card}
-{merge_panel}"##,
+  <div class="cw-warp" aria-hidden="true">
+    <span class="cw-warp__end"><span class="branch-badge">{head}</span></span>
+    <span class="cw-warp__lines"><i></i><i></i></span>
+    <span class="cw-warp__dir">&rarr;</span>
+    <span class="cw-warp__end"><span class="{base_badge_class}">{base}</span></span>
+  </div>
+  <section class="card comment-box">
+    <div class="comment-box__meta"><b>{author}</b> <span>opened this pull request</span> <span title="{created_abs}">{created_rel}</span></div>
+    <div class="comment-box__body">{body_html}{pull_reactions}</div>
+  </section>
+</section>"##,
         cls = cls,
         label = label,
         draft_badge_html = draft_badge_html,
@@ -2812,19 +2856,68 @@ async fn render_detail(
         title = esc(&pull.title),
         head = esc(&pull.head),
         base = esc(&pull.base),
+        base_badge_class = base_badge_class,
         created_abs = esc(&fmt_ts(pull.created_at)),
         created_rel = esc(&fmt_rel(now, pull.created_at)),
         author = esc(&pull.author_sub),
         body_html = body_html,
         pull_reactions = pull_reactions,
-        preview_bot_card = preview_bot_card,
+    );
+    let passes = format!(
+        r##"<section class="cw-region cw-passes" id="cw-passes" aria-labelledby="cw-passes-title">
+  <h2 class="cw-eyebrow" id="cw-passes-title">Commit passes</h2>
+  {commits_card}
+</section>"##,
         commits_card = commits_card,
-        reviews_card = reviews_card,
-        sidebar = sidebar,
-        error_block = error_block,
-        pr_inline = pr_inline,
+    );
+    let strips = format!(
+        r##"<section class="cw-region cw-strips" id="cw-strips" aria-labelledby="cw-strips-title">
+  <h2 class="cw-eyebrow" id="cw-strips-title">File strips</h2>
+  {diff_card}
+</section>"##,
         diff_card = diff_card,
-        merge_panel = merge_panel,
+    );
+    let knots = format!(
+        r##"<section class="cw-region cw-knots" id="cw-knots" aria-labelledby="cw-knots-title">
+  <h2 class="cw-eyebrow" id="cw-knots-title">Review knots</h2>
+  {reviews_card}
+</section>"##,
+        reviews_card = reviews_card,
+    );
+    let meta = format!(
+        r##"<section class="cw-region cw-meta" id="cw-meta" aria-labelledby="cw-meta-title">
+  <h2 class="cw-eyebrow" id="cw-meta-title">Metadata</h2>
+  <div class="cw-meta__grid">{sidebar}</div>
+</section>"##,
+        sidebar = sidebar,
+    );
+    let splice = render_splice(&actions, pull.is_open() && !pull.is_draft && can_gate_user);
+
+    Ok(format!(
+        r##"{header}
+{pr_inline}
+<div class="cw-floor">
+{weave}
+{error_block}
+{tension_gate}
+{signals_ledger}
+{passes}
+{strips}
+{knots}
+{meta}
+{splice}
+</div>"##,
+        header = header,
+        pr_inline = pr_inline,
+        weave = weave,
+        error_block = error_block,
+        tension_gate = tension_gate,
+        signals_ledger = signals_ledger,
+        passes = passes,
+        strips = strips,
+        knots = knots,
+        meta = meta,
+        splice = splice,
     ))
 }
 
@@ -2832,8 +2925,8 @@ fn render_mergeability_bar(mergeability: PrMergeability) -> String {
     match mergeability {
         PrMergeability::Clean => {
             r#"<div class="pr-mergeability able-to-merge" role="status">
-  <strong>Ready to merge</strong>
-  <span>These branches can be cleanly merged.</span>
+  <strong>Mergeability clean</strong>
+  <span>No merge conflicts were detected between these branches.</span>
 </div>"#
                 .to_string()
         }
@@ -2870,11 +2963,11 @@ fn render_checks_card(
     if statuses.is_empty() {
         return String::new();
     }
-    let aggregate_dot = crate::handlers::commits::render_status_dot(aggregate);
+    let aggregate_dot = render_labeled_status_dot(aggregate);
     let rows = statuses
         .iter()
         .map(|status| {
-            let dot = crate::handlers::commits::render_status_dot(Some(&status.state));
+            let dot = render_labeled_status_dot(Some(&status.state));
             let label = crate::handlers::commits::status_label(&status.state);
             let target = if !status.target_url.trim().is_empty()
                 && crate::handlers::commits::safe_status_url(&status.target_url)
@@ -2915,6 +3008,190 @@ fn render_checks_card(
         aggregate = aggregate_dot,
         head = esc(&short_oid(head_oid)),
         rows = rows,
+    )
+}
+
+/// The shared status renderer already labels its outer wrapper. Keep the decorative inner dot
+/// hidden from assistive technology while giving it a redundant title for monochrome/user-CSS
+/// inspection, where an otherwise empty state-shaped span would be colour-only.
+fn render_labeled_status_dot(state: Option<&str>) -> String {
+    let dot = crate::handlers::commits::render_status_dot(state);
+    let Some(state) = state else {
+        return dot;
+    };
+    let label = crate::handlers::commits::status_label(state);
+    dot.replacen(
+        "aria-hidden=\"true\"></span>",
+        &format!("aria-hidden=\"true\" title=\"{}\"></span>", esc(label)),
+        1,
+    )
+}
+
+/// The Tension Gate: exactly the five authoritative server-side merge blockers, each rendered as
+/// its own readable lane — draft state, required approvals, active requests for changes, matched
+/// CODEOWNERS groups, and mergeability. Checks, preview, viewed progress, and unresolved
+/// discussion never enter this plane. For a non-open pull request the gate reports lifecycle
+/// truth instead of readiness: merged is terminal, closed may reopen.
+fn render_tension_gate(
+    pull: &Pull,
+    requirements: &ReviewRequirements,
+    mergeability: Option<PrMergeability>,
+) -> String {
+    let head = r#"<div class="card__head card__head--slim"><h2 id="cw-gate-title">Tension Gate</h2><span class="cw-gate__sub">Five server facts decide the Splice — nothing else</span></div>"#;
+    if pull.is_merged() {
+        return format!(
+            r##"<section class="card cw-region cw-gate" id="cw-gate" aria-labelledby="cw-gate-title">
+  {head}
+  <div class="card__body"><p class="cw-gate__life">This pull request is merged. Merging is terminal; no further Splice is possible.</p></div>
+</section>"##,
+            head = head,
+        );
+    }
+    if !pull.is_open() {
+        return format!(
+            r##"<section class="card cw-region cw-gate" id="cw-gate" aria-labelledby="cw-gate-title">
+  {head}
+  <div class="card__body"><p class="cw-gate__life">This pull request is closed. Reopen it before a Splice can be considered.</p></div>
+</section>"##,
+            head = head,
+        );
+    }
+    let (draft_state, draft_text) = if pull.is_draft {
+        (
+            "approval-status--blocked",
+            "Draft pull requests cannot be merged. Mark this pull request ready for review before merging.",
+        )
+    } else {
+        (
+            "approval-status--satisfied",
+            "This pull request is not a draft.",
+        )
+    };
+    let requirements_html = render_review_requirements(requirements);
+    let mergeability_bar = mergeability
+        .map(render_mergeability_bar)
+        .unwrap_or_default();
+    let ready_verdict = if !pull.is_draft
+        && requirements.satisfied()
+        && matches!(mergeability, Some(PrMergeability::Clean))
+    {
+        if requirements.codeowners.enabled && requirements.codeowners.source_path.is_none() {
+            r#"<div class="cw-gate__verdict" role="status"><strong>Merge action available</strong><span>No authoritative blocker is active. The missing CODEOWNERS file remains a non-blocking configuration gap.</span></div>"#
+        } else {
+            r#"<div class="cw-gate__verdict" role="status"><strong>Ready to merge</strong><span>All five authoritative gate requirements are satisfied.</span></div>"#
+        }
+    } else {
+        ""
+    };
+    format!(
+        r##"<section class="card cw-region cw-gate" id="cw-gate" aria-labelledby="cw-gate-title">
+  {head}
+  <div class="card__body cw-gate__lanes">
+    {ready_verdict}
+    <div class="approval-status {draft_state}">
+      <strong>Draft state</strong>
+      <span class="approval-count">{draft_text}</span>
+    </div>
+    {requirements_html}
+    {mergeability_bar}
+  </div>
+</section>"##,
+        head = head,
+        ready_verdict = ready_verdict,
+        draft_state = draft_state,
+        draft_text = draft_text,
+        requirements_html = requirements_html,
+        mergeability_bar = mergeability_bar,
+    )
+}
+
+/// The Signals & Inspection ledger: checks, preview, the current viewer's viewed progress, and
+/// unresolved discussion — useful, real, and explicitly non-blocking. Nothing in this plane
+/// decides the Splice, and missing evidence is rendered as missing, never as success.
+#[allow(clippy::too_many_arguments)]
+fn render_signals_ledger(
+    checks_card: &str,
+    checks_note: &str,
+    preview_comment: Option<&PullPreviewComment>,
+    diff_state: PrDiffState,
+    viewed_count: usize,
+    viewed_total: usize,
+    unresolved_count: usize,
+) -> String {
+    let checks_html = if checks_card.is_empty() {
+        render_signal_row("Checks", checks_note)
+    } else {
+        checks_card.to_string()
+    };
+    let preview_html = match preview_comment {
+        Some(comment) => render_preview_bot_card(comment),
+        None => render_signal_row("Preview", "No preview deployment reported."),
+    };
+    let viewed_text = match diff_state {
+        PrDiffState::Ready => format!(
+            "Viewed {viewed_count}/{viewed_total} files by you — only you see this progress."
+        ),
+        PrDiffState::Empty => "No files to view in an empty diff.".to_string(),
+        PrDiffState::Oversized => {
+            "Viewed progress is not tracked for an oversized diff.".to_string()
+        }
+        PrDiffState::Unavailable => {
+            "Viewed progress is unknown while the diff cannot be read.".to_string()
+        }
+    };
+    let unresolved_text = match unresolved_count {
+        0 => "No unresolved review threads.".to_string(),
+        1 => "1 unresolved review thread. Resolving is encouraged, never required to merge."
+            .to_string(),
+        n => format!(
+            "{n} unresolved review threads. Resolving is encouraged, never required to merge."
+        ),
+    };
+    let viewed_row = render_signal_row("Viewed", &viewed_text);
+    let unresolved_row = render_signal_row("Discussion", &unresolved_text);
+    format!(
+        r##"<section class="card cw-region cw-signals" id="cw-signals" aria-labelledby="cw-signals-title">
+  <div class="card__head card__head--slim"><h2 id="cw-signals-title">Signals &amp; Inspection</h2><span class="cw-advisory">does not decide merge</span></div>
+  <div class="card__body cw-signals__body">
+    <p class="cw-signals__note">Checks, preview, viewed progress, and discussion state are useful inspection signals — this ledger does not decide merge.</p>
+    {checks_html}
+    {preview_html}
+    {viewed_row}
+    {unresolved_row}
+  </div>
+</section>"##,
+        checks_html = checks_html,
+        preview_html = preview_html,
+        viewed_row = viewed_row,
+        unresolved_row = unresolved_row,
+    )
+}
+
+/// One fact row in the signals ledger: a small kind tag plus plain-language fact text.
+fn render_signal_row(kind: &str, fact: &str) -> String {
+    format!(
+        r##"<div class="cw-signal"><span class="cw-signal__kind">{kind}</span><span class="cw-signal__fact">{fact}</span></div>"##,
+        kind = esc(kind),
+        fact = esc(fact),
+    )
+}
+
+/// The Splice: the terminal merge surface. Merge commit, squash, and rebase are the three real
+/// methods; the server re-runs every authoritative check on submit. The actions themselves are
+/// permission-gated exactly as before — this function only frames them.
+fn render_splice(actions: &str, show_methods_note: bool) -> String {
+    let sub = if show_methods_note {
+        r#"<span class="cw-splice__sub">Merge commit, squash, or rebase — standard Git methods</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r##"<section class="card cw-region cw-splice" id="cw-splice" aria-labelledby="cw-splice-title">
+  <div class="card__head card__head--slim"><h2 id="cw-splice-title">Splice</h2>{sub}</div>
+  <div class="card__body">{actions}</div>
+</section>"##,
+        sub = sub,
+        actions = actions,
     )
 }
 
@@ -3523,9 +3800,9 @@ fn render_reviews_card(
             "Finish your review"
         };
         let submit_class = if pending_count == 0 {
-            "btn btn-secondary"
+            "btn btn-secondary btn-submit-review"
         } else {
-            "btn btn-primary btn-finish-review"
+            "btn btn-primary btn-finish-review btn-submit-review"
         };
         format!(
             r##"<div class="review-forms">
@@ -3561,8 +3838,8 @@ fn render_reviews_card(
       <textarea id="inline-body" name="body" class="issue-input" required></textarea>
     </div>
     <div class="actions">
-      <button class="btn btn-secondary" type="submit">Add inline comment</button>
-      <button class="btn btn-secondary" type="submit" name="mode" value="pending">Add pending comment</button>
+      <button class="btn btn-secondary btn-add-inline-comment" type="submit">Add inline comment</button>
+      <button class="btn btn-secondary btn-add-pending-comment" type="submit" name="mode" value="pending">Add pending comment</button>
     </div>
   </form>
 </div>"##,
@@ -3941,8 +4218,12 @@ pub(crate) fn render_diff_card(diff: &str, options: DiffOptions, controls: DiffC
     )
 }
 
+/// The PR diff card (file strips). Unlike the shared compare/commit renderer, the detail floor
+/// keeps the typed `GitOps::diff()` result: a read failure renders explicit uncertainty instead
+/// of the "No file changes." certainty, and an oversized diff drops the numeric summary instead
+/// of presenting a fake `0 files / +0 / -0` total.
 fn render_pr_diff_card(
-    diff: &str,
+    diff: Option<&str>,
     viewed: &[PrFileViewed],
     repo: &Repo,
     pull: &Pull,
@@ -3950,44 +4231,59 @@ fn render_pr_diff_card(
     options: DiffOptions,
     controls: DiffControls,
 ) -> String {
-    let viewed_by_path: BTreeMap<String, bool> = viewed
-        .iter()
-        .map(|row| (row.file_path.clone(), row.viewed))
-        .collect();
-    let files = if diff.trim().is_empty() || diff.len() > MAX_BLOB_RENDER_BYTES {
-        Vec::new()
-    } else {
-        parse_diff_files(diff)
-    };
-    let metas = diff_file_metas(&files, &viewed_by_path);
-    let n_files = metas.len();
-    let additions: i64 = metas.iter().map(|meta| meta.additions).sum();
-    let deletions: i64 = metas.iter().map(|meta| meta.deletions).sum();
-    let inner = if diff.trim().is_empty() {
-        "<div class=\"card__body\"><p class=\"muted\">No file changes.</p></div>".to_string()
-    } else if diff.len() > MAX_BLOB_RENDER_BYTES {
-        "<div class=\"card__body\"><p class=\"muted\">The diff is too large to display. \
-         Fetch the branches locally to review it.</p></div>"
-            .to_string()
-    } else {
-        format!(
-            "<div class=\"card__body card__body--code\">{}</div>",
-            render_pr_diff(&files, &metas, repo, pull, csrf, options)
-        )
-    };
+    let state = pr_diff_state(diff);
+    let text = diff.unwrap_or("");
     let controls = render_diff_controls(options, &controls);
+    let (summary, inner) = match state {
+        PrDiffState::Unavailable => (
+            "<span class=\"diff-card__summary\"><b>Diff unavailable</b></span>".to_string(),
+            "<div class=\"card__body\"><p class=\"muted\">The diff could not be read, so the file \
+             changes are indeterminate right now. Reload to try again; submitting a merge still \
+             runs the authoritative server-side check.</p></div>"
+                .to_string(),
+        ),
+        PrDiffState::Empty => (
+            "<span class=\"diff-card__summary\"><b>No file changes</b></span>".to_string(),
+            "<div class=\"card__body\"><p class=\"muted\">No file changes.</p></div>".to_string(),
+        ),
+        PrDiffState::Oversized => (
+            "<span class=\"diff-card__summary\"><b>Diff too large to display</b></span>"
+                .to_string(),
+            "<div class=\"card__body\"><p class=\"muted\">The diff is too large to display. \
+             Fetch the branches locally to review it.</p></div>"
+                .to_string(),
+        ),
+        PrDiffState::Ready => {
+            let viewed_by_path: BTreeMap<String, bool> = viewed
+                .iter()
+                .map(|row| (row.file_path.clone(), row.viewed))
+                .collect();
+            let files = parse_diff_files(text);
+            let metas = diff_file_metas(&files, &viewed_by_path);
+            let n_files = metas.len();
+            let additions: i64 = metas.iter().map(|meta| meta.additions).sum();
+            let deletions: i64 = metas.iter().map(|meta| meta.deletions).sum();
+            (
+                format!(
+                    "<span class=\"diff-card__summary\"><b>{n_files} files changed</b> <span class=\"diff-add\">+{additions}</span> <span class=\"diff-del\">&minus;{deletions}</span></span>"
+                ),
+                format!(
+                    "<div class=\"card__body card__body--code\">{}</div>",
+                    render_pr_diff(&files, &metas, repo, pull, csrf, options)
+                ),
+            )
+        }
+    };
     format!(
         r##"<section class="card diff-card" id="files">
   <div class="diff-card__bar">
-    <span class="diff-card__summary"><b>{n_files} files changed</b> <span class="diff-add">+{additions}</span> <span class="diff-del">&minus;{deletions}</span></span>
+    {summary}
     <span class="diff-card__fill"></span>
     {controls}
   </div>
   {inner}
 </section>"##,
-        n_files = n_files,
-        additions = additions,
-        deletions = deletions,
+        summary = summary,
         controls = controls,
         inner = inner,
     )
@@ -4504,8 +4800,8 @@ fn render_file_viewed_form(
         r#"<form class="pr-file-viewed {class}" method="post" action="/r/{owner}/{name}/pulls/{number}/file-viewed">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <input type="hidden" name="file_path" value="{path}">
-  <label class="pr-file-viewed__label"><input class="pr-file-viewed__checkbox" type="checkbox" name="viewed" value="true"{checked}> Viewed</label>
-  <button class="btn btn-ghost btn-sm pr-file-viewed__submit" type="submit">Save</button>
+  <label class="pr-file-viewed__label {class}__label"><input class="pr-file-viewed__checkbox {class}__checkbox" type="checkbox" name="viewed" value="true"{checked}> Viewed</label>
+  <button class="btn btn-ghost btn-sm pr-file-viewed__submit {class}__submit" type="submit">Save</button>
 </form>"#,
         class = class,
         owner = esc(&ctx.repo.owner_sub),
@@ -4843,5 +5139,232 @@ docs/ @docs\n",
         assert_eq!(pick_base(&repo, &branches, None), "main");
         // No default present -> first branch.
         assert_eq!(pick_base(&repo, &["dev".to_string()], None), "dev");
+    }
+
+    fn cw_test_repo() -> Repo {
+        Repo {
+            id: "r".into(),
+            owner_sub: "alice".into(),
+            name: "proj".into(),
+            description: String::new(),
+            is_private: false,
+            default_branch: "main".into(),
+            require_approval: false,
+            required_approvals: 0,
+            require_code_owner_reviews: false,
+            protect_default_branch: false,
+            forked_from_id: String::new(),
+            created_at: 0,
+        }
+    }
+
+    fn cw_test_pull(state: &str, is_draft: bool) -> Pull {
+        Pull {
+            id: "pr1".into(),
+            repo_id: "r".into(),
+            number: 1,
+            title: "Add second line".into(),
+            body: String::new(),
+            base: "main".into(),
+            head: "feature".into(),
+            author_sub: "bob".into(),
+            assignee_sub: String::new(),
+            reviewer_sub: String::new(),
+            milestone_id: String::new(),
+            is_draft,
+            state: state.to_string(),
+            created_at: 1,
+            merged_at: 0,
+        }
+    }
+
+    #[test]
+    fn pr_diff_state_distinguishes_unavailable_empty_oversized_and_ready() {
+        assert_eq!(pr_diff_state(None), PrDiffState::Unavailable);
+        assert_eq!(pr_diff_state(Some("")), PrDiffState::Empty);
+        assert_eq!(pr_diff_state(Some("   \n")), PrDiffState::Empty);
+        let oversized = "x".repeat(MAX_BLOB_RENDER_BYTES + 1);
+        assert_eq!(pr_diff_state(Some(&oversized)), PrDiffState::Oversized);
+        assert_eq!(
+            pr_diff_state(Some("diff --git a/f b/f\n")),
+            PrDiffState::Ready
+        );
+    }
+
+    #[test]
+    fn tension_gate_lists_exactly_the_five_blocker_lanes() {
+        let pull = cw_test_pull("open", false);
+        let requirements = ReviewRequirements {
+            approval_count: 0,
+            required_approvals: 1,
+            approval_satisfied: false,
+            changes_requested: vec!["alice".to_string()],
+            codeowners: CodeOwnerEvaluation::disabled(),
+        };
+        let gate = render_tension_gate(&pull, &requirements, Some(PrMergeability::Clean));
+        assert!(gate.contains("Tension Gate"));
+        assert!(gate.contains("Draft state"));
+        assert!(gate.contains("Approvals"));
+        assert!(gate.contains("0 of 1 approvals"));
+        assert!(gate.contains("Changes requested"));
+        assert!(gate.contains("Code owner reviews not required."));
+        assert!(gate.contains("Mergeability clean"));
+        assert!(!gate.contains("Ready to merge"));
+        let gate = gate.to_ascii_lowercase();
+        for signal in ["ci/red", "preview bot", "viewed 1/", " unresolved"] {
+            assert!(
+                !gate.contains(signal),
+                "non-blocking signal {signal:?} must never enter the Tension Gate"
+            );
+        }
+    }
+
+    #[test]
+    fn tension_gate_names_each_authoritative_blocker() {
+        let requirements = ReviewRequirements {
+            approval_count: 0,
+            required_approvals: 0,
+            approval_satisfied: true,
+            changes_requested: Vec::new(),
+            codeowners: CodeOwnerEvaluation::disabled(),
+        };
+        let draft = render_tension_gate(
+            &cw_test_pull("open", true),
+            &requirements,
+            Some(PrMergeability::Clean),
+        );
+        assert!(draft.contains("Draft pull requests cannot be merged"));
+        let conflict = render_tension_gate(
+            &cw_test_pull("open", false),
+            &requirements,
+            Some(PrMergeability::Conflicting),
+        );
+        assert!(conflict.contains("conflicts"));
+        let unknown = render_tension_gate(
+            &cw_test_pull("open", false),
+            &requirements,
+            Some(PrMergeability::Unknown),
+        );
+        assert!(unknown.contains("Mergeability check unavailable"));
+
+        let missing_codeowners = ReviewRequirements {
+            codeowners: CodeOwnerEvaluation {
+                enabled: true,
+                source_path: None,
+                matched_groups: Vec::new(),
+                pending_groups: Vec::new(),
+            },
+            ..requirements
+        };
+        let gap = render_tension_gate(
+            &cw_test_pull("open", false),
+            &missing_codeowners,
+            Some(PrMergeability::Clean),
+        );
+        assert!(gap.contains("Merge action available"));
+        assert!(gap.contains("missing CODEOWNERS file remains a non-blocking configuration gap"));
+        assert!(!gap.contains("All five authoritative gate requirements are satisfied"));
+    }
+
+    #[test]
+    fn tension_gate_reports_lifecycle_truth_for_non_open_pulls() {
+        let requirements = ReviewRequirements {
+            approval_count: 0,
+            required_approvals: 0,
+            approval_satisfied: true,
+            changes_requested: Vec::new(),
+            codeowners: CodeOwnerEvaluation::disabled(),
+        };
+        let merged = render_tension_gate(&cw_test_pull("merged", false), &requirements, None);
+        assert!(merged.contains("merged"));
+        assert!(merged.contains("terminal"));
+        assert!(!merged.contains("Approvals"));
+        let closed = render_tension_gate(&cw_test_pull("closed", false), &requirements, None);
+        assert!(closed.contains("closed"));
+        assert!(closed.contains("Reopen"));
+        assert!(!closed.contains("Approvals"));
+    }
+
+    #[test]
+    fn signals_ledger_is_explicitly_non_blocking_and_honest_about_gaps() {
+        let html = render_signals_ledger(
+            "",
+            "No checks reported for deadbee. Missing checks are not success.",
+            None,
+            PrDiffState::Ready,
+            1,
+            2,
+            1,
+        );
+        assert!(html.contains("does not decide merge"));
+        assert!(html.contains("No checks reported for deadbee"));
+        assert!(html.contains("Missing checks are not success"));
+        assert!(html.contains("No preview deployment reported."));
+        assert!(html.contains("Viewed 1/2"));
+        assert!(html.contains("1 unresolved review thread"));
+        let empty = render_signals_ledger("", "note", None, PrDiffState::Empty, 0, 0, 0);
+        assert!(empty.contains("No files to view in an empty diff."));
+        assert!(empty.contains("No unresolved review threads."));
+        let unavailable =
+            render_signals_ledger("", "note", None, PrDiffState::Unavailable, 0, 0, 0);
+        assert!(unavailable.contains("Viewed progress is unknown"));
+    }
+
+    #[test]
+    fn pr_diff_card_typed_states_never_fabricate_totals_or_empty_certainty() {
+        let repo = cw_test_repo();
+        let pull = cw_test_pull("open", false);
+        let controls = DiffControls::new("/r/alice/proj/pulls/1".to_string());
+
+        let unavailable = render_pr_diff_card(
+            None,
+            &[],
+            &repo,
+            &pull,
+            "csrf",
+            DiffOptions::default(),
+            controls.clone(),
+        );
+        assert!(unavailable.contains("Diff unavailable"));
+        assert!(unavailable.contains("indeterminate"));
+        assert!(!unavailable.contains("No file changes"));
+        assert!(!unavailable.contains("0 files changed"));
+
+        let empty = render_pr_diff_card(
+            Some(""),
+            &[],
+            &repo,
+            &pull,
+            "csrf",
+            DiffOptions::default(),
+            controls.clone(),
+        );
+        assert!(empty.contains("No file changes"));
+        assert!(!empty.contains("unavailable"));
+        assert!(!empty.contains("indeterminate"));
+
+        let oversized_text = "x".repeat(MAX_BLOB_RENDER_BYTES + 1);
+        let oversized = render_pr_diff_card(
+            Some(&oversized_text),
+            &[],
+            &repo,
+            &pull,
+            "csrf",
+            DiffOptions::default(),
+            controls.clone(),
+        );
+        assert!(oversized.contains("too large"));
+        assert!(!oversized.contains("<b>0 files changed</b>"));
+
+        let ready = render_pr_diff_card(
+            Some("diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-one\n+two\n"),
+            &[],
+            &repo,
+            &pull,
+            "csrf",
+            DiffOptions::default(),
+            controls,
+        );
+        assert!(ready.contains("<b>1 files changed</b>"));
     }
 }

@@ -48,6 +48,21 @@ fn strip_tags(html: &str) -> String {
     out
 }
 
+fn page_main(html: &str) -> &str {
+    let main_at = html
+        .find("<main")
+        .unwrap_or_else(|| panic!("missing <main> in body:\n{html}"));
+    let content_at = html[main_at..]
+        .find('>')
+        .map(|offset| main_at + offset + 1)
+        .unwrap_or_else(|| panic!("unterminated <main> in body"));
+    let end_at = html[content_at..]
+        .find("</main>")
+        .map(|offset| content_at + offset)
+        .unwrap_or_else(|| panic!("missing </main> in body"));
+    &html[content_at..end_at]
+}
+
 struct Resp {
     status: StatusCode,
     headers: HeaderMap,
@@ -191,6 +206,55 @@ fn first_action_with_prefix(body: &str, prefix: &str) -> String {
         .find('"')
         .unwrap_or_else(|| panic!("unterminated action for prefix {prefix}"));
     rest[..end].to_string()
+}
+
+fn change_weave_region<'a>(body: &'a str, start: &str, end: &str) -> &'a str {
+    let main = page_main(body);
+    let start_at = main
+        .find(start)
+        .unwrap_or_else(|| panic!("missing Change Weave region {start}"));
+    let end_at = main[start_at..]
+        .find(end)
+        .map(|offset| start_at + offset)
+        .unwrap_or_else(|| panic!("missing Change Weave region {end} after {start}"));
+    &main[start_at..end_at]
+}
+
+fn assert_change_weave_region_order(body: &str) {
+    let main = page_main(body);
+    let regions = [
+        "cw-weave",
+        "cw-gate",
+        "cw-signals",
+        "cw-passes",
+        "cw-strips",
+        "cw-knots",
+        "cw-meta",
+        "cw-splice",
+    ];
+    let mut previous = None;
+    for region in regions {
+        let current = main
+            .find(region)
+            .unwrap_or_else(|| panic!("missing Change Weave region {region}"));
+        if let Some((previous_region, previous_at)) = previous {
+            assert!(
+                previous_at < current,
+                "{previous_region} must precede {region} in source order"
+            );
+        }
+        previous = Some((region, current));
+    }
+}
+
+fn assert_tension_gate_excludes_signals(body: &str) {
+    let gate = change_weave_region(body, "cw-gate", "cw-signals").to_ascii_lowercase();
+    for signal in ["ci/red", "preview bot", "viewed 1/", " unresolved"] {
+        assert!(
+            !gate.contains(signal),
+            "non-blocking signal {signal:?} leaked into the Tension Gate"
+        );
+    }
 }
 
 /// Like [`post_form`], but also injects an `X-Auth-Groups` header (for admin-gate tests).
@@ -1349,6 +1413,12 @@ async fn pull_request_compare_create_and_merge() {
     assert!(detail.body.contains("Draft pull requests cannot be merged"));
     assert!(detail.body.contains("btn-ready-review"));
     assert!(!detail.body.contains(">Convert to draft</button>"));
+    let draft_gate = change_weave_region(&detail.body, "cw-gate", "cw-signals");
+    assert!(
+        draft_gate.contains("Draft pull requests cannot be merged"),
+        "draft is one authoritative Tension Gate blocker"
+    );
+    assert_tension_gate_excludes_signals(&detail.body);
     assert!(detail
         .body
         .contains("<h3 class=\"side__label\">Assignee</h3><div class=\"side__value\">bob</div>"));
@@ -1655,6 +1725,252 @@ async fn diff_query_options_support_split_and_ignore_whitespace() {
 }
 
 #[tokio::test]
+async fn change_weave_distinguishes_unavailable_empty_and_oversized_diffs() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+
+    create_repo(&app, "alice", "unavailable", "").await;
+    let unavailable_dir = git
+        .repo_path("alice", "unavailable")
+        .to_string_lossy()
+        .to_string();
+    seed_two_branches(&unavailable_dir);
+    open_pull(
+        &app,
+        "alice/unavailable",
+        "main",
+        "feature",
+        "Unavailable diff",
+        "",
+        "alice",
+    )
+    .await;
+    let main_before = git_capture(&unavailable_dir, &["rev-parse", "refs/heads/main"], "");
+    let unavailable_path = git.repo_path("alice", "unavailable");
+    let hidden_path = unavailable_path.with_extension("git-unavailable");
+    std::fs::rename(&unavailable_path, &hidden_path).unwrap();
+
+    let unavailable = send(&app, get("/r/alice/unavailable/pulls/1", Some("alice"))).await;
+    let unavailable_csrf = unavailable.csrf_cookie().unwrap();
+    let attempted = send(
+        &app,
+        post_form(
+            "/r/alice/unavailable/pulls/1/merge",
+            &[("csrf_token", &unavailable_csrf)],
+            &unavailable_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    std::fs::rename(&hidden_path, &unavailable_path).unwrap();
+    let unavailable_strip =
+        change_weave_region(&unavailable.body, "cw-strips", "cw-knots").to_ascii_lowercase();
+    assert!(
+        unavailable_strip.contains("diff")
+            && (unavailable_strip.contains("unavailable")
+                || unavailable_strip.contains("indeterminate")),
+        "a typed GitOps::diff() failure must render explicit uncertainty"
+    );
+    assert!(
+        !unavailable_strip.contains("no file changes"),
+        "a failed diff read must not be presented as a known empty diff"
+    );
+    assert!(
+        !unavailable_strip.contains("0 files changed"),
+        "an unavailable diff must not fabricate authoritative zero totals"
+    );
+    assert!(unavailable.body.contains("Mergeability check unavailable"));
+    assert!(
+        unavailable.body.contains(
+            r#"<button class="btn btn-primary" type="submit">Merge pull request</button>"#
+        ),
+        "Unknown mergeability is advisory and must not disable Splice"
+    );
+    assert_eq!(
+        attempted.status,
+        StatusCode::CONFLICT,
+        "submitting Unknown still reaches the authoritative server merge check"
+    );
+    assert!(attempted.body.contains("Could not merge automatically"));
+    let repo = store
+        .get_repo("alice", "unavailable")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .get_pull(&repo.id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_open(),
+        "a failed authoritative merge leaves the pull request open"
+    );
+    assert_eq!(
+        git_capture(&unavailable_dir, &["rev-parse", "refs/heads/main"], ""),
+        main_before,
+        "a failed authoritative merge leaves the base ref unchanged"
+    );
+
+    create_repo(&app, "alice", "emptydiff", "").await;
+    let empty_dir = git
+        .repo_path("alice", "emptydiff")
+        .to_string_lossy()
+        .to_string();
+    let empty_base = commit_files(&empty_dir, None, "base", &[("file.txt", "same bytes\n")]);
+    git_capture(
+        &empty_dir,
+        &["update-ref", "refs/heads/main", &empty_base],
+        "",
+    );
+    let empty_feature = commit_files(
+        &empty_dir,
+        Some(&empty_base),
+        "metadata only",
+        &[("file.txt", "same bytes\n")],
+    );
+    git_capture(
+        &empty_dir,
+        &["update-ref", "refs/heads/feature", &empty_feature],
+        "",
+    );
+    open_pull(
+        &app,
+        "alice/emptydiff",
+        "main",
+        "feature",
+        "Known empty diff",
+        "",
+        "alice",
+    )
+    .await;
+    let empty = send(&app, get("/r/alice/emptydiff/pulls/1", Some("alice"))).await;
+    let empty_strip = change_weave_region(&empty.body, "cw-strips", "cw-knots");
+    assert!(empty_strip.contains("No file changes"));
+    let empty_text = strip_tags(empty_strip).to_ascii_lowercase();
+    assert!(!empty_text.contains("unavailable"));
+    assert!(!empty_text.contains("indeterminate"));
+
+    create_repo(&app, "alice", "oversized", "").await;
+    let oversized_dir = git
+        .repo_path("alice", "oversized")
+        .to_string_lossy()
+        .to_string();
+    let oversized_base = commit_files(&oversized_dir, None, "base", &[("file.txt", "small\n")]);
+    git_capture(
+        &oversized_dir,
+        &["update-ref", "refs/heads/main", &oversized_base],
+        "",
+    );
+    let oversized_content = "a deliberately oversized changed line\n".repeat(20_000);
+    let oversized_feature = commit_files(
+        &oversized_dir,
+        Some(&oversized_base),
+        "oversized",
+        &[("file.txt", oversized_content.as_str())],
+    );
+    git_capture(
+        &oversized_dir,
+        &["update-ref", "refs/heads/feature", &oversized_feature],
+        "",
+    );
+    open_pull(
+        &app,
+        "alice/oversized",
+        "main",
+        "feature",
+        "Oversized diff",
+        "",
+        "alice",
+    )
+    .await;
+    let oversized = send(&app, get("/r/alice/oversized/pulls/1", Some("alice"))).await;
+    let oversized_strip =
+        change_weave_region(&oversized.body, "cw-strips", "cw-knots").to_ascii_lowercase();
+    assert!(
+        oversized_strip.contains("diff") && oversized_strip.contains("too large"),
+        "oversized diff must retain the local-review recovery copy"
+    );
+    assert!(
+        !oversized_strip.contains("0 files changed"),
+        "oversized diff totals are unknown, not authoritative zero"
+    );
+    assert!(
+        !oversized.body.contains("<b>0 files changed</b>"),
+        "oversized diff must not emit the legacy 0/+0/-0 summary"
+    );
+}
+
+#[tokio::test]
+async fn compare_normalizes_unknown_base_and_does_not_invent_collapsed_read_failures() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+
+    create_repo(&app, "alice", "proj", "").await;
+    let git_dir = git.repo_path("alice", "proj").to_string_lossy().to_string();
+    seed_two_branches(&git_dir);
+    let normalized = send(
+        &app,
+        get(
+            "/r/alice/proj/compare?base=missing-base&head=feature",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(normalized.status, StatusCode::OK);
+    assert!(normalized
+        .body
+        .contains(r#"<option value="main" selected>main</option>"#));
+    assert!(normalized
+        .body
+        .contains(r#"<input type="hidden" name="base" value="main">"#));
+    assert!(
+        !normalized.body.contains("missing-base"),
+        "unknown requested base is normalized to the default branch"
+    );
+
+    create_repo(&app, "alice", "level", "").await;
+    let level_dir = git
+        .repo_path("alice", "level")
+        .to_string_lossy()
+        .to_string();
+    let level = commit_files(&level_dir, None, "level", &[("file.txt", "same\n")]);
+    git_capture(&level_dir, &["update-ref", "refs/heads/main", &level], "");
+    git_capture(
+        &level_dir,
+        &["update-ref", "refs/heads/feature", &level],
+        "",
+    );
+    let collapsed_empty = send(
+        &app,
+        get(
+            "/r/alice/level/compare?base=main&head=feature",
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(collapsed_empty.status, StatusCode::OK);
+    assert!(collapsed_empty.body.contains("No commits"));
+    assert!(collapsed_empty.body.contains("No file changes"));
+    let collapsed_text = strip_tags(page_main(&collapsed_empty.body)).to_ascii_lowercase();
+    assert!(!collapsed_text.contains("diff unavailable"));
+    assert!(!collapsed_text.contains("indeterminate"));
+
+    create_repo(&app, "alice", "blank", "").await;
+    let no_branches = send(&app, get("/r/alice/blank/compare", Some("alice"))).await;
+    assert_eq!(no_branches.status, StatusCode::OK);
+    assert!(strip_tags(page_main(&no_branches.body))
+        .to_ascii_lowercase()
+        .contains("no branches"));
+    let no_branches_text = strip_tags(page_main(&no_branches.body)).to_ascii_lowercase();
+    assert!(!no_branches_text.contains("diff unavailable"));
+    assert!(!no_branches_text.contains("indeterminate"));
+}
+
+#[tokio::test]
 async fn pull_request_squash_merge_creates_single_commit() {
     let state = temp_state();
     let git = state.git.clone();
@@ -1854,6 +2170,12 @@ async fn pull_request_rebase_conflict_leaves_base_ref_unchanged() {
     assert!(detail
         .body
         .contains("Resolve the conflicts manually before merging"));
+    let conflict_gate = change_weave_region(&detail.body, "cw-gate", "cw-signals");
+    assert!(
+        conflict_gate.contains("conflicts"),
+        "conflicting mergeability is one authoritative Tension Gate blocker"
+    );
+    assert_tension_gate_excludes_signals(&detail.body);
     assert!(detail.body.contains(
         r#"<button class="btn btn-primary" type="submit" disabled aria-disabled="true">Merge pull request</button>"#
     ));
@@ -1928,6 +2250,13 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
     assert_eq!(created.status, StatusCode::FOUND);
 
     let detail = send(&app, get("/r/alice/proj/pulls/1", Some("alice"))).await;
+    let approval_gate = change_weave_region(&detail.body, "cw-gate", "cw-signals");
+    assert!(
+        approval_gate.contains("requires at least one approval")
+            || approval_gate.contains("0 of 1 approvals"),
+        "insufficient approvals are one authoritative Tension Gate blocker"
+    );
+    assert_tension_gate_excludes_signals(&detail.body);
     let csrf = detail.csrf_cookie().unwrap();
     let blocked = send(
         &app,
@@ -2111,6 +2440,504 @@ async fn pull_reviews_gate_merge_inline_comments_and_close_linked_issues() {
 }
 
 #[tokio::test]
+async fn change_weave_codeowners_blocker_and_missing_file_gap_are_exact() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+
+    create_repo(&app, "alice", "owned", "").await;
+    let owned_repo = store.get_repo("alice", "owned").await.unwrap().unwrap();
+    assert!(store
+        .update_repo_settings(
+            &owned_repo.id,
+            &owned_repo.description,
+            &owned_repo.default_branch,
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap());
+    let owned_dir = git
+        .repo_path("alice", "owned")
+        .to_string_lossy()
+        .to_string();
+    let owned_base = commit_files(
+        &owned_dir,
+        None,
+        "base",
+        &[("CODEOWNERS", "*.txt @alice\n"), ("file.txt", "base\n")],
+    );
+    git_capture(
+        &owned_dir,
+        &["update-ref", "refs/heads/main", &owned_base],
+        "",
+    );
+    let owned_feature = commit_files(
+        &owned_dir,
+        Some(&owned_base),
+        "feature",
+        &[
+            ("CODEOWNERS", "*.txt @alice\n"),
+            ("file.txt", "base\nfeature\n"),
+        ],
+    );
+    git_capture(
+        &owned_dir,
+        &["update-ref", "refs/heads/feature", &owned_feature],
+        "",
+    );
+    open_pull(
+        &app,
+        "alice/owned",
+        "main",
+        "feature",
+        "Owned change",
+        "",
+        "bob",
+    )
+    .await;
+
+    let blocked_detail = send(&app, get("/r/alice/owned/pulls/1", Some("bob"))).await;
+    let codeowner_gate = change_weave_region(&blocked_detail.body, "cw-gate", "cw-signals");
+    assert!(
+        codeowner_gate.contains("Waiting for code owners") && codeowner_gate.contains("@alice"),
+        "an unsatisfied matched CODEOWNERS group is one authoritative Tension Gate blocker"
+    );
+    assert_tension_gate_excludes_signals(&blocked_detail.body);
+    assert!(blocked_detail.body.contains(
+        r#"<button class="btn btn-primary" type="submit" disabled aria-disabled="true">Merge pull request</button>"#
+    ));
+    let bob_csrf = blocked_detail.csrf_cookie().unwrap();
+    let blocked_merge = send(
+        &app,
+        post_form(
+            "/r/alice/owned/pulls/1/merge",
+            &[("csrf_token", &bob_csrf)],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(blocked_merge.status, StatusCode::BAD_REQUEST);
+    assert!(blocked_merge.body.contains("Code owner review is required"));
+    assert_ne!(
+        git_capture(&owned_dir, &["rev-parse", "refs/heads/main"], ""),
+        owned_feature
+    );
+
+    let alice_detail = send(&app, get("/r/alice/owned/pulls/1", Some("alice"))).await;
+    let alice_csrf = alice_detail.csrf_cookie().unwrap();
+    let approved = send(
+        &app,
+        post_form(
+            "/r/alice/owned/pulls/1/review",
+            &[
+                ("csrf_token", &alice_csrf),
+                ("verdict", "approve"),
+                ("body", "code owner approval"),
+            ],
+            &alice_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(approved.status, StatusCode::FOUND);
+    let ready = send(&app, get("/r/alice/owned/pulls/1", Some("bob"))).await;
+    assert!(ready.body.contains("Code owner reviews satisfied"));
+    assert!(ready
+        .body
+        .contains(r#"<button class="btn btn-primary" type="submit">Merge pull request</button>"#));
+    let ready_csrf = ready.csrf_cookie().unwrap();
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/owned/pulls/1/merge",
+            &[("csrf_token", &ready_csrf)],
+            &ready_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(merged.status, StatusCode::FOUND);
+    assert_eq!(
+        git_capture(&owned_dir, &["rev-parse", "refs/heads/main"], ""),
+        owned_feature
+    );
+
+    create_repo(&app, "alice", "missingowners", "").await;
+    let missing_repo = store
+        .get_repo("alice", "missingowners")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .update_repo_settings(
+            &missing_repo.id,
+            &missing_repo.description,
+            &missing_repo.default_branch,
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap());
+    let missing_dir = git
+        .repo_path("alice", "missingowners")
+        .to_string_lossy()
+        .to_string();
+    let missing_feature = seed_two_branches(&missing_dir);
+    open_pull(
+        &app,
+        "alice/missingowners",
+        "main",
+        "feature",
+        "No owners file",
+        "",
+        "bob",
+    )
+    .await;
+    let gap = send(&app, get("/r/alice/missingowners/pulls/1", Some("bob"))).await;
+    assert!(gap
+        .body
+        .contains("Code owner reviews required, but no CODEOWNERS file was found"));
+    assert!(
+        gap.body.contains("codeowners-req--satisfied"),
+        "missing CODEOWNERS is a non-blocking configuration gap"
+    );
+    assert!(gap
+        .body
+        .contains(r#"<button class="btn btn-primary" type="submit">Merge pull request</button>"#));
+    let gap_csrf = gap.csrf_cookie().unwrap();
+    let gap_merged = send(
+        &app,
+        post_form(
+            "/r/alice/missingowners/pulls/1/merge",
+            &[("csrf_token", &gap_csrf)],
+            &gap_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        gap_merged.status,
+        StatusCode::FOUND,
+        "missing CODEOWNERS must not fabricate a merge blocker"
+    );
+    assert_eq!(
+        git_capture(&missing_dir, &["rev-parse", "refs/heads/main"], ""),
+        missing_feature
+    );
+}
+
+#[tokio::test]
+async fn change_weave_signals_are_visible_but_never_block_splice() {
+    let mut state = temp_state();
+    Arc::make_mut(&mut state.config).status_token = "signal-status-secret".to_string();
+    let git = state.git.clone();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "signals", "").await;
+    let repo = store.get_repo("alice", "signals").await.unwrap().unwrap();
+    let git_dir = git
+        .repo_path("alice", "signals")
+        .to_string_lossy()
+        .to_string();
+    let feature_oid = seed_two_branches(&git_dir);
+    open_pull(
+        &app,
+        "alice/signals",
+        "main",
+        "feature",
+        "Signals stay advisory",
+        "",
+        "bob",
+    )
+    .await;
+    let pull = store.get_pull(&repo.id, 1).await.unwrap().unwrap();
+    store
+        .upsert_pull_preview_comment(
+            &pull.id,
+            "preview-job-failed",
+            "failed",
+            "",
+            &feature_oid,
+            "Preview could not be built.",
+            now_secs(),
+        )
+        .await
+        .unwrap();
+    let failed_check = send(
+        &app,
+        post_json(
+            &format!("/r/alice/signals/statuses/{feature_oid}"),
+            r#"{"state":"failure","context":"ci/red","description":"red by design"}"#,
+            Some("signal-status-secret"),
+        ),
+    )
+    .await;
+    assert_eq!(failed_check.status, StatusCode::OK);
+
+    let detail = send(&app, get("/r/alice/signals/pulls/1", Some("bob"))).await;
+    let csrf = detail.csrf_cookie().unwrap();
+    let commented = send(
+        &app,
+        post_form(
+            "/r/alice/signals/pulls/1/inline-comment",
+            &[
+                ("csrf_token", &csrf),
+                ("path", "file.txt"),
+                ("line", "2"),
+                ("body", "unresolved but advisory"),
+            ],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(commented.status, StatusCode::FOUND);
+
+    let with_thread = send(&app, get("/r/alice/signals/pulls/1", Some("bob"))).await;
+    let csrf = with_thread.csrf_cookie().unwrap();
+    let viewed = send(
+        &app,
+        post_form_accept(
+            "/r/alice/signals/pulls/1/file-viewed",
+            &[
+                ("csrf_token", &csrf),
+                ("file_path", "file.txt"),
+                ("viewed", "true"),
+            ],
+            &csrf,
+            Some("bob"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(viewed.status, StatusCode::OK);
+
+    let all_signals = send(&app, get("/r/alice/signals/pulls/1", Some("bob"))).await;
+    assert_change_weave_region_order(&all_signals.body);
+    assert_tension_gate_excludes_signals(&all_signals.body);
+    let signals =
+        change_weave_region(&all_signals.body, "cw-signals", "cw-passes").to_ascii_lowercase();
+    assert!(signals.contains("does not decide merge"));
+    assert!(signals.contains("ci/red"));
+    assert!(signals.contains("preview") && signals.contains("failed"));
+    assert!(signals.contains("viewed 1/1"));
+    assert!(signals.contains("1 unresolved"));
+    assert!(all_signals
+        .body
+        .contains(r#"<button class="btn btn-primary" type="submit">Merge pull request</button>"#));
+
+    let csrf = all_signals.csrf_cookie().unwrap();
+    let merged = send(
+        &app,
+        post_form(
+            "/r/alice/signals/pulls/1/merge",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        merged.status,
+        StatusCode::FOUND,
+        "failing checks, failed Preview, viewed progress, and unresolved threads are non-blocking"
+    );
+    assert_eq!(
+        git_capture(&git_dir, &["rev-parse", "refs/heads/main"], ""),
+        feature_oid
+    );
+}
+
+#[tokio::test]
+async fn assigned_reviewer_has_viewer_actions_but_no_gate_authority_or_pending_visibility() {
+    let state = temp_state();
+    let git = state.git.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "roles", "").await;
+    let git_dir = git
+        .repo_path("alice", "roles")
+        .to_string_lossy()
+        .to_string();
+    seed_two_branches(&git_dir);
+
+    let compare = send(
+        &app,
+        get("/r/alice/roles/compare?base=main&head=feature", Some("bob")),
+    )
+    .await;
+    let csrf = compare.csrf_cookie().unwrap();
+    let created = send(
+        &app,
+        post_form(
+            "/r/alice/roles/pulls",
+            &[
+                ("csrf_token", &csrf),
+                ("base", "main"),
+                ("head", "feature"),
+                ("title", "Reviewer metadata is not authority"),
+                ("body", ""),
+                ("reviewer", "carol"),
+            ],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+
+    let bob_detail = send(&app, get("/r/alice/roles/pulls/1", Some("bob"))).await;
+    let bob_csrf = bob_detail.csrf_cookie().unwrap();
+    let pending = send(
+        &app,
+        post_form(
+            "/r/alice/roles/pulls/1/inline-comment",
+            &[
+                ("csrf_token", &bob_csrf),
+                ("path", "file.txt"),
+                ("line", "2"),
+                ("body", "bob-only pending review note"),
+                ("mode", "pending"),
+            ],
+            &bob_csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(pending.status, StatusCode::FOUND);
+    let bob_pending = send(&app, get("/r/alice/roles/pulls/1", Some("bob"))).await;
+    assert!(bob_pending.body.contains("bob-only pending review note"));
+
+    let carol = send(&app, get("/r/alice/roles/pulls/1", Some("carol"))).await;
+    assert_eq!(carol.status, StatusCode::OK);
+    assert!(carol.body.contains("Reviewers"));
+    assert!(carol.body.contains("carol"));
+    assert!(
+        !carol.body.contains("bob-only pending review note"),
+        "reviewer_sub metadata does not expose another author's pending comment"
+    );
+    assert!(!carol
+        .body
+        .contains(r#"action="/r/alice/roles/pulls/1/merge""#));
+    assert!(!carol
+        .body
+        .contains(r#"action="/r/alice/roles/pulls/1/review""#));
+    assert!(!carol
+        .body
+        .contains(r#"action="/r/alice/roles/pulls/1/metadata""#));
+    assert!(carol
+        .body
+        .contains(r#"action="/r/alice/roles/pulls/1/reactions""#));
+    assert!(carol
+        .body
+        .contains(r#"action="/r/alice/roles/pulls/1/file-viewed""#));
+    let carol_csrf = carol.csrf_cookie().unwrap();
+
+    let forbidden_review = send(
+        &app,
+        post_form(
+            "/r/alice/roles/pulls/1/review",
+            &[
+                ("csrf_token", &carol_csrf),
+                ("verdict", "approve"),
+                ("body", "assignment must not grant this"),
+            ],
+            &carol_csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden_review.status, StatusCode::FORBIDDEN);
+    let forbidden_metadata = send(
+        &app,
+        post_form(
+            "/r/alice/roles/pulls/1/metadata",
+            &[
+                ("csrf_token", &carol_csrf),
+                ("reviewer", "carol"),
+                ("assignee", ""),
+            ],
+            &carol_csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden_metadata.status, StatusCode::FORBIDDEN);
+    let forbidden_merge = send(
+        &app,
+        post_form(
+            "/r/alice/roles/pulls/1/merge",
+            &[("csrf_token", &carol_csrf)],
+            &carol_csrf,
+            Some("carol"),
+        ),
+    )
+    .await;
+    assert_eq!(forbidden_merge.status, StatusCode::FORBIDDEN);
+
+    let viewed = send(
+        &app,
+        post_form_accept(
+            "/r/alice/roles/pulls/1/file-viewed",
+            &[
+                ("csrf_token", &carol_csrf),
+                ("file_path", "file.txt"),
+                ("viewed", "true"),
+            ],
+            &carol_csrf,
+            Some("carol"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(
+        viewed.status,
+        StatusCode::OK,
+        "any authenticated visible viewer may set only their own viewed state"
+    );
+    let reacted = send(
+        &app,
+        post_form_accept(
+            "/r/alice/roles/pulls/1/reactions",
+            &[("csrf_token", &carol_csrf), ("emoji", "\u{1f440}")],
+            &carol_csrf,
+            Some("carol"),
+            "application/json",
+        ),
+    )
+    .await;
+    assert_eq!(
+        reacted.status,
+        StatusCode::OK,
+        "any authenticated visible viewer may react"
+    );
+    let carol_after = send(&app, get("/r/alice/roles/pulls/1", Some("carol"))).await;
+    assert!(carol_after.body.contains("Viewed 1/1"));
+    let bob_after = send(&app, get("/r/alice/roles/pulls/1", Some("bob"))).await;
+    assert!(bob_after.body.contains("Viewed 0/1"));
+
+    let owner = send(&app, get("/r/alice/roles/pulls/1", Some("alice"))).await;
+    assert!(
+        !owner.body.contains("bob-only pending review note"),
+        "repo_writer authority does not expose another author's pending comment"
+    );
+    let anonymous = send(&app, get("/r/alice/roles/pulls/1", None)).await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::OK,
+        "anonymous GET remains available for a public repository"
+    );
+    assert!(!anonymous.body.contains("bob-only pending review note"));
+    assert!(!anonymous
+        .body
+        .contains(r#"action="/r/alice/roles/pulls/1/merge""#));
+}
+
+#[tokio::test]
 async fn pull_request_changes_blocks_merge_until_dismissed() {
     let state = temp_state();
     let git = state.git.clone();
@@ -2159,6 +2986,12 @@ async fn pull_request_changes_blocks_merge_until_dismissed() {
         .id;
 
     let bob_detail = send(&app, get("/r/alice/proj/pulls/1", Some("bob"))).await;
+    let changes_gate = change_weave_region(&bob_detail.body, "cw-gate", "cw-signals");
+    assert!(
+        changes_gate.contains("Changes requested"),
+        "active latest request_changes is one authoritative Tension Gate blocker"
+    );
+    assert_tension_gate_excludes_signals(&bob_detail.body);
     let bob_csrf = bob_detail.csrf_cookie().unwrap();
     let blocked = send(
         &app,
@@ -2199,7 +3032,10 @@ async fn pull_request_changes_blocks_merge_until_dismissed() {
 
     create_repo(&app, "alice", "other", "").await;
     let other_repo = store.get_repo("alice", "other").await.unwrap().unwrap();
-    let other_git_dir = git.repo_path("alice", "other").to_string_lossy().to_string();
+    let other_git_dir = git
+        .repo_path("alice", "other")
+        .to_string_lossy()
+        .to_string();
     seed_two_branches(&other_git_dir);
     open_pull(
         &app,
