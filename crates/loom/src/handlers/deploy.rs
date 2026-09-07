@@ -14,6 +14,7 @@ use axum::{Form, Json};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::auth::{self, Identity};
@@ -219,8 +220,11 @@ pub async fn add_domain(
     require_deploy_admin(&state, &repo, &who, &headers).await?;
     ensure_public_repo(&repo)?;
     let deploy = require_siteflow_deploy(&state, &repo).await?;
-    let hostname =
-        clean_custom_domain_hostname(&form.hostname, &state.config.siteflow_base_domain)?;
+    let hostname = clean_custom_domain_hostname(
+        &form.hostname,
+        &state.config.siteflow_base_domain,
+        &state.config.siteflow_host_namespace,
+    )?;
 
     let client = siteflow_client()?;
     let path = format!(
@@ -384,7 +388,11 @@ pub async fn rollback_deploy(
     .await?;
     deploy.last_build_job_id = build_job_id;
     deploy.last_deployed_sha = target_sha.clone();
-    deploy.preview_url = preview_url(&state.config.siteflow_base_domain, &deploy.siteflow_slug);
+    deploy.preview_url = preview_url(
+        &state.config.siteflow_base_domain,
+        &state.config.siteflow_host_namespace,
+        &deploy.siteflow_slug,
+    );
     deploy.updated_at = now_secs();
     deploy = state.store.upsert_deploy(&deploy).await?;
     tracing::info!(
@@ -537,6 +545,80 @@ pub fn emit_auto_deploy(state: &AppState, repo: &Repo, actor_sub: &str, push_bod
                 "auto deploy submitted"
             ),
             Err(e) => tracing::warn!(error = %e, repo = repo.id, "auto deploy failed"),
+        }
+    });
+}
+
+/// Trigger every Anvil pipeline bound to the pushed repository + branch. This is deliberately
+/// fail-open: source pushes and SiteFlow deploys must not depend on CI availability.
+pub fn emit_auto_actions(state: &AppState, repo: &Repo, actor_sub: &str, push_body: &[u8]) {
+    if repo.is_private
+        || state.config.anvil_api_url.trim().is_empty()
+        || state.config.anvil_api_token.trim().is_empty()
+    {
+        return;
+    }
+    let branches = push_body_head_branches(push_body);
+    if branches.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    let repo = repo.clone();
+    let actor_sub = actor_sub.to_string();
+
+    tokio::spawn(async move {
+        let Ok(client) = siteflow_client() else {
+            tracing::warn!(repo = repo.id, "anvil trigger client could not be created");
+            return;
+        };
+        let endpoint = format!(
+            "{}/api/integrations/repositories/runs",
+            state.config.anvil_api_url.trim_end_matches('/')
+        );
+        let repo_url = format!(
+            "{}/{}/{}.git",
+            state.config.siteflow_clone_base_url.trim_end_matches('/'),
+            repo.owner_sub,
+            repo.name
+        );
+
+        for branch in branches {
+            let body = match serde_json::to_vec(&json!({
+                "repo_url": &repo_url,
+                "branch": &branch,
+                "actor": &actor_sub,
+            })) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(repo = repo.id, branch, error = %error, "anvil trigger body encode failed");
+                    continue;
+                }
+            };
+            let response = client
+                .post(&endpoint)
+                .header(USER_AGENT, "Loom-Anvil/0.1")
+                .header(CONTENT_TYPE, "application/json")
+                .bearer_auth(&state.config.anvil_api_token)
+                .body(body)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    tracing::info!(repo = repo.id, branch, "anvil workflows enqueued")
+                }
+                Ok(response) => tracing::warn!(
+                    repo = repo.id,
+                    branch,
+                    status = %response.status(),
+                    "anvil workflow trigger rejected"
+                ),
+                Err(error) => tracing::warn!(
+                    repo = repo.id,
+                    branch,
+                    error = %error,
+                    "anvil workflow trigger failed"
+                ),
+            }
         }
     });
 }
@@ -695,7 +777,11 @@ pub(crate) fn render_deploy_card(
     } else {
         ""
     };
-    let fallback_preview = preview_url(&state.config.siteflow_base_domain, slug);
+    let fallback_preview = preview_url(
+        &state.config.siteflow_base_domain,
+        &state.config.siteflow_host_namespace,
+        slug,
+    );
     let preview = deploy
         .map(|d| d.preview_url.as_str())
         .filter(|s| !s.is_empty())
@@ -760,7 +846,7 @@ pub(crate) fn render_deploy_card(
         r##"<section class="card deploy-card">
   <div class="card__head">
     <h2>Deploy</h2>
-    <span class="deploy-status deploy-status--{status}" data-poll="/r/{owner}/{name}/deploy/status">{status}</span>
+    <span class="deploy-status deploy-status--{status}" data-poll="/r/{owner}/{name}/deploy/status">{status_text}</span>
   </div>
   <div class="card__body">
     {private_note}
@@ -844,6 +930,7 @@ pub(crate) fn render_deploy_card(
         name = esc(&repo.name),
         csrf = esc(csrf),
         status = esc(status),
+        status_text = esc(&status.replace('_', " ")),
         private_note = private_note,
         preview = esc(preview),
         build = esc(build),
@@ -1079,7 +1166,11 @@ fn deploy_from_existing(
     }
     deploy.framework = normalize_framework(&deploy.framework)?;
     deploy.siteflow_slug = build_siteflow_slug(&repo.owner_sub, &repo.name);
-    deploy.preview_url = preview_url(&state.config.siteflow_base_domain, &deploy.siteflow_slug);
+    deploy.preview_url = preview_url(
+        &state.config.siteflow_base_domain,
+        &state.config.siteflow_host_namespace,
+        &deploy.siteflow_slug,
+    );
     deploy.updated_at = now;
     Ok(deploy)
 }
@@ -1107,7 +1198,11 @@ async fn deploy_from_settings_form(
     deploy.output_directory = output_directory;
     deploy.framework = framework;
     deploy.auto_deploy = form.auto_deploy == "on";
-    deploy.preview_url = preview_url(&state.config.siteflow_base_domain, &deploy.siteflow_slug);
+    deploy.preview_url = preview_url(
+        &state.config.siteflow_base_domain,
+        &state.config.siteflow_host_namespace,
+        &deploy.siteflow_slug,
+    );
     deploy.updated_at = now;
     Ok(deploy)
 }
@@ -1126,7 +1221,11 @@ fn new_deploy(state: &AppState, repo: &Repo, now: i64) -> RepoDeploy {
         framework: "static".to_string(),
         auto_deploy: state.config.auto_deploy_default,
         last_build_job_id: String::new(),
-        preview_url: preview_url(&state.config.siteflow_base_domain, &slug),
+        preview_url: preview_url(
+            &state.config.siteflow_base_domain,
+            &state.config.siteflow_host_namespace,
+            &slug,
+        ),
         last_deployed_sha: String::new(),
         created_at: now,
         updated_at: now,
@@ -1166,7 +1265,11 @@ async fn submit_deploy_as(
     if state.config.siteflow_base_url.trim().is_empty() {
         deploy.last_build_job_id = format!("local_{}", random_alnum(12));
         deploy.last_deployed_sha = commit_sha;
-        deploy.preview_url = preview_url(&state.config.siteflow_base_domain, &deploy.siteflow_slug);
+        deploy.preview_url = preview_url(
+            &state.config.siteflow_base_domain,
+            &state.config.siteflow_host_namespace,
+            &deploy.siteflow_slug,
+        );
         deploy.updated_at = now_secs();
         return Ok(state.store.upsert_deploy(&deploy).await?);
     }
@@ -1225,7 +1328,11 @@ async fn submit_deploy_as(
     .await?;
     deploy.last_build_job_id = build_job_id;
     deploy.last_deployed_sha = commit_sha;
-    deploy.preview_url = preview_url(&state.config.siteflow_base_domain, &deploy.siteflow_slug);
+    deploy.preview_url = preview_url(
+        &state.config.siteflow_base_domain,
+        &state.config.siteflow_host_namespace,
+        &deploy.siteflow_slug,
+    );
     deploy.updated_at = now_secs();
     Ok(state.store.upsert_deploy(&deploy).await?)
 }
@@ -2128,10 +2235,14 @@ fn normalize_framework(raw: &str) -> Result<String, AppError> {
     }
 }
 
-fn clean_custom_domain_hostname(raw: &str, siteflow_base_domain: &str) -> Result<String, AppError> {
+fn clean_custom_domain_hostname(
+    raw: &str,
+    siteflow_base_domain: &str,
+    host_namespace: &str,
+) -> Result<String, AppError> {
     let hostname = clean_domain_hostname(raw)?;
     if has_siteflow_base_suffix(&hostname, siteflow_base_domain)
-        && !is_siteflow_vanity_subdomain(&hostname, siteflow_base_domain)
+        && !is_siteflow_vanity_subdomain(&hostname, siteflow_base_domain, host_namespace)
     {
         return Err(AppError::BadRequest(
             "Use a domain outside the SiteFlow base domain.".to_string(),
@@ -2157,7 +2268,11 @@ fn clean_domain_hostname(raw: &str) -> Result<String, AppError> {
     Ok(hostname)
 }
 
-fn is_siteflow_vanity_subdomain(hostname: &str, siteflow_base_domain: &str) -> bool {
+fn is_siteflow_vanity_subdomain(
+    hostname: &str,
+    siteflow_base_domain: &str,
+    host_namespace: &str,
+) -> bool {
     let Some(base) = normalized_siteflow_base_domain(siteflow_base_domain) else {
         return false;
     };
@@ -2165,7 +2280,11 @@ fn is_siteflow_vanity_subdomain(hostname: &str, siteflow_base_domain: &str) -> b
     let Some(label) = hostname.strip_suffix(&suffix) else {
         return false;
     };
-    !label.is_empty() && !label.contains('.') && is_dns_label(label)
+    if label.is_empty() || label.contains('.') || !is_dns_label(label) {
+        return false;
+    }
+    let namespace = host_namespace.trim().trim_matches('-').to_ascii_lowercase();
+    namespace.is_empty() || label.starts_with(&format!("{namespace}-"))
 }
 
 fn has_siteflow_base_suffix(hostname: &str, siteflow_base_domain: &str) -> bool {
@@ -2230,17 +2349,44 @@ fn build_siteflow_slug(owner: &str, name: &str) -> String {
     }
 }
 
-fn preview_url(base_domain: &str, slug: &str) -> String {
+fn compact_dns_label(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+
+    let hash = hex::encode(Sha256::digest(value.as_bytes()));
+    let visible_budget = max_len - 12;
+    let head_budget = visible_budget.div_ceil(2);
+    let tail_budget = visible_budget - head_budget;
+    let head = value[..head_budget].trim_end_matches('-');
+    let tail = value[value.len() - tail_budget..].trim_start_matches('-');
+    format!("{head}-{tail}-{}", &hash[..10])
+}
+
+fn siteflow_host_label(slug: &str, host_namespace: &str) -> String {
+    let namespace = host_namespace.trim().trim_matches('-').to_ascii_lowercase();
+    if namespace.is_empty() {
+        compact_dns_label(slug, 63)
+    } else {
+        format!(
+            "{namespace}-{}",
+            compact_dns_label(slug, 63 - namespace.len() - 1)
+        )
+    }
+}
+
+fn preview_url(base_domain: &str, host_namespace: &str, slug: &str) -> String {
     let domain = base_domain.trim().trim_end_matches('/');
     if domain.is_empty() {
         return String::new();
     }
+    let host_label = siteflow_host_label(slug, host_namespace);
     if let Some(rest) = domain.strip_prefix("https://") {
-        format!("https://{slug}.{rest}")
+        format!("https://{host_label}.{rest}")
     } else if let Some(rest) = domain.strip_prefix("http://") {
-        format!("http://{slug}.{rest}")
+        format!("http://{host_label}.{rest}")
     } else {
-        format!("https://{slug}.{domain}")
+        format!("https://{host_label}.{domain}")
     }
 }
 
@@ -3516,11 +3662,16 @@ mod tests {
     #[test]
     fn custom_domain_allows_single_label_siteflow_vanity_subdomain() {
         assert_eq!(
-            clean_custom_domain_hostname("App.Siteflow.W33D.XYZ", "siteflow.w33d.xyz").unwrap(),
+            clean_custom_domain_hostname("App.Siteflow.W33D.XYZ", "siteflow.w33d.xyz", "")
+                .unwrap(),
             "app.siteflow.w33d.xyz"
         );
         assert_eq!(
-            clean_custom_domain_hostname("app.siteflow.w33d.xyz", "https://siteflow.w33d.xyz/")
+            clean_custom_domain_hostname(
+                "app.siteflow.w33d.xyz",
+                "https://siteflow.w33d.xyz/",
+                "",
+            )
                 .unwrap(),
             "app.siteflow.w33d.xyz"
         );
@@ -3528,18 +3679,41 @@ mod tests {
 
     #[test]
     fn custom_domain_rejects_bare_and_multi_label_siteflow_base_domain() {
-        assert!(clean_custom_domain_hostname("siteflow.w33d.xyz", "siteflow.w33d.xyz").is_err());
         assert!(
-            clean_custom_domain_hostname("a.b.siteflow.w33d.xyz", "siteflow.w33d.xyz").is_err()
+            clean_custom_domain_hostname("siteflow.w33d.xyz", "siteflow.w33d.xyz", "")
+                .is_err()
         );
         assert!(
-            clean_custom_domain_hostname("app.example.com", "https://siteflow.w33d.xyz/").is_ok()
+            clean_custom_domain_hostname("a.b.siteflow.w33d.xyz", "siteflow.w33d.xyz", "")
+                .is_err()
+        );
+        assert!(
+            clean_custom_domain_hostname("app.example.com", "https://siteflow.w33d.xyz/", "")
+                .is_ok()
         );
         assert!(clean_custom_domain_hostname(
             "siteflow.w33d.xyz.evil.example",
-            "siteflow.w33d.xyz"
+            "siteflow.w33d.xyz",
+            "",
         )
         .is_ok());
+        assert!(clean_custom_domain_hostname("sf-app.w33d.xyz", "w33d.xyz", "sf").is_ok());
+        assert!(clean_custom_domain_hostname("status.w33d.xyz", "w33d.xyz", "sf").is_err());
+    }
+
+    #[test]
+    fn fallback_preview_url_uses_the_public_siteflow_namespace() {
+        let slug = "usr-82wsei-fuhc5ao9aiaybegwfy5xcagai-up3wgzh0vw-saguadoodle";
+        let url = preview_url("w33d.xyz", "sf", slug);
+        let label = url
+            .strip_prefix("https://")
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap();
+
+        assert_eq!(url, format!("https://sf-{slug}.w33d.xyz"));
+        assert!(label.len() <= 63);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-/* Loom — progressive-enhancement layer (Odyssey v2).
+/* Loom — product-owned progressive-enhancement layer.
  *
  * Every feature here is ADDITIVE: with JavaScript disabled the original <form> POST routes and
  * server-rendered markup work unchanged. Remote strings are only ever written with textContent,
@@ -547,6 +547,28 @@
     });
   }
 
+  // --- Pull-request section navigation ------------------------------------
+  function initPrSubnav() {
+    var nav = document.querySelector(".pr-subnav");
+    if (!nav) return;
+    var links = Array.prototype.slice.call(nav.querySelectorAll("[data-pr-section]"));
+    function sync() {
+      var target = String(window.location.hash || "").replace(/^#/, "");
+      var known = links.some(function (link) {
+        return link.getAttribute("data-pr-section") === target;
+      });
+      if (!known) target = "overview";
+      links.forEach(function (link) {
+        var active = link.getAttribute("data-pr-section") === target;
+        link.classList.toggle("is-active", active);
+        if (active) link.setAttribute("aria-current", "location");
+        else link.removeAttribute("aria-current");
+      });
+    }
+    window.addEventListener("hashchange", sync);
+    sync();
+  }
+
   function init() {
     initCopy();
     initSort();
@@ -561,6 +583,7 @@
     initDeployDomains();
     initDeployPreview();
     initDeployLogs();
+    initPrSubnav();
   }
 
   if (document.readyState === "loading") {

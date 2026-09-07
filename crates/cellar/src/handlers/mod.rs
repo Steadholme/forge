@@ -16,15 +16,17 @@ pub mod retention;
 pub mod robots;
 pub mod web;
 
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 
 /// Cellar-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
+pub const APP_CSS_PATH: &str = "/assets/cellar-20260821.css";
+
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Embedded design system (Odyssey canonical + Cellar service CSS), inlined into each page's `<style>`.
+/// Embedded design system (Odyssey canonical + Cellar service CSS), served as one immutable asset.
 pub fn app_css() -> &'static str {
     APP_CSS
         .get_or_init(|| {
@@ -34,6 +36,24 @@ pub fn app_css() -> &'static str {
             css
         })
         .as_str()
+}
+
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Embedded progressive-enhancement script, inlined into each rendered page's `<script>`. Purely
@@ -247,7 +267,6 @@ pub fn render_error(
     email: Option<&str>,
 ) -> (StatusCode, Html<String>) {
     let body = ERROR_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr("light"))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta("light"))
         .replace("{{SHIELD}}", SHIELD_SVG)

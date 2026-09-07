@@ -71,7 +71,9 @@ pub const ROBOT_USER_PREFIX: &str = "robot$";
 /// Parse `Authorization: Bearer <token>` into the bare token (a robot secret).
 pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let tok = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let tok = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?;
     let tok = tok.trim();
     if tok.is_empty() {
         None
@@ -101,7 +103,9 @@ pub fn token_matches(token: &str, token_hash: &str) -> bool {
 /// Parse `Authorization: Basic base64(user:password)` into `(user, password)`.
 pub fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let b64 = raw.strip_prefix("Basic ").or_else(|| raw.strip_prefix("basic "))?;
+    let b64 = raw
+        .strip_prefix("Basic ")
+        .or_else(|| raw.strip_prefix("basic "))?;
     let decoded = b64_decode(b64.trim())?;
     let text = String::from_utf8(decoded).ok()?;
     let (user, pass) = text.split_once(':')?;
@@ -303,9 +307,12 @@ pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
     };
     let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).
@@ -412,12 +419,18 @@ mod tests {
         assert_eq!(check_basic(&HeaderMap::new(), &cfg), Cred::None);
 
         let mut good = HeaderMap::new();
-        good.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic cm9ib3Q6czNjcmV0"));
+        good.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic cm9ib3Q6czNjcmV0"),
+        );
         assert_eq!(check_basic(&good, &cfg), Cred::Ok);
 
         let mut bad = HeaderMap::new();
         // base64("robot:wrong")
-        bad.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic cm9ib3Q6d3Jvbmc="));
+        bad.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic cm9ib3Q6d3Jvbmc="),
+        );
         assert_eq!(check_basic(&bad, &cfg), Cred::Bad);
     }
 
@@ -431,7 +444,10 @@ mod tests {
     fn csrf_double_submit() {
         let token = new_csrf_token();
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, format!("{CSRF_COOKIE}={token}").parse().unwrap());
+        h.insert(
+            header::COOKIE,
+            format!("{CSRF_COOKIE}={token}").parse().unwrap(),
+        );
         assert!(verify_csrf(&h, &token));
         assert!(!verify_csrf(&h, "nope"));
     }
@@ -483,7 +499,10 @@ mod tests {
         assert!(is_admin(&product));
         assert!(require_admin(&product).is_ok());
         // The resolved set is exactly the two globals plus the product group.
-        assert_eq!(admin_groups(), ["admins", "infra-admins", "registry-admins"]);
+        assert_eq!(
+            admin_groups(),
+            ["admins", "infra-admins", "registry-admins"]
+        );
         // A random unrelated group is still refused (403 at the gate).
         let mut random = HeaderMap::new();
         random.insert(HEADER_GROUPS, HeaderValue::from_static("random-group"));
@@ -505,11 +524,17 @@ mod tests {
     #[test]
     fn bearer_and_human_basic_parsing() {
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer tok-123"));
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer tok-123"),
+        );
         assert_eq!(bearer_token(&h), Some("tok-123".to_string()));
         // A Basic header is not a Bearer token.
         let mut b = HeaderMap::new();
-        b.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic cm9ib3Q6czNjcmV0"));
+        b.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic cm9ib3Q6czNjcmV0"),
+        );
         assert_eq!(bearer_token(&b), None);
 
         let cfg = cfg_with_auth(); // user=robot, pass=s3cret

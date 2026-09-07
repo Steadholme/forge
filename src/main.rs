@@ -98,8 +98,8 @@ async fn dispatch(State(v): State<Vhosts>, req: Request) -> Response {
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     // Match on the leading label, ignoring any port. Accept BOTH the gateway subdomain label
-    // (`git`/`registry`/`atlas`) AND the bare internal service-name label (`loom`/`cellar`/`atlas`)
-    // a caller uses when POSTing to `http://<name>:9030`.
+    // (`git`/`registry`/`registry-ui`/`atlas`) AND the bare internal service-name label
+    // (`loom`/`cellar`/`atlas`) a caller uses when POSTing to `http://<name>:9030`.
     let label = host
         .split(':')
         .next()
@@ -109,7 +109,7 @@ async fn dispatch(State(v): State<Vhosts>, req: Request) -> Response {
         .unwrap_or("");
     let router = match label {
         "git" | "loom" => v.git,
-        "registry" | "cellar" => v.registry,
+        "registry" | "registry-ui" | "cellar" => v.registry,
         "atlas" => v.atlas,
         _ => return (StatusCode::NOT_FOUND, "unknown devplatform host").into_response(),
     };
@@ -174,7 +174,10 @@ async fn build_registry() -> Result<Router, String> {
     let blobs = cellar::blobs::FsBlobStore::open(&config.data_dir)
         .await
         .map_err(|e| format!("open blob volume: {e}"))?;
-    tracing::info!(data_dir = config.data_dir, "registry (cellar) blob volume ready");
+    tracing::info!(
+        data_dir = config.data_dir,
+        "registry (cellar) blob volume ready"
+    );
 
     if config.auth_enabled() {
         tracing::info!(user = config.user, "/v2/ HTTP Basic auth ENABLED");
@@ -209,23 +212,22 @@ async fn build_atlas() -> Result<Router, String> {
     pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
     tracing::info!("atlas store ready");
 
-    let routes: Arc<dyn atlas::routes_src::RoutesSource> =
-        match atlas::config::env_nonempty("ATLAS_ROUTES_DSN") {
-            Some(routes_dsn) => {
-                tracing::info!(
-                    "ATLAS_ROUTES_DSN set — reading the gateway routes table (read-only)"
-                );
-                let src = atlas::routes_src::PgRoutesSource::connect_lazy(&routes_dsn)
-                    .map_err(|e| format!("open routes DSN pool: {e}"))?;
-                Arc::new(src)
-            }
-            None => {
-                tracing::warn!(
+    let routes: Arc<dyn atlas::routes_src::RoutesSource> = match atlas::config::env_nonempty(
+        "ATLAS_ROUTES_DSN",
+    ) {
+        Some(routes_dsn) => {
+            tracing::info!("ATLAS_ROUTES_DSN set — reading the gateway routes table (read-only)");
+            let src = atlas::routes_src::PgRoutesSource::connect_lazy(&routes_dsn)
+                .map_err(|e| format!("open routes DSN pool: {e}"))?;
+            Arc::new(src)
+        }
+        None => {
+            tracing::warn!(
                     "ATLAS_ROUTES_DSN unset — serving the built-in demo route seed (no live route table)"
                 );
-                Arc::new(atlas::routes_src::InMemoryRoutes::demo())
-            }
-        };
+            Arc::new(atlas::routes_src::InMemoryRoutes::demo())
+        }
+    };
 
     let audit = atlas::audit::AuditSink::start(
         env_truthy("AUDIT_ENABLED"),

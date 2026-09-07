@@ -10,16 +10,19 @@
 pub mod catalog;
 pub mod health;
 
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 
 use crate::inventory::auth_slug;
 
 /// Atlas-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
+pub const APP_CSS_PATH: &str = "/assets/atlas-20260821.css";
+
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Embedded design system (Odyssey canonical + Atlas service CSS), inlined into each page's `<style>`.
+/// Embedded design system (Odyssey canonical + Atlas service CSS), served as one immutable asset.
 pub fn app_css() -> &'static str {
     APP_CSS
         .get_or_init(|| {
@@ -29,6 +32,24 @@ pub fn app_css() -> &'static str {
             css
         })
         .as_str()
+}
+
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Cross-subdomain gateway logout (Atlas lives at atlas.w33d.xyz; the IdP is at id.w33d.xyz).
@@ -269,7 +290,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
-<title>{code} {reason} · Atlas</title><style>{css}</style></head>
+<title>{code} {reason} · Atlas</title><link rel="stylesheet" href="{css_path}"></head>
 <body class="page-reading">
 {topbar}
 <main class="reader">
@@ -285,7 +306,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
   <span>Estate ops atlas · part of the Steadholme estate</span>
 </footer>
 </body></html>"#,
-        css = app_css(),
+        css_path = APP_CSS_PATH,
         topbar = topbar("Atlas", "—", "light"),
         code = code,
         reason = esc(reason),

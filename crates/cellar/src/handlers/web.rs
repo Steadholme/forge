@@ -15,8 +15,7 @@ use serde::Deserialize;
 use crate::auth::{self, Identity};
 use crate::error::WebError;
 use crate::handlers::{
-    app_css, esc, fmt_ts, human_size, short_digest, time_ago, userbox, APP_JS, LAYERS_SVG,
-    SHIELD_SVG,
+    esc, fmt_ts, human_size, short_digest, time_ago, userbox, APP_JS, LAYERS_SVG, SHIELD_SVG,
 };
 use crate::model::{
     image_size, index_child_digests, index_entries, index_platforms, is_manifest_list,
@@ -327,7 +326,6 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
         n => format!("{n} repositories"),
     };
     INDEX_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace(
@@ -441,7 +439,6 @@ fn render_repo(
     let sample_tag = tags.first().map(|t| t.tag.as_str()).unwrap_or("latest");
     let pull_cmd = format!("docker pull {host}/{name}:{sample_tag}");
     REPO_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace(
@@ -587,7 +584,6 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
         digest = v.digest
     );
     MANIFEST_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace(

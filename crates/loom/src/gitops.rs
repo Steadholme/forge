@@ -352,6 +352,39 @@ impl GitOps {
             .map(|commit| commit.time)
     }
 
+    /// Commit counts per week over the last `weeks` weeks (oldest first), from HEAD's first-parent
+    /// history. Repositories without commits yield all zeros; the list is always `weeks` long.
+    pub async fn weekly_activity(&self, owner: &str, name: &str, weeks: usize) -> Vec<u32> {
+        let mut buckets = vec![0u32; weeks];
+        let Some(head) = self.head_commit(owner, name).await else {
+            return buckets;
+        };
+        let repo = self.repo_path(owner, name);
+        let since = format!("--since={}.days", weeks * 7);
+        let out = match self
+            .run_git_in_capture(
+                &repo.to_string_lossy(),
+                &["log", "--first-parent", &since, "--format=%at", &head],
+            )
+            .await
+        {
+            Ok(out) if out.status => out,
+            _ => return buckets,
+        };
+        let now = crate::now_secs();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Ok(t) = line.trim().parse::<i64>() else {
+                continue;
+            };
+            let age = (now - t).max(0) as usize;
+            let idx_from_end = age / (7 * 86_400);
+            if idx_from_end < weeks {
+                buckets[weeks - 1 - idx_from_end] += 1;
+            }
+        }
+        buckets
+    }
+
     /// List the local branch names (`refs/heads/*`).
     pub async fn branches(&self, owner: &str, name: &str) -> Vec<String> {
         let path = self.repo_path(owner, name);

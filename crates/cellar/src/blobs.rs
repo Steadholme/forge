@@ -148,12 +148,19 @@ impl BlobStore for MemoryBlobStore {
 
     async fn upload_len(&self, uuid: &str) -> Result<u64, BlobError> {
         let g = self.inner.lock().expect("blob lock poisoned");
-        g.uploads.get(uuid).map(|b| b.len() as u64).ok_or(BlobError::UploadNotFound)
+        g.uploads
+            .get(uuid)
+            .map(|b| b.len() as u64)
+            .ok_or(BlobError::UploadNotFound)
     }
 
     async fn finalize(&self, uuid: &str, expected_digest: &str) -> Result<u64, BlobError> {
         let mut g = self.inner.lock().expect("blob lock poisoned");
-        let bytes = g.uploads.get(uuid).cloned().ok_or(BlobError::UploadNotFound)?;
+        let bytes = g
+            .uploads
+            .get(uuid)
+            .cloned()
+            .ok_or(BlobError::UploadNotFound)?;
         verify(expected_digest, &bytes)?;
         let size = bytes.len() as u64;
         g.blobs.entry(expected_digest.to_string()).or_insert(bytes);
@@ -162,27 +169,50 @@ impl BlobStore for MemoryBlobStore {
     }
 
     async fn cancel(&self, uuid: &str) -> Result<(), BlobError> {
-        self.inner.lock().expect("blob lock poisoned").uploads.remove(uuid);
+        self.inner
+            .lock()
+            .expect("blob lock poisoned")
+            .uploads
+            .remove(uuid);
         Ok(())
     }
 
     async fn put_verified(&self, digest: &str, bytes: &[u8]) -> Result<u64, BlobError> {
         verify(digest, bytes)?;
         let mut g = self.inner.lock().expect("blob lock poisoned");
-        g.blobs.entry(digest.to_string()).or_insert_with(|| bytes.to_vec());
+        g.blobs
+            .entry(digest.to_string())
+            .or_insert_with(|| bytes.to_vec());
         Ok(bytes.len() as u64)
     }
 
     async fn exists(&self, digest: &str) -> Result<bool, BlobError> {
-        Ok(self.inner.lock().expect("blob lock poisoned").blobs.contains_key(digest))
+        Ok(self
+            .inner
+            .lock()
+            .expect("blob lock poisoned")
+            .blobs
+            .contains_key(digest))
     }
 
     async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, BlobError> {
-        Ok(self.inner.lock().expect("blob lock poisoned").blobs.get(digest).cloned())
+        Ok(self
+            .inner
+            .lock()
+            .expect("blob lock poisoned")
+            .blobs
+            .get(digest)
+            .cloned())
     }
 
     async fn delete(&self, digest: &str) -> Result<bool, BlobError> {
-        Ok(self.inner.lock().expect("blob lock poisoned").blobs.remove(digest).is_some())
+        Ok(self
+            .inner
+            .lock()
+            .expect("blob lock poisoned")
+            .blobs
+            .remove(digest)
+            .is_some())
     }
 }
 
@@ -209,7 +239,10 @@ impl FsBlobStore {
         tokio::fs::create_dir_all(&uploads_dir)
             .await
             .map_err(|e| BlobError::Io(format!("create {}: {e}", uploads_dir.display())))?;
-        Ok(Self { blobs_dir, uploads_dir })
+        Ok(Self {
+            blobs_dir,
+            uploads_dir,
+        })
     }
 
     fn upload_path(&self, uuid: &str) -> PathBuf {
@@ -251,9 +284,11 @@ impl FsBlobStore {
                 .await
                 .map_err(|e| BlobError::Io(format!("create blob dir: {e}")))?;
         }
-        let tmp = self
-            .blobs_dir
-            .join(format!(".tmp-publish-{}-{}", std::process::id(), new_uuid()));
+        let tmp = self.blobs_dir.join(format!(
+            ".tmp-publish-{}-{}",
+            std::process::id(),
+            new_uuid()
+        ));
         tokio::fs::write(&tmp, bytes)
             .await
             .map_err(|e| BlobError::Io(format!("write temp blob: {e}")))?;
@@ -294,7 +329,9 @@ impl BlobStore for FsBlobStore {
         f.write_all(data)
             .await
             .map_err(|e| BlobError::Io(format!("append upload: {e}")))?;
-        f.flush().await.map_err(|e| BlobError::Io(format!("flush upload: {e}")))?;
+        f.flush()
+            .await
+            .map_err(|e| BlobError::Io(format!("flush upload: {e}")))?;
         let meta = tokio::fs::metadata(&path)
             .await
             .map_err(|e| BlobError::Io(format!("stat upload: {e}")))?;
@@ -371,7 +408,10 @@ mod tests {
         // Chunked upload: create -> append -> append -> finalize.
         let uuid = store.create_upload().await.unwrap();
         assert_eq!(store.append(&uuid, &payload[..5]).await.unwrap(), 5);
-        assert_eq!(store.append(&uuid, &payload[5..]).await.unwrap(), payload.len() as u64);
+        assert_eq!(
+            store.append(&uuid, &payload[5..]).await.unwrap(),
+            payload.len() as u64
+        );
         assert_eq!(store.upload_len(&uuid).await.unwrap(), payload.len() as u64);
         let size = store.finalize(&uuid, &digest).await.unwrap();
         assert_eq!(size, payload.len() as u64);
@@ -379,7 +419,10 @@ mod tests {
         assert!(store.exists(&digest).await.unwrap());
         assert_eq!(store.get(&digest).await.unwrap().unwrap(), payload);
         // Session consumed.
-        assert!(matches!(store.upload_len(&uuid).await, Err(BlobError::UploadNotFound)));
+        assert!(matches!(
+            store.upload_len(&uuid).await,
+            Err(BlobError::UploadNotFound)
+        ));
     }
 
     #[tokio::test]
@@ -412,7 +455,10 @@ mod tests {
         let store = MemoryBlobStore::new();
         let payload = b"config blob";
         let digest = sha256_digest(payload);
-        assert_eq!(store.put_verified(&digest, payload).await.unwrap(), payload.len() as u64);
+        assert_eq!(
+            store.put_verified(&digest, payload).await.unwrap(),
+            payload.len() as u64
+        );
         assert!(store.exists(&digest).await.unwrap());
     }
 }

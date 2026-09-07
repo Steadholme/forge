@@ -848,21 +848,32 @@ async fn render_settings(
 
     format!(
         r##"{header}
-<section class="card">
-  <div class="card__head"><h2>Repository settings</h2></div>
+<div class="settings">
+<nav class="settings-nav" aria-label="Repository settings">
+  <a class="is-active" href="#settings-general"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>General</a>
+  <a href="#settings-collaborators"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>Collaborators</a>
+  <a href="#settings-webhooks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 16.98h-5.99c-1.1 0-1.95.94-2.48 1.9A4 4 0 0 1 2 17c.01-.7.2-1.4.57-2M6 8a6 6 0 0 1 11.5-2.4M13.3 8.9 9.7 15"/><circle cx="18" cy="17" r="3"/></svg>Webhooks</a>
+  <a href="#settings-deploy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 16.5 12 3l7.5 13.5"/><path d="M8 16.5h8"/><path d="M12 3v18"/></svg>Deploy</a>
+  <a href="#settings-labels"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg>Labels</a>
+  <a href="#settings-milestones"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 21V4h13l-3 4 3 4H5"/></svg>Milestones</a>
+  <a class="settings-nav__danger" href="#settings-danger"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>Danger zone</a>
+</nav>
+<div class="settings-main">
+<section class="card" id="settings-general">
+  <div class="card__head"><h2>General</h2></div>
   <div class="card__body">
     {error_block}
     <form method="post" action="/r/{owner}/{name}/settings">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <div class="field">
         <label for="description">Description</label>
-        <input type="text" id="description" name="description" maxlength="500" value="{desc}" placeholder="Optional one-line summary">
-        <p class="hint hint--muted">Shown on the repository list and the repository home page.</p>
+        <input type="text" id="description" name="description" maxlength="500" value="{desc}">
+        <p class="hint hint--muted">Shown on the repository list and home page</p>
       </div>
       <div class="field">
         <label for="default_branch">Default branch</label>
         {branch_field}
-        <p class="hint hint--muted">What HEAD points at — new clones and the file browser use this branch.</p>
+        <p class="hint hint--muted">Where pull requests merge</p>
       </div>
       <div class="field field--check">
         <label for="required_approvals">Required approvals before web merge</label>
@@ -875,17 +886,19 @@ async fn render_settings(
         <label class="check"><input type="checkbox" name="protect_default_branch" value="on"{protect_checked}> Protect the default branch from direct git push</label>
       </div>
       <div class="actions">
-        <button class="btn btn-primary" type="submit">Save settings</button>
+        <button class="btn btn-primary" type="submit">Save changes</button>
       </div>
     </form>
   </div>
 </section>
 {collaborators_card}
 {webhooks_card}
-{deploy_card}
+<div id="settings-deploy">{deploy_card}</div>
 {labels_card}
 {milestones_card}
-{danger_zone}"##,
+{danger_zone}
+</div>
+</div>"##,
         header = header,
         error_block = error_block,
         owner = esc(&repo.owner_sub),
@@ -921,8 +934,8 @@ fn render_collaborators_card(
     };
     let role_options = render_role_options("write");
     format!(
-        r##"<section class="card collaborator-settings">
-  <div class="card__head"><h2>Collaborators</h2></div>
+        r##"<section class="card collaborator-settings" id="settings-collaborators">
+  <div class="card__head"><h2>Collaborators</h2><span class="tab__count">{count}</span></div>
   <div class="card__body">
     <ul class="collaborator-list">{rows}</ul>
     <form class="collaborator-form collaborator-form--new" method="post" action="/r/{owner}/{name}/settings/collaborators">
@@ -944,6 +957,7 @@ fn render_collaborators_card(
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         csrf = esc(csrf),
+        count = collaborators.len(),
         rows = rows,
         role_options = role_options,
     )
@@ -999,13 +1013,13 @@ fn render_danger_zone(repo: &Repo, who: &Identity, csrf: &str) -> String {
         return String::new();
     }
     format!(
-        r##"<section class="card danger-zone">
-  <div class="card__head"><h2>Danger Zone</h2></div>
+        r##"<section class="card danger-zone" id="settings-danger">
+  <div class="card__head"><h2>Delete repository</h2></div>
   <div class="card__body">
     <form class="delete-repo-form" method="post" action="/r/{owner}/{name}/settings/delete" data-delete-confirm="{name}">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <div class="field">
-        <label for="delete-repo-confirm">Type the repository name to confirm</label>
+        <label for="delete-repo-confirm">Type <code>{name}</code> to confirm</label>
         <input type="text" id="delete-repo-confirm" name="confirm_name" maxlength="64" autocomplete="off" spellcheck="false" data-delete-confirm-input required>
       </div>
       <div class="actions">
@@ -1031,8 +1045,8 @@ fn render_webhooks_card(repo: &Repo, csrf: &str, webhooks: &[Webhook]) -> String
     };
     let create_events = render_webhook_event_checks("new", "push");
     format!(
-        r##"<section class="card webhook-settings">
-  <div class="card__head"><h2>Webhooks</h2></div>
+        r##"<section class="card webhook-settings" id="settings-webhooks">
+  <div class="card__head"><h2>Webhooks</h2><span class="tab__count">{count}</span></div>
   <div class="card__body">
     <ul class="webhook-list">{rows}</ul>
     <form class="webhook-form webhook-form--new" method="post" action="/r/{owner}/{name}/settings/webhooks">
@@ -1061,6 +1075,7 @@ fn render_webhooks_card(repo: &Repo, csrf: &str, webhooks: &[Webhook]) -> String
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         csrf = esc(csrf),
+        count = webhooks.len(),
         rows = rows,
         create_events = create_events,
     )
@@ -1082,7 +1097,9 @@ fn render_webhook_item(repo: &Repo, csrf: &str, webhook: &Webhook) -> String {
     <span class="issue-item__title">{url}</span>
     <span class="state-badge {active_class}">{active_label}</span>
   </div>
-  <div class="issue-item__meta">Events: {event_summary} · created {created}</div>
+  <div class="issue-item__meta">{event_summary} · created {created}</div>
+  <details class="webhook-edit">
+  <summary>Edit</summary>
   <form class="webhook-form webhook-form--edit" method="post" action="/r/{owner}/{name}/settings/webhooks/{id}/update">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <div class="field">
@@ -1102,12 +1119,13 @@ fn render_webhook_item(repo: &Repo, csrf: &str, webhook: &Webhook) -> String {
     </div>
     <div class="actions">
       <button class="btn btn-secondary btn-update-webhook" type="submit">Save webhook</button>
+      <form class="inline-form webhook-delete-form" method="post" action="/r/{owner}/{name}/settings/webhooks/{id}/delete">
+        <input type="hidden" name="csrf_token" value="{csrf}">
+        <button class="btn btn-ghost btn-sm btn-delete-webhook" type="submit">Delete webhook</button>
+      </form>
     </div>
   </form>
-  <form class="inline-form webhook-delete-form" method="post" action="/r/{owner}/{name}/settings/webhooks/{id}/delete">
-    <input type="hidden" name="csrf_token" value="{csrf}">
-    <button class="btn btn-ghost btn-sm btn-delete-webhook" type="submit">Delete webhook</button>
-  </form>
+  </details>
 </li>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
@@ -1183,8 +1201,8 @@ fn render_labels_card(repo: &Repo, csrf: &str, labels: &[Label]) -> String {
             .collect::<String>()
     };
     format!(
-        r##"<section class="card">
-  <div class="card__head"><h2>Labels</h2></div>
+        r##"<section class="card" id="settings-labels">
+  <div class="card__head"><h2>Labels</h2><span class="tab__count">{count}</span></div>
   <div class="card__body">
     <ul class="issue-list">{list}</ul>
     <form method="post" action="/r/{owner}/{name}/settings/labels">
@@ -1206,6 +1224,7 @@ fn render_labels_card(repo: &Repo, csrf: &str, labels: &[Label]) -> String {
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         csrf = esc(csrf),
+        count = labels.len(),
         list = list,
     )
 }
@@ -1277,8 +1296,8 @@ async fn render_milestones_card(
         rows
     };
     format!(
-        r##"<section class="card">
-  <div class="card__head"><h2>Milestones</h2></div>
+        r##"<section class="card" id="settings-milestones">
+  <div class="card__head"><h2>Milestones</h2><span class="tab__count">{count}</span></div>
   <div class="card__body">
     <ul class="issue-list">{list}</ul>
     <form method="post" action="/r/{owner}/{name}/settings/milestones">
@@ -1300,6 +1319,7 @@ async fn render_milestones_card(
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         csrf = esc(csrf),
+        count = milestones.len(),
         list = list,
     )
 }

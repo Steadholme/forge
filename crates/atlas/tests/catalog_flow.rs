@@ -45,6 +45,7 @@ async fn full_catalog_flow_in_memory() {
     let (status, body) = call(&state, get_auth("/", "u_op", "op@hf")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Estate Catalog"));
+    assert!(body.contains(&format!(r#"href="{}""#, atlas::handlers::APP_CSS_PATH)));
     // Demo seed groups by upstream service: inkwell, cellar, aperture, etc. are present.
     assert!(body.contains("inkwell"), "inkwell service discovered");
     assert!(body.contains("cellar"), "cellar service discovered");
@@ -155,6 +156,30 @@ async fn full_catalog_flow_in_memory() {
     assert!(v["routes_total"].as_u64().unwrap() >= 20);
     assert_eq!(v["routes_available"], true);
     assert_eq!(v["beacon_reached"], false);
+}
+
+#[tokio::test]
+async fn stylesheet_is_public_and_immutable() {
+    let response = app(build_dev_state())
+        .oneshot(get(atlas::handlers::APP_CSS_PATH))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap(),
+        "nosniff"
+    );
 }
 
 #[tokio::test]

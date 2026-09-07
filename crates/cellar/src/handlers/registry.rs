@@ -41,7 +41,9 @@ const H_API_VERSION: &str = "docker-distribution-api-version";
 /// `docker login` succeeds).
 pub async fn version_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match authenticate(&state, &headers).await {
-        Principal::Human | Principal::Robot(_) => build(StatusCode::OK, vec![json_ct()], b"{}".to_vec()),
+        Principal::Human | Principal::Robot(_) => {
+            build(StatusCode::OK, vec![json_ct()], b"{}".to_vec())
+        }
         _ => RegError::Unauthorized.into_response(),
     }
 }
@@ -238,7 +240,9 @@ async fn handle(
             read_guard(principal)?;
             valid_name(&name)?;
             if !state.store.repo_exists(&name).await? {
-                return Err(RegError::NameUnknown(format!("repository {name} not found")));
+                return Err(RegError::NameUnknown(format!(
+                    "repository {name} not found"
+                )));
             }
             let tags: Vec<String> = state
                 .store
@@ -503,7 +507,9 @@ fn valid_name(name: &str) -> Result<(), RegError> {
     if is_valid_name(name) {
         Ok(())
     } else {
-        Err(RegError::NameInvalid(format!("invalid repository name {name}")))
+        Err(RegError::NameInvalid(format!(
+            "invalid repository name {name}"
+        )))
     }
 }
 
@@ -529,11 +535,18 @@ fn build(status: StatusCode, extra: Vec<(HeaderName, String)>, body: Vec<u8>) ->
 }
 
 fn json_ct() -> (HeaderName, String) {
-    (header::CONTENT_TYPE, "application/json; charset=utf-8".to_string())
+    (
+        header::CONTENT_TYPE,
+        "application/json; charset=utf-8".to_string(),
+    )
 }
 
 fn json_ok(value: serde_json::Value) -> Result<Response, RegError> {
-    Ok(build(StatusCode::OK, vec![json_ct()], value.to_string().into_bytes()))
+    Ok(build(
+        StatusCode::OK,
+        vec![json_ct()],
+        value.to_string().into_bytes(),
+    ))
 }
 
 /// `202 Accepted` for an open upload session.
@@ -557,7 +570,10 @@ fn created_blob(name: &str, digest: &str) -> Result<Response, RegError> {
         StatusCode::CREATED,
         vec![
             (header::LOCATION, format!("/v2/{name}/blobs/{digest}")),
-            (HeaderName::from_static(H_CONTENT_DIGEST), digest.to_string()),
+            (
+                HeaderName::from_static(H_CONTENT_DIGEST),
+                digest.to_string(),
+            ),
         ],
         Vec::new(),
     ))
@@ -569,7 +585,10 @@ fn created_manifest(name: &str, digest: &str) -> Result<Response, RegError> {
         StatusCode::CREATED,
         vec![
             (header::LOCATION, format!("/v2/{name}/manifests/{digest}")),
-            (HeaderName::from_static(H_CONTENT_DIGEST), digest.to_string()),
+            (
+                HeaderName::from_static(H_CONTENT_DIGEST),
+                digest.to_string(),
+            ),
         ],
         Vec::new(),
     ))
@@ -640,17 +659,29 @@ mod tests {
 
     #[test]
     fn parse_blob_and_manifest_routes() {
-        assert!(matches!(parse_route("library/alpine/blobs/sha256:abc"), Route::Blob { name, digest } if name=="library/alpine" && digest=="sha256:abc"));
-        assert!(matches!(parse_route("alpine/manifests/latest"), Route::Manifest { name, reference } if name=="alpine" && reference=="latest"));
+        assert!(
+            matches!(parse_route("library/alpine/blobs/sha256:abc"), Route::Blob { name, digest } if name=="library/alpine" && digest=="sha256:abc")
+        );
+        assert!(
+            matches!(parse_route("alpine/manifests/latest"), Route::Manifest { name, reference } if name=="alpine" && reference=="latest")
+        );
         assert!(matches!(parse_route("_catalog"), Route::Catalog));
-        assert!(matches!(parse_route("alpine/tags/list"), Route::TagsList { name } if name=="alpine"));
+        assert!(
+            matches!(parse_route("alpine/tags/list"), Route::TagsList { name } if name=="alpine")
+        );
     }
 
     #[test]
     fn parse_upload_routes() {
-        assert!(matches!(parse_route("alpine/blobs/uploads"), Route::UploadInit { name } if name=="alpine"));
-        assert!(matches!(parse_route("alpine/blobs/uploads/"), Route::UploadInit { name } if name=="alpine"));
-        assert!(matches!(parse_route("team/app/blobs/uploads/abc-123"), Route::UploadSession { name, uuid } if name=="team/app" && uuid=="abc-123"));
+        assert!(
+            matches!(parse_route("alpine/blobs/uploads"), Route::UploadInit { name } if name=="alpine")
+        );
+        assert!(
+            matches!(parse_route("alpine/blobs/uploads/"), Route::UploadInit { name } if name=="alpine")
+        );
+        assert!(
+            matches!(parse_route("team/app/blobs/uploads/abc-123"), Route::UploadSession { name, uuid } if name=="team/app" && uuid=="abc-123")
+        );
     }
 
     #[test]

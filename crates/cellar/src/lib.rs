@@ -55,6 +55,7 @@ pub struct AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route(handlers::APP_CSS_PATH, get(handlers::app_css_asset))
         // --- SSO web console ---
         .route("/", get(handlers::web::index))
         .route("/r/{*name}", get(handlers::web::repo_detail))
@@ -71,7 +72,10 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/retention/create", post(handlers::retention::create))
         .route("/admin/retention/toggle", post(handlers::retention::toggle))
         .route("/admin/retention/delete", post(handlers::retention::delete))
-        .route("/admin/retention/preview", post(handlers::retention::preview))
+        .route(
+            "/admin/retention/preview",
+            post(handlers::retention::preview),
+        )
         .route(
             "/admin/retention/preview.json",
             post(handlers::retention::preview_json),
@@ -146,14 +150,25 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
             Arc::new(pg)
         }
         "memory" => Arc::new(InMemoryStore::new()),
-        other => return Err(format!("unknown CELLAR_STORE={other} (use memory|postgres)")),
+        other => {
+            return Err(format!(
+                "unknown CELLAR_STORE={other} (use memory|postgres)"
+            ))
+        }
     };
 
-    let default_blobs = if store_kind == "postgres" { "fs" } else { "memory" };
+    let default_blobs = if store_kind == "postgres" {
+        "fs"
+    } else {
+        "memory"
+    };
     let blobs_kind = std::env::var("CELLAR_BLOBS").unwrap_or_else(|_| default_blobs.to_string());
     let blobs: Arc<dyn BlobStore> = match blobs_kind.as_str() {
         "fs" => {
-            tracing::info!(data_dir = config.data_dir, "CELLAR_BLOBS=fs — content-addressed volume");
+            tracing::info!(
+                data_dir = config.data_dir,
+                "CELLAR_BLOBS=fs — content-addressed volume"
+            );
             Arc::new(
                 FsBlobStore::open(&config.data_dir)
                     .await

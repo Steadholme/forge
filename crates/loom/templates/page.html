@@ -2,21 +2,26 @@
 <html lang="en"{{THEME}}>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="{{COLOR_SCHEME}}">
   <title>{{TITLE}} · Loom · Steadholme</title>
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="/assets/loom-20260907.css">
 </head>
-<body class="page-console" data-wire-nav="#loom-main">
-  <header class="appbar">{{USERBOX}}</header>
+<body class="page-console page-loom">
+  <header class="appbar"><div class="appbar__inner">{{USERBOX}}</div></header>
 
   <main class="console" id="loom-main">
     {{BODY}}
   </main>
 
   <footer class="site-foot">
-    <span>Steadholme · Loom</span>
-    <span>Git forge · part of the Steadholme estate</span>
+    <div class="site-foot__inner">
+      <span class="site-foot__brand">Steadholme · Loom</span>
+      <nav class="site-foot__links" aria-label="Estate">
+        <a href="https://status.w33d.xyz/status">Status</a>
+        <a href="https://w33d.xyz">All apps</a>
+      </nav>
+    </div>
   </footer>
   <script>{{JS}}</script>
 </body>

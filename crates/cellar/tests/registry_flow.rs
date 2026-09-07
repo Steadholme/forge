@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
+use cellar::blobs::MemoryBlobStore;
 use cellar::config::Config;
 use cellar::digest::sha256_digest;
-use cellar::{app, build_dev_state, AppState};
-use cellar::blobs::MemoryBlobStore;
 use cellar::store::InMemoryStore;
+use cellar::{app, build_dev_state, AppState};
 use tower::ServiceExt;
 
 struct Resp {
@@ -41,8 +41,15 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
     let headers = res.headers().clone();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
-    Resp { status, headers, body }
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Resp {
+        status,
+        headers,
+        body,
+    }
 }
 
 fn req(method: &str, uri: &str, auth: Option<&str>, body: Vec<u8>) -> Request<Body> {
@@ -58,14 +65,28 @@ async fn push_blob(app: &axum::Router, name: &str, payload: &[u8], auth: Option<
     let digest = sha256_digest(payload);
 
     // POST init -> 202 + Location.
-    let init = send(app, req("POST", &format!("/v2/{name}/blobs/uploads/"), auth, Vec::new())).await;
+    let init = send(
+        app,
+        req(
+            "POST",
+            &format!("/v2/{name}/blobs/uploads/"),
+            auth,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(init.status, StatusCode::ACCEPTED, "init: {}", init.text());
     let location = init.header("location");
     assert!(location.contains("/blobs/uploads/"), "location {location}");
 
     // PATCH the bytes.
     let patch = send(app, req("PATCH", &location, auth, payload.to_vec())).await;
-    assert_eq!(patch.status, StatusCode::ACCEPTED, "patch: {}", patch.text());
+    assert_eq!(
+        patch.status,
+        StatusCode::ACCEPTED,
+        "patch: {}",
+        patch.text()
+    );
 
     // PUT ?digest finalizes.
     let put_uri = format!("{location}?digest={}", encode(&digest));
@@ -97,13 +118,31 @@ async fn full_push_pull_lifecycle() {
     let layer_digest = push_blob(&app, name, &layer_blob, None).await;
 
     // 3. HEAD both blobs -> present.
-    let head = send(&app, req("HEAD", &format!("/v2/{name}/blobs/{layer_digest}"), None, Vec::new())).await;
+    let head = send(
+        &app,
+        req(
+            "HEAD",
+            &format!("/v2/{name}/blobs/{layer_digest}"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(head.status, StatusCode::OK);
     assert_eq!(head.header("content-length"), layer_blob.len().to_string());
     assert_eq!(head.header("docker-content-digest"), layer_digest);
 
     // 4. GET the layer blob back -> exact bytes.
-    let got = send(&app, req("GET", &format!("/v2/{name}/blobs/{layer_digest}"), None, Vec::new())).await;
+    let got = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v2/{name}/blobs/{layer_digest}"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(got.status, StatusCode::OK);
     assert_eq!(got.body, layer_blob);
 
@@ -121,33 +160,75 @@ async fn full_push_pull_lifecycle() {
         Request::builder()
             .method("PUT")
             .uri(format!("/v2/{name}/manifests/latest"))
-            .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .header(
+                header::CONTENT_TYPE,
+                "application/vnd.oci.image.manifest.v1+json",
+            )
             .body(Body::from(manifest.clone()))
             .unwrap(),
     )
     .await;
-    assert_eq!(put_m.status, StatusCode::CREATED, "put manifest: {}", put_m.text());
+    assert_eq!(
+        put_m.status,
+        StatusCode::CREATED,
+        "put manifest: {}",
+        put_m.text()
+    );
     assert_eq!(put_m.header("docker-content-digest"), manifest_digest);
 
     // 6. GET the manifest by tag -> exact bytes + stored media type + digest header.
-    let get_m = send(&app, req("GET", &format!("/v2/{name}/manifests/latest"), None, Vec::new())).await;
+    let get_m = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v2/{name}/manifests/latest"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(get_m.status, StatusCode::OK);
     assert_eq!(get_m.body, manifest.as_bytes());
-    assert_eq!(get_m.header("content-type"), "application/vnd.oci.image.manifest.v1+json");
+    assert_eq!(
+        get_m.header("content-type"),
+        "application/vnd.oci.image.manifest.v1+json"
+    );
     assert_eq!(get_m.header("docker-content-digest"), manifest_digest);
 
     // 6b. HEAD the manifest by tag (docker pull's existence probe).
-    let head_m = send(&app, req("HEAD", &format!("/v2/{name}/manifests/latest"), None, Vec::new())).await;
+    let head_m = send(
+        &app,
+        req(
+            "HEAD",
+            &format!("/v2/{name}/manifests/latest"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(head_m.status, StatusCode::OK);
     assert_eq!(head_m.header("docker-content-digest"), manifest_digest);
 
     // 6c. GET the manifest BY DIGEST too.
-    let by_digest = send(&app, req("GET", &format!("/v2/{name}/manifests/{manifest_digest}"), None, Vec::new())).await;
+    let by_digest = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v2/{name}/manifests/{manifest_digest}"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(by_digest.status, StatusCode::OK);
     assert_eq!(by_digest.body, manifest.as_bytes());
 
     // 7. tags/list + _catalog.
-    let tags = send(&app, req("GET", &format!("/v2/{name}/tags/list"), None, Vec::new())).await;
+    let tags = send(
+        &app,
+        req("GET", &format!("/v2/{name}/tags/list"), None, Vec::new()),
+    )
+    .await;
     assert_eq!(tags.status, StatusCode::OK);
     assert!(tags.text().contains("\"latest\""));
     assert!(tags.text().contains(name));
@@ -159,6 +240,9 @@ async fn full_push_pull_lifecycle() {
     // 8. The SSO web console lists the repo and its detail page renders the tag.
     let index = send(&app, req("GET", "/", None, Vec::new())).await;
     assert_eq!(index.status, StatusCode::OK);
+    assert!(index
+        .text()
+        .contains(&format!(r#"href="{}""#, cellar::handlers::APP_CSS_PATH)));
     assert!(index.text().contains(name));
 
     let detail = send(&app, req("GET", &format!("/r/{name}"), None, Vec::new())).await;
@@ -166,6 +250,23 @@ async fn full_push_pull_lifecycle() {
     assert!(detail.text().contains("latest"));
     // Image size (config + layer) is rendered, not zero.
     assert!(detail.text().contains("docker pull"));
+}
+
+#[tokio::test]
+async fn stylesheet_is_public_and_immutable() {
+    let app = app(build_dev_state());
+    let css = send(
+        &app,
+        req("GET", cellar::handlers::APP_CSS_PATH, None, Vec::new()),
+    )
+    .await;
+    assert_eq!(css.status, StatusCode::OK);
+    assert_eq!(css.header("content-type"), "text/css; charset=utf-8");
+    assert_eq!(
+        css.header("cache-control"),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(css.header("x-content-type-options"), "nosniff");
 }
 
 /// PUT a manifest body at `reference` with an explicit `Content-Type`.
@@ -236,18 +337,41 @@ async fn multi_arch_index_push_pull() {
     );
     let index_digest = sha256_digest(index.as_bytes());
     let put_idx = put_manifest(&app, name, "latest", OCI_INDEX, &index).await;
-    assert_eq!(put_idx.status, StatusCode::CREATED, "index put: {}", put_idx.text());
+    assert_eq!(
+        put_idx.status,
+        StatusCode::CREATED,
+        "index put: {}",
+        put_idx.text()
+    );
     assert_eq!(put_idx.header("docker-content-digest"), index_digest);
 
     // 3. GET the index by tag -> exact bytes, stored index media type, digest header.
-    let get_idx = send(&app, req("GET", &format!("/v2/{name}/manifests/latest"), None, Vec::new())).await;
+    let get_idx = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v2/{name}/manifests/latest"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(get_idx.status, StatusCode::OK);
     assert_eq!(get_idx.body, index.as_bytes());
     assert_eq!(get_idx.header("content-type"), OCI_INDEX);
     assert_eq!(get_idx.header("docker-content-digest"), index_digest);
 
     // 3b. HEAD the index by tag (docker pull's existence probe) preserves the index media type.
-    let head_idx = send(&app, req("HEAD", &format!("/v2/{name}/manifests/latest"), None, Vec::new())).await;
+    let head_idx = send(
+        &app,
+        req(
+            "HEAD",
+            &format!("/v2/{name}/manifests/latest"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(head_idx.status, StatusCode::OK);
     assert_eq!(head_idx.header("content-type"), OCI_INDEX);
 
@@ -261,7 +385,16 @@ async fn multi_arch_index_push_pull() {
         .and_then(|m| m["digest"].as_str())
         .unwrap();
     assert_eq!(picked, arm64_digest);
-    let child = send(&app, req("GET", &format!("/v2/{name}/manifests/{picked}"), None, Vec::new())).await;
+    let child = send(
+        &app,
+        req(
+            "GET",
+            &format!("/v2/{name}/manifests/{picked}"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(child.status, StatusCode::OK);
     assert_eq!(child.body, arm64.as_bytes());
     assert_eq!(child.header("content-type"), OCI_MANIFEST);
@@ -273,16 +406,33 @@ async fn multi_arch_index_push_pull() {
         amdlen = amd64.len(),
     );
     let put_list = put_manifest(&app, name, "listtag", DOCKER_LIST, &list).await;
-    assert_eq!(put_list.status, StatusCode::CREATED, "list put: {}", put_list.text());
+    assert_eq!(
+        put_list.status,
+        StatusCode::CREATED,
+        "list put: {}",
+        put_list.text()
+    );
 
     // 6. The web console surfaces the multi-arch tag: badge, platforms, aggregate size (2100+3150).
     let detail = send(&app, req("GET", &format!("/r/{name}"), None, Vec::new())).await;
     assert_eq!(detail.status, StatusCode::OK);
     let html = detail.text();
-    assert!(html.contains("multi-arch"), "detail missing multi-arch badge");
-    assert!(html.contains("linux/amd64"), "detail missing amd64 platform");
-    assert!(html.contains("linux/arm64"), "detail missing arm64 platform");
-    assert!(html.contains("5.1 KB"), "detail missing aggregate multi-arch size: {html}");
+    assert!(
+        html.contains("multi-arch"),
+        "detail missing multi-arch badge"
+    );
+    assert!(
+        html.contains("linux/amd64"),
+        "detail missing amd64 platform"
+    );
+    assert!(
+        html.contains("linux/arm64"),
+        "detail missing arm64 platform"
+    );
+    assert!(
+        html.contains("5.1 KB"),
+        "detail missing aggregate multi-arch size: {html}"
+    );
 }
 
 /// A non-manifest `Content-Type` on a manifest `PUT` is rejected as MANIFEST_INVALID.
@@ -299,7 +449,11 @@ async fn manifest_put_rejects_non_manifest_content_type() {
 async fn pull_unknown_manifest_is_404() {
     let app = app(build_dev_state());
     // Repo must exist for tags/list 404 distinction; push nothing, just query a manifest.
-    let r = send(&app, req("GET", "/v2/ghost/manifests/latest", None, Vec::new())).await;
+    let r = send(
+        &app,
+        req("GET", "/v2/ghost/manifests/latest", None, Vec::new()),
+    )
+    .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     assert!(r.text().contains("MANIFEST_UNKNOWN"));
 }
@@ -307,7 +461,11 @@ async fn pull_unknown_manifest_is_404() {
 #[tokio::test]
 async fn invalid_repo_name_is_rejected() {
     let app = app(build_dev_state());
-    let r = send(&app, req("POST", "/v2/BadName/blobs/uploads/", None, Vec::new())).await;
+    let r = send(
+        &app,
+        req("POST", "/v2/BadName/blobs/uploads/", None, Vec::new()),
+    )
+    .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(r.text().contains("NAME_INVALID"));
 }
@@ -316,12 +474,34 @@ async fn invalid_repo_name_is_rejected() {
 async fn digest_mismatch_on_finalize_is_400() {
     let app = app(build_dev_state());
     let name = "app";
-    let init = send(&app, req("POST", &format!("/v2/{name}/blobs/uploads/"), None, Vec::new())).await;
+    let init = send(
+        &app,
+        req(
+            "POST",
+            &format!("/v2/{name}/blobs/uploads/"),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     let location = init.header("location");
-    send(&app, req("PATCH", &location, None, b"the real bytes".to_vec())).await;
+    send(
+        &app,
+        req("PATCH", &location, None, b"the real bytes".to_vec()),
+    )
+    .await;
     // Claim the wrong digest.
     let wrong = sha256_digest(b"some other bytes");
-    let put = send(&app, req("PUT", &format!("{location}?digest={}", encode(&wrong)), None, Vec::new())).await;
+    let put = send(
+        &app,
+        req(
+            "PUT",
+            &format!("{location}?digest={}", encode(&wrong)),
+            None,
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(put.status, StatusCode::BAD_REQUEST);
     assert!(put.text().contains("DIGEST_INVALID"));
 }
@@ -353,7 +533,11 @@ async fn basic_auth_gate() {
     assert_eq!(with_cred.status, StatusCode::OK);
 
     // 3. Push without creds is denied at the very first step.
-    let init_anon = send(&app, req("POST", "/v2/app/blobs/uploads/", None, Vec::new())).await;
+    let init_anon = send(
+        &app,
+        req("POST", "/v2/app/blobs/uploads/", None, Vec::new()),
+    )
+    .await;
     assert_eq!(init_anon.status, StatusCode::UNAUTHORIZED);
 
     // 4. Push WITH creds succeeds.
@@ -361,10 +545,23 @@ async fn basic_auth_gate() {
     assert!(digest.starts_with("sha256:"));
 
     // 5. Anonymous READ of an existing blob is allowed (public pull).
-    let anon_read = send(&app, req("HEAD", &format!("/v2/app/blobs/{digest}"), None, Vec::new())).await;
+    let anon_read = send(
+        &app,
+        req("HEAD", &format!("/v2/app/blobs/{digest}"), None, Vec::new()),
+    )
+    .await;
     assert_eq!(anon_read.status, StatusCode::OK);
 
     // 6. A WRONG credential on a read is rejected (not silently treated as anonymous).
-    let bad_read = send(&app, req("HEAD", &format!("/v2/app/blobs/{digest}"), Some(bad), Vec::new())).await;
+    let bad_read = send(
+        &app,
+        req(
+            "HEAD",
+            &format!("/v2/app/blobs/{digest}"),
+            Some(bad),
+            Vec::new(),
+        ),
+    )
+    .await;
     assert_eq!(bad_read.status, StatusCode::UNAUTHORIZED);
 }

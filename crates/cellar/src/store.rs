@@ -55,7 +55,11 @@ pub trait Store: Send + Sync {
     async fn put_manifest(&self, m: &ManifestRec) -> Result<(), StoreError>;
 
     /// Fetch a manifest by repo + digest.
-    async fn get_manifest(&self, repo: &str, digest: &str) -> Result<Option<ManifestRec>, StoreError>;
+    async fn get_manifest(
+        &self,
+        repo: &str,
+        digest: &str,
+    ) -> Result<Option<ManifestRec>, StoreError>;
 
     /// All manifests in a repo (for web size aggregation).
     async fn manifests_for(&self, repo: &str) -> Result<Vec<ManifestRec>, StoreError>;
@@ -65,7 +69,13 @@ pub trait Store: Send + Sync {
     async fn delete_manifest(&self, repo: &str, digest: &str) -> Result<bool, StoreError>;
 
     /// Upsert a tag pointer (last-writer-wins on `(repo,tag)`).
-    async fn put_tag(&self, repo: &str, tag: &str, manifest_digest: &str, now: i64) -> Result<(), StoreError>;
+    async fn put_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+        manifest_digest: &str,
+        now: i64,
+    ) -> Result<(), StoreError>;
 
     /// Resolve a tag to its manifest digest.
     async fn get_tag(&self, repo: &str, tag: &str) -> Result<Option<String>, StoreError>;
@@ -181,13 +191,15 @@ impl Store for InMemoryStore {
 
     async fn blob_size(&self, digest: &str) -> Result<Option<i64>, StoreError> {
         let g = self.inner.lock().expect("store lock poisoned");
-        Ok(g.blobs.iter().find(|(d, _, _)| d == digest).map(|(_, s, _)| *s))
+        Ok(g.blobs
+            .iter()
+            .find(|(d, _, _)| d == digest)
+            .map(|(_, s, _)| *s))
     }
 
     async fn list_blobs(&self) -> Result<Vec<BlobRec>, StoreError> {
         let g = self.inner.lock().expect("store lock poisoned");
-        Ok(g
-            .blobs
+        Ok(g.blobs
             .iter()
             .map(|(digest, size, created_at)| BlobRec {
                 digest: digest.clone(),
@@ -216,10 +228,13 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn get_manifest(&self, repo: &str, digest: &str) -> Result<Option<ManifestRec>, StoreError> {
+    async fn get_manifest(
+        &self,
+        repo: &str,
+        digest: &str,
+    ) -> Result<Option<ManifestRec>, StoreError> {
         let g = self.inner.lock().expect("store lock poisoned");
-        Ok(g
-            .manifests
+        Ok(g.manifests
             .iter()
             .find(|m| m.repo == repo && m.digest == digest)
             .cloned())
@@ -227,17 +242,28 @@ impl Store for InMemoryStore {
 
     async fn manifests_for(&self, repo: &str) -> Result<Vec<ManifestRec>, StoreError> {
         let g = self.inner.lock().expect("store lock poisoned");
-        Ok(g.manifests.iter().filter(|m| m.repo == repo).cloned().collect())
+        Ok(g.manifests
+            .iter()
+            .filter(|m| m.repo == repo)
+            .cloned()
+            .collect())
     }
 
     async fn delete_manifest(&self, repo: &str, digest: &str) -> Result<bool, StoreError> {
         let mut g = self.inner.lock().expect("store lock poisoned");
         let before = g.manifests.len();
-        g.manifests.retain(|m| !(m.repo == repo && m.digest == digest));
+        g.manifests
+            .retain(|m| !(m.repo == repo && m.digest == digest));
         Ok(g.manifests.len() != before)
     }
 
-    async fn put_tag(&self, repo: &str, tag: &str, manifest_digest: &str, now: i64) -> Result<(), StoreError> {
+    async fn put_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+        manifest_digest: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
         let mut g = self.inner.lock().expect("store lock poisoned");
         if let Some(t) = g.tags.iter_mut().find(|t| t.repo == repo && t.tag == tag) {
             t.manifest_digest = manifest_digest.to_string();
@@ -255,8 +281,7 @@ impl Store for InMemoryStore {
 
     async fn get_tag(&self, repo: &str, tag: &str) -> Result<Option<String>, StoreError> {
         let g = self.inner.lock().expect("store lock poisoned");
-        Ok(g
-            .tags
+        Ok(g.tags
             .iter()
             .find(|t| t.repo == repo && t.tag == tag)
             .map(|t| t.manifest_digest.clone()))
@@ -636,7 +661,11 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn get_manifest(&self, repo: &str, digest: &str) -> Result<Option<ManifestRec>, StoreError> {
+    async fn get_manifest(
+        &self,
+        repo: &str,
+        digest: &str,
+    ) -> Result<Option<ManifestRec>, StoreError> {
         let row = sqlx::query(&format!(
             "SELECT {MANIFEST_COLS} FROM manifests WHERE repo = $1 AND digest = $2"
         ))
@@ -645,16 +674,24 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(be)?;
-        row.as_ref().map(Self::manifest_from_row).transpose().map_err(be)
+        row.as_ref()
+            .map(Self::manifest_from_row)
+            .transpose()
+            .map_err(be)
     }
 
     async fn manifests_for(&self, repo: &str) -> Result<Vec<ManifestRec>, StoreError> {
-        let rows = sqlx::query(&format!("SELECT {MANIFEST_COLS} FROM manifests WHERE repo = $1"))
-            .bind(repo)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(be)?;
-        rows.iter().map(Self::manifest_from_row).collect::<Result<_, _>>().map_err(be)
+        let rows = sqlx::query(&format!(
+            "SELECT {MANIFEST_COLS} FROM manifests WHERE repo = $1"
+        ))
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(be)?;
+        rows.iter()
+            .map(Self::manifest_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(be)
     }
 
     async fn delete_manifest(&self, repo: &str, digest: &str) -> Result<bool, StoreError> {
@@ -667,7 +704,13 @@ impl Store for PgStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn put_tag(&self, repo: &str, tag: &str, manifest_digest: &str, now: i64) -> Result<(), StoreError> {
+    async fn put_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+        manifest_digest: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO tags (repo, tag, manifest_digest, updated_at) VALUES ($1, $2, $3, $4) \
              ON CONFLICT (repo, tag) DO UPDATE SET \
@@ -843,7 +886,10 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(be)?;
-        row.as_ref().map(Self::robot_from_row).transpose().map_err(be)
+        row.as_ref()
+            .map(Self::robot_from_row)
+            .transpose()
+            .map_err(be)
     }
 
     async fn set_robot_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError> {
@@ -907,9 +953,15 @@ mod tests {
         assert_eq!(s.blob_size("sha256:bb").await.unwrap(), None);
 
         s.ensure_repository("library/alpine", 1).await.unwrap();
-        s.put_manifest(&manifest("library/alpine", "sha256:m1")).await.unwrap();
+        s.put_manifest(&manifest("library/alpine", "sha256:m1"))
+            .await
+            .unwrap();
         assert_eq!(
-            s.get_manifest("library/alpine", "sha256:m1").await.unwrap().unwrap().digest,
+            s.get_manifest("library/alpine", "sha256:m1")
+                .await
+                .unwrap()
+                .unwrap()
+                .digest,
             "sha256:m1"
         );
     }
@@ -922,8 +974,17 @@ mod tests {
         s.put_tag("app", "v2", "sha256:m2", 2).await.unwrap();
         // last-writer-wins on the same tag
         s.put_tag("app", "latest", "sha256:m3", 3).await.unwrap();
-        assert_eq!(s.get_tag("app", "latest").await.unwrap().unwrap(), "sha256:m3");
-        let tags: Vec<String> = s.tags_for("app").await.unwrap().into_iter().map(|t| t.tag).collect();
+        assert_eq!(
+            s.get_tag("app", "latest").await.unwrap().unwrap(),
+            "sha256:m3"
+        );
+        let tags: Vec<String> = s
+            .tags_for("app")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.tag)
+            .collect();
         assert_eq!(tags, vec!["latest", "v2"]);
         assert!(s.delete_tag("app", "v2").await.unwrap());
         assert!(!s.delete_tag("app", "v2").await.unwrap());
@@ -938,7 +999,7 @@ mod tests {
         let stat = s.pull_stat("app").await.unwrap().unwrap();
         assert_eq!(stat.pulls, 2);
         assert_eq!(stat.last_pulled_at, 200); // stamped with the latest pull
-        // A different repo is tracked independently.
+                                              // A different repo is tracked independently.
         assert_eq!(s.pull_stat("other").await.unwrap(), None);
     }
 
@@ -980,11 +1041,21 @@ mod tests {
         s.create_robot(&robot).await.unwrap();
         // Duplicate name is rejected.
         assert!(s.create_robot(&robot).await.is_err());
-        assert_eq!(s.get_robot_by_name("ci").await.unwrap().unwrap().id, "rob-1");
+        assert_eq!(
+            s.get_robot_by_name("ci").await.unwrap().unwrap().id,
+            "rob-1"
+        );
         assert_eq!(s.get_robot_by_name("missing").await.unwrap(), None);
         // Touch stamps last_used_at.
         s.touch_robot("rob-1", 999).await.unwrap();
-        assert_eq!(s.get_robot_by_name("ci").await.unwrap().unwrap().last_used_at, 999);
+        assert_eq!(
+            s.get_robot_by_name("ci")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at,
+            999
+        );
         // Disable + delete.
         assert!(s.set_robot_enabled("rob-1", false).await.unwrap());
         assert!(!s.get_robot_by_name("ci").await.unwrap().unwrap().enabled);

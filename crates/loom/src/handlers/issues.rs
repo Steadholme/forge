@@ -19,9 +19,7 @@ use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::handlers::repos::{can_write_repo, load_visible_repo, render_repo_header};
 use crate::handlers::{
-    accepts_json, esc, fmt_rel, fmt_ts, html_with_csrf, is_valid_reaction_emoji, page,
-    reaction_summaries_json, redirect, render_reactions, state_icon, REACTION_TARGET_COMMENT,
-    REACTION_TARGET_ISSUE,
+    REACTION_TARGET_COMMENT, REACTION_TARGET_ISSUE, accepts_json, esc, fmt_rel, fmt_ts, html_with_csrf, initials, is_valid_reaction_emoji, page, reaction_summaries_json, redirect, render_reactions, state_icon,
 };
 use crate::model::{Issue, IssueComment, Label, Milestone, ReactionSummary, Repo};
 use crate::webhooks;
@@ -988,7 +986,6 @@ async fn render_list(
                <div class=\"empty\">\
                  <svg class=\"empty__icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 8v4M12 16h.01\"/></svg>\
                  <div class=\"empty__title\">No issues to show</div>\
-                 <div class=\"empty__text\">Nothing matches this view yet. Open one from the form, or clear the filters.</div>\
                  <a class=\"btn btn-secondary btn-sm\" href=\"/r/{owner}/{name}/issues\">View all issues</a>\
                </div>\
              </li>",
@@ -1025,10 +1022,11 @@ async fn render_list(
     format!(
         r##"{header}
 	<div class="list-toolbar">
+	  {tabs}
 	  <span class="list-toolbar__fill"></span>
 	  {filters}
 	  <details class="popbtn popbtn--new"{open_attr}>
-    <summary class="btn btn-primary btn-sm">New issue</summary>
+    <summary class="btn btn-primary btn-sm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>New issue</summary>
     <div class="popbtn__pop popbtn__pop--wide">
       {error_block}
       <form method="post" action="/r/{owner}/{name}/issues">
@@ -1050,7 +1048,6 @@ async fn render_list(
 	  </details>
 	</div>
 	<section class="card">
-	  <div class="card__head card__head--list">{tabs}</div>
 	  <div class="card__body card__body--list">
 	    <ul class="issue-list">{list}</ul>
 	    {pager}
@@ -1290,6 +1287,7 @@ fn render_issue_row(
     } else {
         ("state-ico--closed", "issue-closed")
     };
+    let now = now_secs();
     let label_chips = render_label_chips(labels);
     let assignee = if issue.assignee_sub.is_empty() {
         String::new()
@@ -1301,16 +1299,18 @@ fn render_issue_row(
         .find(|m| m.id == issue.milestone_id)
         .map(|m| format!(" · milestone {}", esc(&m.title)))
         .unwrap_or_default();
+    let verb = if issue.is_open() { "opened" } else { "closed" };
     format!(
         r##"<li class="issue-item">
   <span class="state-ico {icon_class}" title="{state_label}">{icon}</span>
   <div class="issue-item__main">
     <div class="issue-item__head">
-      <a class="issue-item__title" href="/r/{owner}/{name}/issues/{number}">#{number} {title}</a>
+      <a class="issue-item__title" href="/r/{owner}/{name}/issues/{number}">{title}</a>
+      <span class="issue-item__number">#{number}</span>
     </div>
     <div class="label-row">{label_chips}</div>
     <div class="issue-item__meta">
-      <span>opened {when} by {author}{assignee}{milestone}</span>
+      <span>{verb} <span title="{when_abs}">{when}</span> by {author}{assignee}{milestone}</span>
     </div>
   </div>
 </li>"##,
@@ -1320,7 +1320,9 @@ fn render_issue_row(
         number = issue.number,
         title = esc(&issue.title),
         label_chips = label_chips,
-        when = esc(&fmt_ts(issue.created_at)),
+        verb = verb,
+        when_abs = esc(&fmt_ts(issue.created_at)),
+        when = esc(&fmt_rel(now, issue.created_at)),
         author = esc(&issue.author_sub),
         assignee = assignee,
         milestone = milestone,
@@ -1347,7 +1349,7 @@ fn render_pager(
     }
     let prev = if has_prev {
         format!(
-            "<a class=\"btn btn-ghost btn-sm\" href=\"{}\">&larr; Newer</a>",
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{}\">Newer</a>",
             list_url(
                 &repo.owner_sub,
                 &repo.name,
@@ -1362,7 +1364,7 @@ fn render_pager(
     };
     let next = if has_next {
         format!(
-            "<a class=\"btn btn-ghost btn-sm\" href=\"{}\">Older &rarr;</a>",
+            "<a class=\"btn btn-ghost btn-sm spacer\" href=\"{}\">Older</a>",
             list_url(
                 &repo.owner_sub,
                 &repo.name,
@@ -1375,7 +1377,12 @@ fn render_pager(
     } else {
         String::new()
     };
-    format!("<div class=\"pager\">{prev}{next}</div>")
+    format!(
+        "<div class=\"pager\">{prev}<span class=\"pager__page\">{page}</span>{next}</div>",
+        prev = prev,
+        page = page,
+        next = next,
+    )
 }
 
 /// The issue detail page: title + state, the (markdown) body, the comment thread, a comment form,
@@ -1434,7 +1441,7 @@ fn render_detail(
         .unwrap_or_else(|| "<span class=\"side__empty\">No milestone</span>".to_string());
 
     let comment_list = if comments.is_empty() {
-        "<li class=\"issue-item issue-item--empty\">No comments yet.</li>".to_string()
+        String::new()
     } else {
         comments
             .iter()
@@ -1526,13 +1533,13 @@ fn render_detail(
 <div class="detail-head detail-head--issue">
   <div class="detail-head__badges"><span class="state-badge {cls}" id="state-badge-main">{label}</span></div>
   <h1 class="detail-head__title">{title} <span class="detail-head__number">#{number}</span></h1>
-  <p class="detail-head__meta">opened <span title="{created_abs}">{created_rel}</span> by <b>{author}</b>{updated}</p>
+  <p class="detail-head__meta"><span class="avatar avatar--sm" aria-hidden="true">{avatar}</span><b>{author}</b> opened <span title="{created_abs}">{created_rel}</span>{updated}</p>
 </div>
 {error_block}
 <div class="detail-layout">
   <div class="detail-layout__main">
     <section class="card comment-box">
-      <div class="comment-box__meta"><b>{author}</b> <span>opened this issue</span> <span title="{created_abs}">{created_rel}</span></div>
+      <div class="comment-box__meta"><span class="avatar avatar--sm" aria-hidden="true">{avatar}</span><b>{author}</b> <span title="{created_abs}">{created_rel}</span><span class="comment-box__role">Author</span></div>
       <div class="comment-box__body">{body_html}{issue_reactions}</div>
     </section>
     <ul class="issue-list timeline" data-motion-list>{comment_list}</ul>
@@ -1561,6 +1568,7 @@ fn render_detail(
         title = esc(&issue.title),
         created_abs = esc(&fmt_ts(issue.created_at)),
         created_rel = esc(&fmt_rel(now, issue.created_at)),
+        avatar = esc(&initials(&issue.author_sub)),
         author = esc(&issue.author_sub),
         updated = updated,
         body_html = body_html,
@@ -1603,12 +1611,14 @@ fn render_comment(
     );
     format!(
         r##"<li class="issue-item">
-  <div class="issue-item__meta"><span>{author}</span> commented {when}</div>
+  <div class="issue-item__meta"><span class="avatar avatar--sm" aria-hidden="true">{avatar}</span><span>{author}</span> <span title="{when_abs}">{when}</span></div>
   {body_html}
   {reactions}
 </li>"##,
+        avatar = esc(&initials(&comment.author_sub)),
         author = esc(&comment.author_sub),
-        when = esc(&fmt_ts(comment.created_at)),
+        when_abs = esc(&fmt_ts(comment.created_at)),
+        when = esc(&fmt_rel(now_secs(), comment.created_at)),
         body_html = body_html,
         reactions = reactions,
     )

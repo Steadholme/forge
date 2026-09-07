@@ -37,14 +37,31 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect to TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect to TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
 
     // Raw pool to reset the tables for a clean run.
-    let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    for t in ["tags", "manifests", "blobs", "repositories", "pull_stats", "retention_rules", "robot_accounts"] {
-        sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
+    let raw = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    for t in [
+        "tags",
+        "manifests",
+        "blobs",
+        "repositories",
+        "pull_stats",
+        "retention_rules",
+        "robot_accounts",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&raw)
+            .await
+            .unwrap();
     }
 
     let store: Arc<dyn Store> = Arc::new(pg);
@@ -55,14 +72,26 @@ async fn pg_store_full_integration() {
     store.ensure_repository(repo, now).await.unwrap();
     store.ensure_repository(repo, now + 1).await.unwrap(); // idempotent
     assert!(store.repo_exists(repo).await.unwrap());
-    let names: Vec<String> = store.list_repositories().await.unwrap().into_iter().map(|r| r.name).collect();
+    let names: Vec<String> = store
+        .list_repositories()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
     assert_eq!(names, vec![repo.to_string()]);
 
     let layer = b"a fake image layer blob";
     let layer_digest = sha256_digest(layer);
-    store.put_blob(&layer_digest, layer.len() as i64, now).await.unwrap();
+    store
+        .put_blob(&layer_digest, layer.len() as i64, now)
+        .await
+        .unwrap();
     store.put_blob(&layer_digest, 999, now).await.unwrap(); // idempotent (size unchanged)
-    assert_eq!(store.blob_size(&layer_digest).await.unwrap(), Some(layer.len() as i64));
+    assert_eq!(
+        store.blob_size(&layer_digest).await.unwrap(),
+        Some(layer.len() as i64)
+    );
     assert_eq!(store.blob_size("sha256:missing").await.unwrap(), None);
 
     // --- manifest upsert + fetch ------------------------------------------
@@ -82,26 +111,51 @@ async fn pg_store_full_integration() {
     };
     store.put_manifest(&rec).await.unwrap();
     store.put_manifest(&rec).await.unwrap(); // idempotent upsert on (repo,digest)
-    let fetched = store.get_manifest(repo, &digest).await.unwrap().expect("manifest persisted");
+    let fetched = store
+        .get_manifest(repo, &digest)
+        .await
+        .unwrap()
+        .expect("manifest persisted");
     assert_eq!(fetched.raw, raw_manifest);
     assert_eq!(store.manifests_for(repo).await.unwrap().len(), 1);
 
     // --- tag pointer + list -----------------------------------------------
     store.put_tag(repo, "latest", &digest, now).await.unwrap();
     store.put_tag(repo, "v1", &digest, now).await.unwrap();
-    assert_eq!(store.get_tag(repo, "latest").await.unwrap().unwrap(), digest);
-    let tags: Vec<String> = store.tags_for(repo).await.unwrap().into_iter().map(|t| t.tag).collect();
+    assert_eq!(
+        store.get_tag(repo, "latest").await.unwrap().unwrap(),
+        digest
+    );
+    let tags: Vec<String> = store
+        .tags_for(repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.tag)
+        .collect();
     assert_eq!(tags, vec!["latest".to_string(), "v1".to_string()]);
 
     // last-writer-wins on the same tag
     let digest2 = sha256_digest(b"another manifest");
-    store.put_tag(repo, "latest", &digest2, now + 5).await.unwrap();
-    assert_eq!(store.get_tag(repo, "latest").await.unwrap().unwrap(), digest2);
+    store
+        .put_tag(repo, "latest", &digest2, now + 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_tag(repo, "latest").await.unwrap().unwrap(),
+        digest2
+    );
 
     // --- delete a tag ------------------------------------------------------
     assert!(store.delete_tag(repo, "v1").await.unwrap());
     assert!(!store.delete_tag(repo, "v1").await.unwrap());
-    let remaining: Vec<String> = store.tags_for(repo).await.unwrap().into_iter().map(|t| t.tag).collect();
+    let remaining: Vec<String> = store
+        .tags_for(repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.tag)
+        .collect();
     assert_eq!(remaining, vec!["latest".to_string()]);
 
     // --- pull statistics (portable upsert) ---------------------------------
@@ -121,7 +175,10 @@ async fn pg_store_full_integration() {
         enabled: true,
     };
     store.create_retention_rule(&rule).await.unwrap();
-    assert_eq!(store.list_retention_rules().await.unwrap(), vec![rule.clone()]);
+    assert_eq!(
+        store.list_retention_rules().await.unwrap(),
+        vec![rule.clone()]
+    );
     assert!(store.set_retention_enabled("ret-pg", false).await.unwrap());
     assert!(!store.list_retention_rules().await.unwrap()[0].enabled);
     assert!(store.delete_retention_rule("ret-pg").await.unwrap());
@@ -139,12 +196,33 @@ async fn pg_store_full_integration() {
         last_used_at: 0,
     };
     store.create_robot(&robot).await.unwrap();
-    assert!(store.create_robot(&robot).await.is_err(), "duplicate name must be rejected");
-    assert_eq!(store.get_robot_by_name("ci").await.unwrap().unwrap().id, "rob-pg");
+    assert!(
+        store.create_robot(&robot).await.is_err(),
+        "duplicate name must be rejected"
+    );
+    assert_eq!(
+        store.get_robot_by_name("ci").await.unwrap().unwrap().id,
+        "rob-pg"
+    );
     store.touch_robot("rob-pg", now + 5).await.unwrap();
-    assert_eq!(store.get_robot_by_name("ci").await.unwrap().unwrap().last_used_at, now + 5);
+    assert_eq!(
+        store
+            .get_robot_by_name("ci")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        now + 5
+    );
     assert!(store.set_robot_enabled("rob-pg", false).await.unwrap());
-    assert!(!store.get_robot_by_name("ci").await.unwrap().unwrap().enabled);
+    assert!(
+        !store
+            .get_robot_by_name("ci")
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
     assert!(store.delete_robot("rob-pg").await.unwrap());
     assert!(store.list_robots().await.unwrap().is_empty());
 
@@ -177,8 +255,19 @@ async fn pg_store_full_integration() {
         .unwrap();
     assert_eq!(n, 1);
 
-    for t in ["tags", "manifests", "blobs", "repositories", "pull_stats", "retention_rules", "robot_accounts"] {
-        sqlx::query(&format!("DELETE FROM {t}")).execute(&raw).await.unwrap();
+    for t in [
+        "tags",
+        "manifests",
+        "blobs",
+        "repositories",
+        "pull_stats",
+        "retention_rules",
+        "robot_accounts",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&raw)
+            .await
+            .unwrap();
     }
     eprintln!("pg_store integration test passed.");
 }

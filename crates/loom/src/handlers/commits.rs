@@ -235,7 +235,7 @@ fn render_history(
     if commits.is_empty() {
         return format!(
             r##"{picker}
-<p class="muted commits-empty">No commits on this branch.</p>
+<div class="empty commits-empty"><div class="empty__title">No commits on this branch</div></div>
 {pager}"##
         );
     }
@@ -253,7 +253,7 @@ fn render_history(
             group_open = true;
             groups.push_str(&format!(
                 r##"<section class="commit-group">
-  <h3 class="commit-group__date">Commits on {day}</h3>
+  <h3 class="commit-group__date">{day}</h3>
   <ol class="commit-group__list">"##,
                 day = esc(&current_day),
             ));
@@ -374,15 +374,16 @@ fn render_commit(
     aggregate: Option<&str>,
     diff_options: crate::handlers::pulls::DiffOptions,
 ) -> String {
+    let now = now_secs();
     let parents = if detail.parents.is_empty() {
-        "<span class=\"muted\">none (root commit)</span>".to_string()
+        "<span class=\"muted\">root commit</span>".to_string()
     } else {
         detail
             .parents
             .iter()
             .map(|p| {
                 format!(
-                    "<a href=\"/r/{owner}/{name}/commit/{oid}\"><code class=\"oid\">{short}</code></a>",
+                    "parent <a href=\"/r/{owner}/{name}/commit/{oid}\"><code class=\"oid\">{short}</code></a>",
                     owner = esc(&repo.owner_sub),
                     name = esc(&repo.name),
                     oid = esc(p),
@@ -395,49 +396,53 @@ fn render_commit(
     let stat_html = if stat.is_empty() {
         "<span class=\"muted\">no combined changes</span>".to_string()
     } else {
-        esc(stat)
+        esc(stat.trim())
     };
-    // Show the full message below the metadata only when it says more than the subject line.
-    let message_block = if detail.message.trim() != detail.subject().trim() {
-        format!(
-            "<pre class=\"code-pre\"><code>{}</code></pre>",
-            esc(&detail.message)
-        )
+    // Show the full message below the subject only when it says more than the subject line.
+    let body = detail.message.trim();
+    let subject = detail.subject().trim();
+    let message_block = if body != subject {
+        let rest = body.strip_prefix(subject).unwrap_or(body).trim();
+        format!("<p class=\"commit-head__body\">{}</p>", esc(rest))
     } else {
         String::new()
     };
     let status_dot = render_status_dot(aggregate);
 
     format!(
-        r##"<div class="console__head">
-  <h1 class="pr-title">{status}{subject}</h1>
-  <p class="sub">authored {when} by {author} &lt;{email}&gt;</p>
-</div>
-<section class="card">
-  <div class="card__head"><h2>Commit</h2></div>
-  <div class="card__body">
-    <table class="data">
-      <tbody>
-        <tr><td><span class="strong">Commit</span></td><td><code class="oid">{oid}</code></td></tr>
-        <tr><td><span class="strong">Author</span></td><td>{author} &lt;{email}&gt;</td></tr>
-        <tr><td><span class="strong">Date</span></td><td>{when}</td></tr>
-        <tr><td><span class="strong">Parents</span></td><td>{parents}</td></tr>
-        <tr><td><span class="strong">Changes</span></td><td>{stat}</td></tr>
-      </tbody>
-    </table>
-    {message_block}
+        r##"<header class="commit-head">
+  <h1 class="commit-head__title pr-title">{status}{subject}</h1>
+  {message_block}
+  <div class="commit-head__meta">
+    <span class="avatar avatar--sm" aria-hidden="true">{avatar}</span>
+    <b>{author}</b>
+    <span class="muted">&lt;{email}&gt;</span>
+    <span title="{when}">{rel}</span>
+    <span class="dot">·</span>
+    <code class="oid">{short}</code>
+    <span class="dot">·</span>
+    {parents}
   </div>
-</section>
+  <div class="commit-head__stats">
+    <span>{stat}</span>
+    <a class="btn btn-secondary btn-sm" href="/r/{owner}/{name}/tree/{oid}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg>Browse files</a>
+  </div>
+</header>
 {diff}"##,
-        subject = esc(detail.subject()),
+        subject = esc(subject),
         status = status_dot,
-        when = esc(&fmt_ts(detail.time)),
+        message_block = message_block,
+        avatar = esc(&initials(&detail.author_email)),
         author = esc(&detail.author_name),
         email = esc(&detail.author_email),
-        oid = esc(&detail.oid),
+        when = esc(&fmt_ts(detail.time)),
+        rel = esc(&fmt_rel(now, detail.time)),
+        short = esc(&short_oid(&detail.oid)),
         parents = parents,
         stat = stat_html,
-        message_block = message_block,
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
+        oid = esc(&detail.oid),
         diff = crate::handlers::pulls::render_diff_card(
             patch,
             diff_options,

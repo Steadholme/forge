@@ -64,7 +64,10 @@ impl Store for InMemoryStore {
     // The std `Mutex` is fine throughout: each critical section is fully synchronous (no `.await`
     // inside), so a guard is never held across a yield point.
     async fn list_services(&self) -> Vec<Service> {
-        self.services.lock().expect("services lock poisoned").clone()
+        self.services
+            .lock()
+            .expect("services lock poisoned")
+            .clone()
     }
 
     async fn get_service(&self, key: &str) -> Option<Service> {

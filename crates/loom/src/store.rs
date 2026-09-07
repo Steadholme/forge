@@ -458,7 +458,8 @@ pub trait Store: Send + Sync {
     async fn list_pull_reviews(&self, pull_id: &str) -> Result<Vec<PullReview>, StoreError>;
 
     /// Dismiss a PR review verdict by id, scoped to its owning PR.
-    async fn dismiss_pull_review(&self, review_id: &str, pull_id: &str) -> Result<bool, StoreError>;
+    async fn dismiss_pull_review(&self, review_id: &str, pull_id: &str)
+        -> Result<bool, StoreError>;
 
     /// Add an inline PR review comment anchored to file + line.
     #[allow(clippy::too_many_arguments)]
@@ -1907,7 +1908,11 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
-    async fn dismiss_pull_review(&self, review_id: &str, pull_id: &str) -> Result<bool, StoreError> {
+    async fn dismiss_pull_review(
+        &self,
+        review_id: &str,
+        pull_id: &str,
+    ) -> Result<bool, StoreError> {
         let mut reviews = self
             .pull_reviews
             .lock()
@@ -4641,13 +4646,18 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn dismiss_pull_review(&self, review_id: &str, pull_id: &str) -> Result<bool, StoreError> {
-        let result = sqlx::query("UPDATE pr_reviews SET dismissed = TRUE WHERE id = $1 AND pull_id = $2")
-            .bind(review_id)
-            .bind(pull_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+    async fn dismiss_pull_review(
+        &self,
+        review_id: &str,
+        pull_id: &str,
+    ) -> Result<bool, StoreError> {
+        let result =
+            sqlx::query("UPDATE pr_reviews SET dismissed = TRUE WHERE id = $1 AND pull_id = $2")
+                .bind(review_id)
+                .bind(pull_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
         Ok(result.rows_affected() > 0)
     }
 

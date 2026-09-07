@@ -139,7 +139,11 @@ async fn delete_tag_json_removes_tag_and_mirrors_form_gate() {
     )
     .await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
-    assert_eq!(store.tags_for("app").await.unwrap().len(), 3, "CSRF-rejected delete must not mutate");
+    assert_eq!(
+        store.tags_for("app").await.unwrap().len(),
+        3,
+        "CSRF-rejected delete must not mutate"
+    );
 }
 
 #[tokio::test]
@@ -169,9 +173,16 @@ async fn retention_preview_json_lists_candidates_without_mutating() {
     // Candidates are `old` + `mid`; the newest (`new`) and `latest` are kept.
     assert!(body.contains("\"tag\":\"old\""), "{body}");
     assert!(body.contains("\"tag\":\"mid\""), "{body}");
-    assert!(!body.contains("\"tag\":\"new\""), "newest tag must be kept: {body}");
+    assert!(
+        !body.contains("\"tag\":\"new\""),
+        "newest tag must be kept: {body}"
+    );
     // A dry run must not mutate: all four tags remain.
-    assert_eq!(store.tags_for("app").await.unwrap().len(), 4, "preview mutated the store");
+    assert_eq!(
+        store.tags_for("app").await.unwrap().len(),
+        4,
+        "preview mutated the store"
+    );
 
     // The JSON endpoint enforces the same admin gate as the form: no admin group -> not OK.
     let unauth = send(

@@ -31,8 +31,15 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
     let headers = res.headers().clone();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
-    Resp { status, headers, body }
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Resp {
+        status,
+        headers,
+        body,
+    }
 }
 
 /// Percent-encode the `:` in a digest for the query string.
@@ -43,18 +50,53 @@ fn encode(digest: &str) -> String {
 /// Push a blob through the chunked upload flow; returns its digest.
 async fn push_blob(app: &axum::Router, name: &str, payload: &[u8]) -> String {
     let digest = sha256_digest(payload);
-    let init = send(app, Request::builder().method("POST").uri(format!("/v2/{name}/blobs/uploads/")).body(Body::empty()).unwrap()).await;
+    let init = send(
+        app,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v2/{name}/blobs/uploads/"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(init.status, StatusCode::ACCEPTED, "init: {}", init.text());
     let location = init.header("location");
-    let patch = send(app, Request::builder().method("PATCH").uri(&location).body(Body::from(payload.to_vec())).unwrap()).await;
-    assert_eq!(patch.status, StatusCode::ACCEPTED, "patch: {}", patch.text());
-    let put = send(app, Request::builder().method("PUT").uri(format!("{location}?digest={}", encode(&digest))).body(Body::empty()).unwrap()).await;
+    let patch = send(
+        app,
+        Request::builder()
+            .method("PATCH")
+            .uri(&location)
+            .body(Body::from(payload.to_vec()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        patch.status,
+        StatusCode::ACCEPTED,
+        "patch: {}",
+        patch.text()
+    );
+    let put = send(
+        app,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("{location}?digest={}", encode(&digest)))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(put.status, StatusCode::CREATED, "put: {}", put.text());
     digest
 }
 
 /// PUT an image manifest referencing a config + layer blob, at `reference`. Returns its digest.
-async fn put_image_manifest(app: &axum::Router, name: &str, reference: &str, config: &str, layer: &str) -> String {
+async fn put_image_manifest(
+    app: &axum::Router,
+    name: &str,
+    reference: &str,
+    config: &str,
+    layer: &str,
+) -> String {
     let manifest = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config}","size":10}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer}","size":20}}]}}"#,
     );
@@ -64,7 +106,10 @@ async fn put_image_manifest(app: &axum::Router, name: &str, reference: &str, con
         Request::builder()
             .method("PUT")
             .uri(format!("/v2/{name}/manifests/{reference}"))
-            .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .header(
+                header::CONTENT_TYPE,
+                "application/vnd.oci.image.manifest.v1+json",
+            )
             .body(Body::from(manifest))
             .unwrap(),
     )
@@ -152,12 +197,28 @@ async fn admin_gc_reclaims_orphans_and_keeps_live() {
     // The admin panel shows reclaimable bytes (the orphan manifest + its 2 orphan blobs).
     let before = get_admin(&app, Some("admins")).await;
     assert_eq!(before.status, StatusCode::OK);
-    assert!(before.text().contains("reclaimable"), "expected a reclaim line: {}", before.text());
+    assert!(
+        before.text().contains("reclaimable"),
+        "expected a reclaim line: {}",
+        before.text()
+    );
 
     // The orphan blobs exist before GC.
     for d in [&cfg_orphan, &lay_orphan] {
-        let h = send(&app, Request::builder().method("HEAD").uri(format!("/v2/{name}/blobs/{d}")).body(Body::empty()).unwrap()).await;
-        assert_eq!(h.status, StatusCode::OK, "orphan blob {d} should exist pre-GC");
+        let h = send(
+            &app,
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("/v2/{name}/blobs/{d}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            h.status,
+            StatusCode::OK,
+            "orphan blob {d} should exist pre-GC"
+        );
     }
 
     // Run GC (double-submit CSRF: cookie + form token must match).
@@ -175,25 +236,69 @@ async fn admin_gc_reclaims_orphans_and_keeps_live() {
     )
     .await;
     assert_eq!(gc.status, StatusCode::OK, "{}", gc.text());
-    assert!(gc.text().contains("reclaimed"), "expected a reclaimed notice: {}", gc.text());
+    assert!(
+        gc.text().contains("reclaimed"),
+        "expected a reclaimed notice: {}",
+        gc.text()
+    );
 
     // The orphan blobs are gone; the live blobs remain.
     for d in [&cfg_orphan, &lay_orphan] {
-        let h = send(&app, Request::builder().method("HEAD").uri(format!("/v2/{name}/blobs/{d}")).body(Body::empty()).unwrap()).await;
-        assert_eq!(h.status, StatusCode::NOT_FOUND, "orphan blob {d} should be reclaimed");
+        let h = send(
+            &app,
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("/v2/{name}/blobs/{d}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            h.status,
+            StatusCode::NOT_FOUND,
+            "orphan blob {d} should be reclaimed"
+        );
     }
     for d in [&cfg_live, &lay_live] {
-        let h = send(&app, Request::builder().method("HEAD").uri(format!("/v2/{name}/blobs/{d}")).body(Body::empty()).unwrap()).await;
+        let h = send(
+            &app,
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("/v2/{name}/blobs/{d}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(h.status, StatusCode::OK, "live blob {d} must survive GC");
     }
 
     // The live tag still pulls.
-    let m = send(&app, Request::builder().method("GET").uri(format!("/v2/{name}/manifests/keep")).body(Body::empty()).unwrap()).await;
+    let m = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/v2/{name}/manifests/keep"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(m.status, StatusCode::OK, "live tag must still resolve");
 
     // The orphan manifest is gone (its digest no longer resolves).
-    let om = send(&app, Request::builder().method("GET").uri(format!("/v2/{name}/manifests/{orphan_digest}")).body(Body::empty()).unwrap()).await;
-    assert_eq!(om.status, StatusCode::NOT_FOUND, "orphan manifest must be reclaimed");
+    let om = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/v2/{name}/manifests/{orphan_digest}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        om.status,
+        StatusCode::NOT_FOUND,
+        "orphan manifest must be reclaimed"
+    );
 
     // A second GC is a no-op (idempotent) -> "Nothing to reclaim".
     let gc2 = send(
@@ -209,7 +314,11 @@ async fn admin_gc_reclaims_orphans_and_keeps_live() {
     )
     .await;
     assert_eq!(gc2.status, StatusCode::OK);
-    assert!(gc2.text().contains("Nothing to reclaim"), "second GC should reclaim nothing: {}", gc2.text());
+    assert!(
+        gc2.text().contains("Nothing to reclaim"),
+        "second GC should reclaim nothing: {}",
+        gc2.text()
+    );
 }
 
 #[tokio::test]

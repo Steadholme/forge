@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::WebError;
-use crate::handlers::{admin_tabs, app_css, esc, fmt_ts, time_ago, userbox, APP_JS};
+use crate::handlers::{admin_tabs, esc, fmt_ts, time_ago, userbox, APP_JS};
 use crate::model::{is_valid_robot_scope, RobotAccount, ROBOT_SCOPE_PUSHPULL};
 use crate::names::{is_valid_repo_pattern, is_valid_robot_name};
 use crate::{now_secs, random_alnum, AppState};
@@ -249,7 +249,6 @@ fn render(
         n => format!("{n} robots"),
     };
     ROBOTS_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))

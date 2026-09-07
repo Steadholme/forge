@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use cellar::config::Config;
 use cellar::blobs::MemoryBlobStore;
+use cellar::config::Config;
 use cellar::store::{InMemoryStore, Store};
 use cellar::{app, AppState};
 use tower::ServiceExt;
@@ -32,7 +32,10 @@ impl Resp {
 async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
     Resp { status, body }
 }
 
@@ -143,7 +146,10 @@ async fn pull_token_can_pull_but_is_rejected_on_push() {
     let human = basic("ci", "s3cret");
 
     // Human seeds a manifest to pull.
-    assert_eq!(put_manifest(&app, "app", Some(&human)).await.status, StatusCode::CREATED);
+    assert_eq!(
+        put_manifest(&app, "app", Some(&human)).await.status,
+        StatusCode::CREATED
+    );
 
     // Mint a PULL-only robot.
     let resp = mint(&app, "name=puller&scope=pull&repo_pattern=app").await;
@@ -154,10 +160,18 @@ async fn pull_token_can_pull_but_is_rejected_on_push() {
     // The robot can log in (GET /v2/) ...
     assert_eq!(v2_probe(&app, Some(&robot)).await.status, StatusCode::OK);
     // ... and pull ...
-    assert_eq!(get_manifest(&app, "app", Some(&robot)).await.status, StatusCode::OK);
+    assert_eq!(
+        get_manifest(&app, "app", Some(&robot)).await.status,
+        StatusCode::OK
+    );
     // ... but a push is DENIED (403), because the token is pull-scoped.
     let push = put_manifest(&app, "app", Some(&robot)).await;
-    assert_eq!(push.status, StatusCode::FORBIDDEN, "pull token must not push: {}", push.text());
+    assert_eq!(
+        push.status,
+        StatusCode::FORBIDDEN,
+        "pull token must not push: {}",
+        push.text()
+    );
 
     // The token also works as a Bearer credential (docker token-auth style).
     let bearer = format!("Bearer {token}");
@@ -179,10 +193,18 @@ async fn pushpull_token_is_bounded_by_repo_pattern() {
     let robot = basic("robot$teambot", &extract_token(&resp.text()));
 
     // Push to a matching repo succeeds.
-    assert_eq!(put_manifest(&app, "team/app", Some(&robot)).await.status, StatusCode::CREATED);
+    assert_eq!(
+        put_manifest(&app, "team/app", Some(&robot)).await.status,
+        StatusCode::CREATED
+    );
     // Push to a NON-matching repo is denied.
     let off = put_manifest(&app, "other/app", Some(&robot)).await;
-    assert_eq!(off.status, StatusCode::FORBIDDEN, "pattern miss must deny: {}", off.text());
+    assert_eq!(
+        off.status,
+        StatusCode::FORBIDDEN,
+        "pattern miss must deny: {}",
+        off.text()
+    );
 }
 
 #[tokio::test]
@@ -205,12 +227,17 @@ async fn disable_and_delete_revoke_the_token() {
             .header("x-auth-groups", "admins")
             .header(header::COOKIE, format!("__Host-csrf={CSRF}"))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(format!("id={id}&enabled=false&csrf_token={CSRF}")))
+            .body(Body::from(format!(
+                "id={id}&enabled=false&csrf_token={CSRF}"
+            )))
             .unwrap(),
     )
     .await;
     assert_eq!(toggle.status, StatusCode::OK);
-    assert_eq!(v2_probe(&app, Some(&robot)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        v2_probe(&app, Some(&robot)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // Delete -> still rejected, and the row is gone.
     let del = send(
@@ -241,7 +268,9 @@ async fn minting_requires_admin_and_csrf() {
             .method("POST")
             .uri("/admin/robots/create")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("name=x&scope=pull&repo_pattern=app&csrf_token=x"))
+            .body(Body::from(
+                "name=x&scope=pull&repo_pattern=app&csrf_token=x",
+            ))
             .unwrap(),
     )
     .await;
@@ -256,7 +285,9 @@ async fn minting_requires_admin_and_csrf() {
             .header("x-auth-groups", "admins")
             .header(header::COOKIE, "__Host-csrf=cookie")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("name=x&scope=pull&repo_pattern=app&csrf_token=form"))
+            .body(Body::from(
+                "name=x&scope=pull&repo_pattern=app&csrf_token=form",
+            ))
             .unwrap(),
     )
     .await;
@@ -280,17 +311,36 @@ async fn existing_human_auth_path_is_unchanged() {
 
     // 2. Valid human creds -> 200, and a human push succeeds (full access, every repo).
     assert_eq!(v2_probe(&app, Some(&good)).await.status, StatusCode::OK);
-    assert_eq!(put_manifest(&app, "anything/here", Some(&good)).await.status, StatusCode::CREATED);
+    assert_eq!(
+        put_manifest(&app, "anything/here", Some(&good))
+            .await
+            .status,
+        StatusCode::CREATED
+    );
 
     // 3. Anonymous READ of an existing manifest is still allowed (public pull).
-    assert_eq!(get_manifest(&app, "anything/here", None).await.status, StatusCode::OK);
+    assert_eq!(
+        get_manifest(&app, "anything/here", None).await.status,
+        StatusCode::OK
+    );
 
     // 4. WRONG human creds are still rejected (not silently anonymous).
-    assert_eq!(get_manifest(&app, "anything/here", Some(&wrong)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get_manifest(&app, "anything/here", Some(&wrong))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // 5. An unknown robot username with any secret is rejected (present-but-invalid), and anonymous
     //    reads keep working (the robot path never weakens the anonymous/human contract).
     let ghost = basic("robot$ghost", "whatever");
-    assert_eq!(v2_probe(&app, Some(&ghost)).await.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(get_manifest(&app, "anything/here", None).await.status, StatusCode::OK);
+    assert_eq!(
+        v2_probe(&app, Some(&ghost)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_manifest(&app, "anything/here", None).await.status,
+        StatusCode::OK
+    );
 }

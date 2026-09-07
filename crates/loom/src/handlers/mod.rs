@@ -31,7 +31,7 @@ pub mod settings;
 pub mod smart_http;
 
 use axum::extract::Query;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use serde::de::{SeqAccess, Visitor};
 use serde::Deserialize;
@@ -43,9 +43,11 @@ use crate::model::ReactionSummary;
 /// Loom-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
+pub const APP_CSS_PATH: &str = "/assets/loom-20260907.css";
+
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Embedded design system (Odyssey canonical + Loom service CSS), inlined into each page's `<style>`.
+/// Embedded design system (Odyssey canonical + Loom service CSS), served as one immutable asset.
 pub fn app_css() -> &'static str {
     APP_CSS
         .get_or_init(|| {
@@ -55,6 +57,24 @@ pub fn app_css() -> &'static str {
             css
         })
         .as_str()
+}
+
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Embedded progressive-enhancement script, inlined into each rendered page's `<script>`. Purely
@@ -146,11 +166,7 @@ pub fn fmt_rel(now: i64, then: i64) -> String {
 /// the signed-in identity (shown when known), `body` the already-escaped main content HTML.
 pub fn page(title: &str, email: Option<&str>, theme: &str, body: &str) -> String {
     PAGE_HTML
-        .replace("{{CSS}}", app_css())
-        .replace(
-            "{{JS}}",
-            &format!("{}\n{}\n{}", odyssey::MOTION_JS, odyssey::WIRE_JS, APP_JS),
-        )
+        .replace("{{JS}}", APP_JS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
@@ -409,29 +425,35 @@ fn user_menu(email: Option<&str>) -> String {
     )
 }
 
-/// The Odyssey v2 app-bar: a brand lockup (Loom's git-branch tile + wordmark), the service nav
-/// (Repositories / Tokens, current marked `.is-active`), an "All apps" waffle to the apex portal,
-/// and the avatar menu. Shared by every page so the chrome stays identical across the estate.
+/// The Loom v2 app bar: brand lockup (emerald tile + wordmark), the repository search with its
+/// keyboard hint, the service nav (Repositories / Tokens, current marked `.is-active`), a "New"
+/// menu, the estate launcher, the theme switch and the avatar menu. Anonymous visitors get the
+/// same bar with a sign-in button instead of the account controls.
 pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
-    if email.map_or(true, |e| e.is_empty()) {
-        return format!(
-            r##"<a class="appbar__brand" href="/" aria-label="Steadholme Loom">
+    const BRAND: &str = r##"<a class="appbar__brand" href="/" aria-label="Steadholme Loom">
   <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
   <span class="appbar__name"><b>Loom</b></span>
 </a>
 <form class="appbar__search" method="get" action="/" role="search">
-  <svg class="appbar__search-ico" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"/></svg>
-  <input class="appbar__search-q" type="search" name="q" placeholder="Find a repository&hellip;" aria-label="Find a repository">
-</form>
+  <svg class="appbar__search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+  <input class="appbar__search-q" type="search" name="q" placeholder="Find a repository" aria-label="Find a repository">
+  <kbd class="appbar__kbd" aria-hidden="true">⌘K</kbd>
+</form>"##;
+    const APPS: &str = r##"<a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>"##;
+    if email.map_or(true, |e| e.is_empty()) {
+        return format!(
+            r##"{brand}
 <nav class="appbar__nav" aria-label="Loom sections">
   <a class="appnav is-active" href="/" data-wire-off>Repositories</a>
 </nav>
 <div class="appbar__spacer"></div>
 <div class="appbar__right">
-  <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+  {apps}
   {switcher}
   <a class="btn" href="/signin">Sign in</a>
 </div>"##,
+            brand = BRAND,
+            apps = APPS,
             switcher = theme_switcher(theme),
         );
     }
@@ -448,14 +470,7 @@ pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
         "appnav"
     };
     format!(
-        r##"<a class="appbar__brand" href="/" aria-label="Steadholme Loom">
-  <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span>
-  <span class="appbar__name"><b>Loom</b></span>
-</a>
-<form class="appbar__search" method="get" action="/" role="search">
-  <svg class="appbar__search-ico" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"/></svg>
-  <input class="appbar__search-q" type="search" name="q" placeholder="Find a repository&hellip;" aria-label="Find a repository">
-</form>
+        r##"{brand}
 <nav class="appbar__nav" aria-label="Loom sections">
   <a class="{repos_cls}" href="/" data-wire-off>Repositories</a>
   <a class="{tokens_cls}" href="/pats" data-wire-off>Tokens</a>
@@ -463,16 +478,18 @@ pub fn userbox(title: &str, email: Option<&str>, theme: &str) -> String {
 <div class="appbar__spacer"></div>
 <div class="appbar__right">
   <details class="create-menu">
-    <summary class="iconbtn" aria-label="Create new" title="Create new&hellip;"><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg><svg class="create-menu__caret" viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="m4.427 7.427 3.396 3.396a.25.25 0 0 0 .354 0l3.396-3.396A.25.25 0 0 0 11.396 7H4.604a.25.25 0 0 0-.177.427Z"/></svg></summary>
+    <summary class="btn btn-sm btn-new" aria-label="New" title="New"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>New</span></summary>
     <div class="create-menu__pop">
       <a class="menuitem" href="/new" data-wire-off>New repository</a>
       <a class="menuitem" href="/pats" data-wire-off>New access token</a>
     </div>
   </details>
-  <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+  {apps}
   {switcher}
   {user}
 </div>"##,
+        brand = BRAND,
+        apps = APPS,
         repos_cls = repos_cls,
         tokens_cls = tokens_cls,
         switcher = theme_switcher(theme),
@@ -516,7 +533,6 @@ pub fn render_error(
     email: Option<&str>,
 ) -> (StatusCode, Html<String>) {
     let body = ERROR_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Loom", email, "light"))
         .replace("{{STATUS}}", &status.as_u16().to_string())
@@ -707,5 +723,20 @@ mod tests {
         assert_eq!(safe_signin_return(Some("https://evil")), "/");
         assert_eq!(safe_signin_return(Some("//evil")), "/");
         assert_eq!(safe_signin_return(None), "/");
+    }
+
+    #[test]
+    fn page_keeps_navigation_native_and_uses_only_loom_interactions() {
+        let html = page(
+            "Repository",
+            Some("user@example.com"),
+            "light",
+            "<p>repo</p>",
+        );
+
+        assert!(!html.contains("data-wire-nav"));
+        assert!(!html.contains("odyssey-wire v1"));
+        assert!(!html.contains("Could not save — try again"));
+        assert!(html.contains("window.LoomUI"));
     }
 }

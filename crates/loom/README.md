@@ -13,6 +13,18 @@ Loom 是 Steadholme 主权基础设施中的 **自托管 Git 代码托管服务�
 > 设计要点：Web UI 走网关 SSO；协议子路径走网关 public + 服务自认证。这是本浪次（git/docker CLI 无法
 > 说浏览器 SSO）所有服务共用的“按路径切分”模式（参见姊妹服务 Cellar 镜像仓库的 `/v2/`）。
 
+## UI v2（2026-09-07）
+
+Web 控制台按 Figma「Loom」設計稿實裝（fileKey `O9m0SbXLaT0EG6gbbZs3uq`）：淺色 56px 頂欄（品牌 / 倉庫搜尋 ⌘K /
+Repositories · Tokens / New / 主題切換 / 帳號）、倉庫索引按 Today / This week / This month / Earlier 分組（語言點、
+12 週活動條、更新時間）、倉庫頭部帶圖示分頁、程式碼頁（分支選擇 · History · 搜尋 · Clone / Fork / Deploy、檔案樹側欄、
+README、Clone / Latest release 側欄）、提交日分組與提交頁 CommitHeader、PR 頁（狀態 pill + 標題、WarpStrip、
+Overview / Requirements / Checks / Commits / Files / Review / Merge 子導航、階段軌、右側中繼資料欄）、Issue 列表 / 詳情、
+Releases 卡片（Latest / Pre-release / Draft）、Settings（左側導航 + 分節卡片 + Delete repository）、Personal access tokens。
+詞彙規則：頁面上每個字串都是名字、數值或動作（沒有副標題、裝飾性計數或重複的狀態詞）。樣式落在 `static/service.css`
+（Odyssey 基礎之上的 `.page-loom` 層，淺色預設 + `data-theme` 深色重映射），以版本化不可變資產 `/assets/loom-20260907.css`
+（`handlers::APP_CSS_PATH`）供應；所有標記仍由 Rust 渲染（`templates/page.html` 只剩外殼）。
+
 ## 架构
 
 ```

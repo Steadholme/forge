@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use cellar::config::Config;
 use cellar::blobs::MemoryBlobStore;
+use cellar::config::Config;
 use cellar::model::{ManifestRec, RetentionRule};
 use cellar::store::{InMemoryStore, Store};
 use cellar::{app, AppState};
@@ -29,7 +29,10 @@ impl Resp {
 async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
     Resp { status, body }
 }
 
@@ -102,30 +105,59 @@ async fn preview_lists_candidates_without_mutating_then_apply_deletes() {
     let app = app(state_with(store.clone()));
 
     // --- Preview: a DRY RUN. It lists `old` + `mid`, and NOT `new` (newest, kept) or `latest`. ---
-    let preview = admin_post(&app, "/admin/retention/preview", format!("csrf_token={CSRF}")).await;
+    let preview = admin_post(
+        &app,
+        "/admin/retention/preview",
+        format!("csrf_token={CSRF}"),
+    )
+    .await;
     assert_eq!(preview.status, StatusCode::OK, "{}", preview.text());
     let html = preview.text();
     assert!(html.contains(">old<"), "preview should list 'old': {html}");
     assert!(html.contains(">mid<"), "preview should list 'mid'");
-    assert!(!html.contains(">new<"), "preview must NOT list the newest tag 'new'");
+    assert!(
+        !html.contains(">new<"),
+        "preview must NOT list the newest tag 'new'"
+    );
     // Preview must not mutate: all four tags still present.
-    assert_eq!(store.tags_for("app").await.unwrap().len(), 4, "preview mutated the store");
+    assert_eq!(
+        store.tags_for("app").await.unwrap().len(),
+        4,
+        "preview mutated the store"
+    );
 
     // --- Apply: deletes the non-kept tags, keeps `new` + `latest`, and GC-reclaims orphans. ---
     let apply = admin_post(&app, "/admin/retention/apply", format!("csrf_token={CSRF}")).await;
     assert_eq!(apply.status, StatusCode::OK, "{}", apply.text());
-    assert!(apply.text().contains("Retention applied"), "{}", apply.text());
+    assert!(
+        apply.text().contains("Retention applied"),
+        "{}",
+        apply.text()
+    );
 
-    let mut remaining: Vec<String> =
-        store.tags_for("app").await.unwrap().into_iter().map(|t| t.tag).collect();
+    let mut remaining: Vec<String> = store
+        .tags_for("app")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.tag)
+        .collect();
     remaining.sort();
     assert_eq!(remaining, vec!["latest".to_string(), "new".to_string()]);
 
     // The orphaned manifests (old/mid) were reclaimed through the shared GC path; new/latest remain.
-    let mut digests: Vec<String> =
-        store.manifests_for("app").await.unwrap().into_iter().map(|m| m.digest).collect();
+    let mut digests: Vec<String> = store
+        .manifests_for("app")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.digest)
+        .collect();
     digests.sort();
-    assert_eq!(digests, vec!["sha256:bb".to_string(), "sha256:dd".to_string()]);
+    assert_eq!(
+        digests,
+        vec!["sha256:bb".to_string(), "sha256:dd".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -133,11 +165,23 @@ async fn keep_days_window_keeps_recent_tags() {
     let store = Arc::new(InMemoryStore::new());
     let now = cellar::now_secs();
     store.ensure_repository("svc", now).await.unwrap();
-    store.put_manifest(&manifest("svc", "sha256:11")).await.unwrap();
-    store.put_manifest(&manifest("svc", "sha256:22")).await.unwrap();
+    store
+        .put_manifest(&manifest("svc", "sha256:11"))
+        .await
+        .unwrap();
+    store
+        .put_manifest(&manifest("svc", "sha256:22"))
+        .await
+        .unwrap();
     // `recent` pushed an hour ago; `stale` pushed 100 days ago.
-    store.put_tag("svc", "recent", "sha256:11", now - 3_600).await.unwrap();
-    store.put_tag("svc", "stale", "sha256:22", now - 100 * 86_400).await.unwrap();
+    store
+        .put_tag("svc", "recent", "sha256:11", now - 3_600)
+        .await
+        .unwrap();
+    store
+        .put_tag("svc", "stale", "sha256:22", now - 100 * 86_400)
+        .await
+        .unwrap();
     // keep_last = 0 (ignored), keep_days = 1: only tags pushed within the last day survive.
     store
         .create_retention_rule(&RetentionRule {
@@ -151,10 +195,21 @@ async fn keep_days_window_keeps_recent_tags() {
         .unwrap();
     let app = app(state_with(store.clone()));
 
-    let preview = admin_post(&app, "/admin/retention/preview", format!("csrf_token={CSRF}")).await;
+    let preview = admin_post(
+        &app,
+        "/admin/retention/preview",
+        format!("csrf_token={CSRF}"),
+    )
+    .await;
     let html = preview.text();
-    assert!(html.contains(">stale<"), "stale (out of window) should be a candidate");
-    assert!(!html.contains(">recent<"), "recent (in window) must be kept");
+    assert!(
+        html.contains(">stale<"),
+        "stale (out of window) should be a candidate"
+    );
+    assert!(
+        !html.contains(">recent<"),
+        "recent (in window) must be kept"
+    );
 }
 
 #[tokio::test]
@@ -175,8 +230,16 @@ async fn disabled_rule_deletes_nothing() {
 
     let apply = admin_post(&app, "/admin/retention/apply", format!("csrf_token={CSRF}")).await;
     assert_eq!(apply.status, StatusCode::OK);
-    assert!(apply.text().contains("Nothing to delete"), "{}", apply.text());
-    assert_eq!(store.tags_for("app").await.unwrap().len(), 4, "disabled rule must not delete");
+    assert!(
+        apply.text().contains("Nothing to delete"),
+        "{}",
+        apply.text()
+    );
+    assert_eq!(
+        store.tags_for("app").await.unwrap().len(),
+        4,
+        "disabled rule must not delete"
+    );
 }
 
 #[tokio::test]
@@ -191,7 +254,9 @@ async fn create_requires_admin_csrf_and_valid_input() {
             .method("POST")
             .uri("/admin/retention/create")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("repo_pattern=app&keep_last=5&keep_days=0&csrf_token=x"))
+            .body(Body::from(
+                "repo_pattern=app&keep_last=5&keep_days=0&csrf_token=x",
+            ))
             .unwrap(),
     )
     .await;
@@ -206,7 +271,9 @@ async fn create_requires_admin_csrf_and_valid_input() {
             .header("x-auth-groups", "admins")
             .header(header::COOKIE, "__Host-csrf=cookie")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from("repo_pattern=app&keep_last=5&keep_days=0&csrf_token=form"))
+            .body(Body::from(
+                "repo_pattern=app&keep_last=5&keep_days=0&csrf_token=form",
+            ))
             .unwrap(),
     )
     .await;
@@ -219,7 +286,12 @@ async fn create_requires_admin_csrf_and_valid_input() {
         format!("repo_pattern=app&keep_last=0&keep_days=0&csrf_token={CSRF}"),
     )
     .await;
-    assert_eq!(both_zero.status, StatusCode::BAD_REQUEST, "{}", both_zero.text());
+    assert_eq!(
+        both_zero.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        both_zero.text()
+    );
     assert!(store.list_retention_rules().await.unwrap().is_empty());
 
     // A valid rule is created.

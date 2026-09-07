@@ -22,7 +22,9 @@ use crate::gitops::{
     BlameLine, CodeSearchFile, CodeSearchResults, CommitInfo, GitOps, LanguageStat, TreeEntry,
     TreeLastCommits,
 };
-use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect, short_oid};
+use crate::handlers::{
+    esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, initials, page, redirect, short_oid,
+};
 use crate::model::{repo_role_rank, validate_owner_sub, validate_repo_name, Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
@@ -32,6 +34,8 @@ const FILE_HISTORY_PER_PAGE: usize = 50;
 const CODE_SEARCH_RESULT_LIMIT: usize = 200;
 const CODE_SEARCH_FILE_LIMIT: usize = 20;
 const CODE_SEARCH_QUERY_MAX_CHARS: usize = 128;
+/// Weeks of commit activity drawn on each repository row of the index.
+const ACTIVITY_WEEKS: usize = 12;
 
 // ===========================================================================
 // GET / — repo list + create form
@@ -41,6 +45,12 @@ const CODE_SEARCH_QUERY_MAX_CHARS: usize = 128;
 pub struct IndexQuery {
     #[serde(default)]
     pub q: String,
+    #[serde(default)]
+    pub ownership: String,
+    #[serde(default)]
+    pub visibility: String,
+    #[serde(default)]
+    pub language: String,
 }
 
 pub async fn index(
@@ -50,17 +60,48 @@ pub async fn index(
 ) -> Response {
     let who = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
-    let mut repos = state
+    let repos = state
         .store
         .list_visible_repos(&who.subject)
         .await
         .unwrap_or_default();
     let query = q.q.trim().to_string();
-    if !query.is_empty() {
-        repos.retain(|repo| repo_matches_query(repo, &query));
-    }
-    let rows = repo_rows(&state, repos).await;
-    let body = render_index(&who, &rows, &query);
+    let ownership = match q.ownership.trim() {
+        "owned" => "owned",
+        "collaborating" => "collaborating",
+        _ => "",
+    };
+    let visibility = match q.visibility.trim() {
+        "public" => "public",
+        "private" => "private",
+        _ => "",
+    };
+    let language = q.language.trim().chars().take(64).collect::<String>();
+    let all_rows = repo_rows(&state, repos).await;
+    let rows = all_rows
+        .iter()
+        .filter(|row| {
+            (query.is_empty() || repo_matches_query(&row.repo, &query))
+                && match ownership {
+                    "owned" => row.repo.owner_sub == who.subject,
+                    "collaborating" => row.repo.owner_sub != who.subject,
+                    _ => true,
+                }
+                && match visibility {
+                    "public" => !row.repo.is_private,
+                    "private" => row.repo.is_private,
+                    _ => true,
+                }
+                && (language.is_empty()
+                    || row
+                        .language
+                        .is_some_and(|value| value.name.eq_ignore_ascii_case(&language)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let body = render_index(
+        &who, &rows, &all_rows, &query, ownership, visibility, &language,
+    );
     html_with_csrf(
         StatusCode::OK,
         page("Repositories", Some(&who.email), who.theme, &body),
@@ -71,7 +112,7 @@ pub async fn index(
 pub async fn new_page(State(_state): State<AppState>, headers: HeaderMap) -> Response {
     let who = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
-    let body = render_new(&csrf, None, "", "", "main", false);
+    let body = render_new(&who.subject, &csrf, None, "", "", "main", false);
     html_with_csrf(
         StatusCode::OK,
         page("Create repository", Some(&who.email), who.theme, &body),
@@ -791,10 +832,12 @@ fn is_full_oid(s: &str) -> bool {
 // Rendering
 // ===========================================================================
 
+#[derive(Clone)]
 struct RepoRow {
     repo: Repo,
     head_time: Option<i64>,
     language: Option<LanguageStat>,
+    activity: Vec<u32>,
 }
 
 impl RepoRow {
@@ -813,7 +856,7 @@ fn repo_matches_query(repo: &Repo, query: &str) -> bool {
 async fn repo_rows(state: &AppState, repos: Vec<Repo>) -> Vec<RepoRow> {
     let mut rows = Vec::with_capacity(repos.len());
     for (idx, repo) in repos.into_iter().enumerate() {
-        let (head_time, language) = if idx < 50 {
+        let (head_time, language, activity) = if idx < 50 {
             (
                 state
                     .git
@@ -823,14 +866,19 @@ async fn repo_rows(state: &AppState, repos: Vec<Repo>) -> Vec<RepoRow> {
                     .git
                     .dominant_language(&repo.owner_sub, &repo.name)
                     .await,
+                state
+                    .git
+                    .weekly_activity(&repo.owner_sub, &repo.name, ACTIVITY_WEEKS)
+                    .await,
             )
         } else {
-            (None, None)
+            (None, None, vec![0; ACTIVITY_WEEKS])
         };
         rows.push(RepoRow {
             repo,
             head_time,
             language,
+            activity,
         });
     }
 
@@ -844,164 +892,221 @@ async fn repo_rows(state: &AppState, repos: Vec<Repo>) -> Vec<RepoRow> {
     rows
 }
 
-fn render_index(who: &Identity, rows: &[RepoRow], q: &str) -> String {
+fn render_index(
+    who: &Identity,
+    rows: &[RepoRow],
+    all_rows: &[RepoRow],
+    q: &str,
+    ownership: &str,
+    visibility: &str,
+    language: &str,
+) -> String {
     let now = now_secs();
+    let has_filters = !q.trim().is_empty()
+        || !ownership.is_empty()
+        || !visibility.is_empty()
+        || !language.is_empty();
     let list = if rows.is_empty() {
-        let title = if q.trim().is_empty() {
-            "No repositories yet".to_string()
+        let title = if !has_filters {
+            "No repositories yet"
         } else {
-            format!("No repositories matched &ldquo;{}&rdquo;", esc(q))
+            "No repositories matched these filters"
         };
-        let cta = if !q.trim().is_empty() {
-            ""
+        let cta = if has_filters {
+            "<a class=\"btn\" href=\"/\">Clear filters</a>"
         } else if who.is_authenticated() {
             "<a class=\"btn btn-primary\" href=\"/new\">New repository</a>"
         } else {
             "<a class=\"btn btn-primary\" href=\"/signin\">Sign in</a>"
         };
-        let text = if q.trim().is_empty() {
-            "Create your first repository to get started."
-        } else {
-            "Try a different repository filter."
-        };
         format!(
-            r##"<div class="repo-rows__empty"><div class="empty"><svg class="empty__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><div class="empty__title">{title}</div><p class="empty__text">{text}</p>{cta}</div></div>"##,
+            r##"<div class="repo-rows__empty"><div class="empty"><svg class="empty__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><div class="empty__title">{title}</div>{cta}</div></div>"##,
             title = title,
-            text = text,
             cta = cta,
         )
     } else {
-        let items = rows
+        // Group by the age of the latest commit (or creation for empty repositories).
+        let mut groups: Vec<(&str, String)> = vec![
+            ("Today", String::new()),
+            ("This week", String::new()),
+            ("This month", String::new()),
+            ("Earlier", String::new()),
+        ];
+        for row in rows {
+            let t = row.head_time.unwrap_or(row.repo.created_at);
+            let age = now - t;
+            let idx = if age < 86_400 {
+                0
+            } else if age < 7 * 86_400 {
+                1
+            } else if age < 30 * 86_400 {
+                2
+            } else {
+                3
+            };
+            groups[idx].1.push_str(&render_repo_row(row, now));
+        }
+        groups
             .iter()
-            .map(|row| {
-                let r = &row.repo;
-                let chip = if r.is_private {
-                    "<span class=\"vis-chip vis-chip--private\">Private</span>"
-                } else {
-                    "<span class=\"vis-chip\">Public</span>"
-                };
-                let desc = if r.description.trim().is_empty() {
-                    "<p class=\"repo-card__desc repo-card__desc--empty\">No description</p>".to_string()
-                } else {
-                    format!("<p class=\"repo-card__desc\">{}</p>", esc(&r.description))
-                };
-                let lang = row
-                    .language
-                    .map(|language| {
-                        format!(
-                            "<span class=\"repo-card__lang\"><span class=\"lang-dot\" style=\"--lang-color:#{color}\" aria-hidden=\"true\"></span>{name}</span>",
-                            color = language.color,
-                            name = esc(language.name),
-                        )
-                    })
-                    .unwrap_or_default();
-                let (time_label, time_abs, time_rel) = match row.head_time {
-                    Some(t) => ("Updated", fmt_ts(t), fmt_rel(now, t)),
-                    None => ("Created", fmt_ts(r.created_at), fmt_rel(now, r.created_at)),
-                };
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(title, items)| {
                 format!(
-                    r##"<li class="repo-card"><a class="repo-card__link" href="/r/{owner}/{name}">
-  <div class="repo-card__head">
-    <span class="repo-card__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
-    <span class="repo-card__name">{owner_e}/<b>{name_e}</b></span>
-    {chip}
-  </div>
-  {desc}
-  <div class="repo-card__meta">{lang}<span title="{time_abs}">{time_label} {time_rel}</span></div>
-</a></li>"##,
-                    owner = esc(&r.owner_sub),
-                    name = esc(&r.name),
-                    owner_e = esc(&r.owner_sub),
-                    name_e = esc(&r.name),
-                    chip = chip,
-                    desc = desc,
-                    lang = lang,
-                    time_abs = esc(&time_abs),
-                    time_label = time_label,
-                    time_rel = esc(&time_rel),
+                    r##"<section class="repo-group">
+  <h2 class="repo-group__head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>{title}</h2>
+  <ul class="repo-rows">{items}</ul>
+</section>"##,
+                    title = title,
+                    items = items,
                 )
             })
-            .collect::<String>();
-        format!("<ul class=\"repo-grid\">{items}</ul>")
+            .collect::<String>()
     };
 
-    // The full branded hero is the landing masthead; a search collapses it to a compact head so
-    // results dominate. Stats reflect the unfiltered estate (rows == everything when q is empty).
-    let head = if q.trim().is_empty() {
-        let repo_count = rows.len();
-        let mut langs: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| r.language.map(|l| l.name))
-            .collect();
-        langs.sort_unstable();
-        langs.dedup();
-        let lang_count = langs.len();
-        let repo_label = if repo_count == 1 {
-            "Repository"
-        } else {
-            "Repositories"
-        };
-        let lang_label = if lang_count == 1 {
-            "Language"
-        } else {
-            "Languages"
-        };
-        let actions = if who.is_authenticated() {
-            r##"<a class="btn btn-primary" href="/new">New repository</a>
-      <a class="btn" href="/pats">Access tokens</a>"##
-        } else {
-            r##"<a class="btn btn-primary" href="/signin">Sign in</a>"##
-        };
-        format!(
-            r##"<section class="home-hero">
-  <div class="home-hero__body">
-    <p class="eyebrow">Steadholme · SOVEREIGN ESTATE</p>
-    <h1 class="home-hero__title">Built in the open.</h1>
-    <p class="home-hero__lede">A sovereign, self-hosted estate — identity, mail, git, registry, search, AI and dozens more services, engineered from the ground up. Every service, open source. Clone any repository over HTTPS.</p>
-    <div class="home-hero__actions">
-      {actions}
-    </div>
-  </div>
-  <dl class="home-stats" aria-label="Estate at a glance">
-    <div class="home-stat"><dt>{repo_label}</dt><dd>{repo_count}</dd></div>
-    <div class="home-stat"><dt>{lang_label}</dt><dd>{lang_count}</dd></div>
-    <div class="home-stat"><dt>License</dt><dd class="home-stat__word">Open</dd></div>
-  </dl>
-</section>"##,
-            repo_count = repo_count,
-            repo_label = repo_label,
-            lang_count = lang_count,
-            lang_label = lang_label,
-            actions = actions,
-        )
+    let mut languages = all_rows
+        .iter()
+        .filter_map(|row| row.language.map(|value| value.name))
+        .collect::<Vec<_>>();
+    languages.sort_unstable();
+    languages.dedup();
+    let language_options = languages
+        .iter()
+        .map(|value| {
+            let selected = if value.eq_ignore_ascii_case(language) {
+                " selected"
+            } else {
+                ""
+            };
+            format!(
+                "<option value=\"{}\"{}>{}</option>",
+                esc(value),
+                selected,
+                esc(value)
+            )
+        })
+        .collect::<String>();
+    let sel = |current: &str, value: &str| if current == value { " selected" } else { "" };
+    let actions = if who.is_authenticated() {
+        r##"<a class="btn btn-primary" href="/new"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>New repository</a>"##
     } else {
-        let action = if who.is_authenticated() {
-            r##"<a class="btn btn-primary" href="/new">New repository</a>"##
-        } else {
-            r##"<a class="btn btn-primary" href="/signin">Sign in</a>"##
-        };
-        format!(
-            r##"<div class="console__head console__head--row">
-  <div><p class="eyebrow">Steadholme · SOVEREIGN ESTATE</p><h1>Repositories</h1></div>
-  {action}
-</div>"##,
-            action = action,
-        )
+        r##"<a class="btn btn-primary" href="/signin">Sign in</a>"##
+    };
+    let clear = if has_filters {
+        "<a class=\"repo-browser__clear\" href=\"/\">Clear</a>"
+    } else {
+        ""
     };
 
     format!(
-        r##"{head}
-<form class="repo-filter" method="get" action="/">
-  <input class="input repo-filter__q" type="search" name="q" value="{q}" placeholder="Find a repository&hellip;" aria-label="Filter repositories">
-</form>
-{list}"##,
-        head = head,
+        r##"<section class="repo-workspace" aria-labelledby="repo-workspace-title">
+  <header class="repo-workspace__head">
+    <h1 id="repo-workspace-title">Repositories</h1>
+    <div class="repo-workspace__actions">{actions}</div>
+  </header>
+  <form class="repo-browser" method="get" action="/">
+    <div class="repo-browser__search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <label class="sr-only" for="repo-search">Find a repository</label>
+      <input class="input repo-filter__q" id="repo-search" type="search" name="q" value="{q}" placeholder="Find a repository" autocomplete="off">
+      <kbd aria-hidden="true">⌘K</kbd>
+    </div>
+    <select class="select" name="ownership" aria-label="Ownership">
+      <option value="">All repositories</option>
+      <option value="owned"{owned_selected}>Owned by me</option>
+      <option value="collaborating"{collaborating_selected}>Collaborating</option>
+    </select>
+    <select class="select" name="visibility" aria-label="Visibility">
+      <option value="">Public and private</option>
+      <option value="public"{public_selected}>Public</option>
+      <option value="private"{private_selected}>Private</option>
+    </select>
+    <select class="select" name="language" aria-label="Language">
+      <option value="">All languages</option>
+      {language_options}
+    </select>
+    <button class="btn" type="submit">Apply</button>
+    {clear}
+  </form>
+  <div class="repo-groups" aria-live="polite">{list}</div>
+</section>"##,
+        actions = actions,
         q = esc(q),
+        owned_selected = sel(ownership, "owned"),
+        collaborating_selected = sel(ownership, "collaborating"),
+        public_selected = sel(visibility, "public"),
+        private_selected = sel(visibility, "private"),
+        language_options = language_options,
+        clear = clear,
         list = list,
     )
 }
 
+/// One repository row of the index: glyph · owner/name (+ private chip) · description ·
+/// language · 12-week activity bars · last-update age.
+fn render_repo_row(row: &RepoRow, now: i64) -> String {
+    let r = &row.repo;
+    let chip = if r.is_private {
+        "<span class=\"vis-chip vis-chip--private\">Private</span>"
+    } else {
+        ""
+    };
+    let desc = if r.description.trim().is_empty() {
+        "<span class=\"repo-row__desc repo-row__desc--empty\">&mdash;</span>".to_string()
+    } else {
+        format!("<span class=\"repo-row__desc\">{}</span>", esc(&r.description))
+    };
+    let lang = row
+        .language
+        .map(|language| {
+            format!(
+                "<span class=\"lang-dot\" style=\"--lang-color:#{color}\" aria-hidden=\"true\"></span>{name}",
+                color = language.color,
+                name = esc(language.name),
+            )
+        })
+        .unwrap_or_default();
+    let max = row.activity.iter().copied().max().unwrap_or(0).max(1);
+    let bars = row
+        .activity
+        .iter()
+        .map(|n| {
+            if *n == 0 {
+                "<i class=\"is-zero\"></i>".to_string()
+            } else {
+                format!("<i style=\"--h:{:.2}\"></i>", *n as f32 / max as f32)
+            }
+        })
+        .collect::<String>();
+    let (time_label, time_abs, time_rel) = match row.head_time {
+        Some(t) => ("Updated", fmt_ts(t), fmt_rel(now, t)),
+        None => ("Created", fmt_ts(r.created_at), fmt_rel(now, r.created_at)),
+    };
+    format!(
+        r##"<li class="repo-row"><a class="repo-card__link" href="/r/{owner}/{name}">
+  <span class="repo-row__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
+  <span class="repo-row__content">
+    <span class="repo-row__title"><span class="repo-row__name">{owner_e} / <b>{name_e}</b></span>{chip}</span>
+    {desc}
+  </span>
+  <span class="repo-row__language">{lang}</span>
+  <span class="repo-row__activity" aria-hidden="true">{bars}</span>
+  <span class="repo-row__updated" title="{time_abs}">{time_label} {time_rel}</span>
+</a></li>"##,
+        owner = esc(&r.owner_sub),
+        name = esc(&r.name),
+        owner_e = esc(&r.owner_sub),
+        name_e = esc(&r.name),
+        chip = chip,
+        desc = desc,
+        lang = lang,
+        bars = bars,
+        time_abs = esc(&time_abs),
+        time_label = time_label,
+        time_rel = esc(&time_rel),
+    )
+}
+
 fn render_new(
+    owner: &str,
     csrf: &str,
     error: Option<&str>,
     name: &str,
@@ -1017,28 +1122,49 @@ fn render_new(
             )
         })
         .unwrap_or_default();
-    let checked = if private { " checked" } else { "" };
+    let (public_checked, private_checked) = if private {
+        ("", " checked")
+    } else {
+        (" checked", "")
+    };
     format!(
-        r##"<div class="console__head"><h1>Create a new repository</h1><p class="sub">A repository contains your project's files and history.</p></div>
+        r##"<div class="new-repo">
+<h1>New repository</h1>
 {error_block}
 <form class="new-repo-form" method="post" action="/new">
   <input type="hidden" name="csrf_token" value="{csrf}">
-  <div class="form-section">
-    <div class="field"><label class="label" for="nr-name">Repository name</label><input class="input" type="text" id="nr-name" name="name" maxlength="64" autocomplete="off" spellcheck="false" required value="{name}"></div>
-    <div class="field"><label class="label" for="nr-desc">Description <span class="hint--muted">(optional)</span></label><input class="input" type="text" id="nr-desc" name="description" maxlength="500" value="{description}"></div>
+  <div class="card">
+    <div class="card__body">
+      <div class="form-row">
+        <div class="field"><label class="label" for="nr-owner">Owner</label><input class="input new-repo__owner" type="text" id="nr-owner" value="{owner}" readonly tabindex="-1"></div>
+        <span class="form-row__slash" aria-hidden="true">/</span>
+        <div class="field"><label class="label" for="nr-name">Repository name</label><input class="input" type="text" id="nr-name" name="name" maxlength="64" autocomplete="off" spellcheck="false" required value="{name}"></div>
+      </div>
+      <div class="field"><label class="label" for="nr-desc">Description</label><input class="input" type="text" id="nr-desc" name="description" maxlength="500" value="{description}"></div>
+      <div class="field">
+        <span class="label">Visibility</span>
+        <div class="vis-options">
+          <label class="vis-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg><span class="vis-option__text"><b>Public</b><span>Anyone on the estate can clone</span></span><input type="radio" name="visibility" value="public"{public_checked}></label>
+          <label class="vis-option"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span class="vis-option__text"><b>Private</b><span>Collaborators and tokens only</span></span><input type="radio" name="visibility" value="private"{private_checked}></label>
+        </div>
+      </div>
+      <div class="field"><label class="label" for="nr-branch">Default branch</label><input class="input" type="text" id="nr-branch" name="default_branch" maxlength="64" autocomplete="off" spellcheck="false" value="{default_branch}"></div>
+    </div>
+    <div class="card__foot">
+      <a class="btn" href="/">Cancel</a>
+      <button class="btn btn-primary" type="submit">Create repository</button>
+    </div>
   </div>
-  <div class="form-section">
-    <div class="field"><label class="label" for="nr-branch">Default branch</label><input class="input" type="text" id="nr-branch" name="default_branch" maxlength="64" autocomplete="off" spellcheck="false" value="{default_branch}"></div>
-    <div class="field field--check"><label class="check"><input type="checkbox" name="visibility" value="private"{checked}> Private repository</label></div>
-  </div>
-  <div class="actions"><button class="btn btn-primary" type="submit">Create repository</button></div>
-</form>"##,
+</form>
+</div>"##,
         error_block = error_block,
+        owner = esc(owner),
         csrf = esc(csrf),
         name = esc(name),
         description = esc(description),
         default_branch = esc(default_branch),
-        checked = checked,
+        public_checked = public_checked,
+        private_checked = private_checked,
     )
 }
 
@@ -1079,7 +1205,7 @@ async fn render_new_error(who: &Identity, msg: &str, form: &CreateForm) -> Respo
     } else {
         form.default_branch.trim()
     };
-    let body = render_new(
+    let body = render_new(&who.subject, 
         &csrf,
         Some(msg),
         form.name.trim(),
@@ -1193,11 +1319,12 @@ async fn render_code_page_at_commit(
         String::new()
     };
 
-    let content = if subpath.is_empty() && !latest_release.is_empty() {
+    let content = if subpath.is_empty() {
+        let clone_block = render_clone_block(repo, &state.config.public_base_url);
         format!(
             r##"<div class="repo-layout">
   <div class="repo-layout__main">{files}{readme}</div>
-  <aside class="side">{latest_release}</aside>
+  <aside class="side">{clone_block}{latest_release}</aside>
 </div>"##
         )
     } else {
@@ -1225,9 +1352,10 @@ fn render_code_toolbar(
     let primary = if let Some(n_branches) = branch_count {
         format!(
             r##"<a class="branchbtn" href="/r/{owner}/{name}/branches">
-    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span class="branchbtn__name">{branch}</span><span class="branchbtn__count">{n_branches}</span>
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span class="branchbtn__name">{branch}</span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
   </a>
-  <a class="code-toolbar__link" href="/r/{owner}/{name}/commits"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Commits</a>
+  <a class="code-toolbar__link" href="/r/{owner}/{name}/branches">{n_branches} {branch_word}</a>
+  <a class="code-toolbar__link" href="/r/{owner}/{name}/commits"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5M12 7v5l3 2"/></svg>History</a>
   <span class="code-toolbar__spacer"></span>
   <form class="code-toolbar__search" action="/r/{owner}/{name}/search" method="get" role="search">
     <input class="code-toolbar__q" type="search" name="q" placeholder="Search code" aria-label="Search code">
@@ -1237,6 +1365,7 @@ fn render_code_toolbar(
             name = esc(&repo.name),
             branch = esc(&repo.default_branch),
             n_branches = n_branches,
+            branch_word = if n_branches == 1 { "branch" } else { "branches" },
         )
     } else {
         r#"<span class="code-toolbar__spacer"></span>"#.to_string()
@@ -1245,14 +1374,14 @@ fn render_code_toolbar(
         r##"<div class="code-toolbar">
   {primary}
   <details class="popbtn popbtn--clone">
-    <summary class="btn btn-primary btn-sm">Code<svg class="popbtn__caret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></summary>
+    <summary class="btn btn-primary btn-sm"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg>Clone<svg class="popbtn__caret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></summary>
     <div class="popbtn__pop">
       <div class="popbtn__label">Clone over HTTPS</div>
       <div class="clone-row">
         <input class="clone-row__url" type="text" readonly value="{clone_url}" onclick="this.select()">
         <button class="btn btn-ghost btn-sm" type="button" data-copy="{clone_url}">Copy</button>
       </div>
-      <p class="popbtn__hint">Authenticate with a <a href="/pats">personal access token</a>.</p>
+      <p class="popbtn__hint">Password = <a href="/pats">personal access token</a></p>
     </div>
   </details>
   {fork_popover}
@@ -1269,7 +1398,7 @@ fn render_code_toolbar_at_commit(repo: &Repo, commit: &str) -> String {
   <a class="branchbtn" href="/r/{owner}/{name}/commit/{commit}">
     <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M1.75 3.5a.75.75 0 0 0 0 1.5h8.69L7.22 8.22a.75.75 0 1 0 1.06 1.06l4.5-4.5a.75.75 0 0 0 0-1.06l-4.5-4.5a.75.75 0 0 0-1.06 1.06L10.44 3.5H1.75Zm12.5 7.5H5.56l3.22-3.22a.75.75 0 1 0-1.06-1.06l-4.5 4.5a.75.75 0 0 0 0 1.06l4.5 4.5a.75.75 0 1 0 1.06-1.06L5.56 12.5h8.69a.75.75 0 0 0 0-1.5Z"/></svg><span class="branchbtn__name">{short}</span>
   </a>
-  <a class="code-toolbar__link" href="/r/{owner}/{name}/commits"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Commits</a>
+  <a class="code-toolbar__link" href="/r/{owner}/{name}/commits"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5M12 7v5l3 2"/></svg>History</a>
   <span class="code-toolbar__spacer"></span>
   <form class="code-toolbar__search" action="/r/{owner}/{name}/search" method="get" role="search">
     <input class="code-toolbar__q" type="search" name="q" placeholder="Search code" aria-label="Search code">
@@ -1328,6 +1457,27 @@ async fn render_latest_release(state: &AppState, repo: &Repo) -> String {
     render_latest_release_card(repo, &release)
 }
 
+/// Side-rail clone block on the repository home: the HTTPS clone URL with a copy button.
+fn render_clone_block(repo: &Repo, base_url: &str) -> String {
+    let clone_url = format!(
+        "{}/git/{}/{}.git",
+        base_url.trim_end_matches('/'),
+        repo.owner_sub,
+        repo.name
+    );
+    format!(
+        r##"<section class="side__block side-clone">
+  <h3 class="side__label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-5-6-5M12 19h8"/></svg>Clone</h3>
+  <div class="clone-row">
+    <input class="clone-row__url" type="text" readonly value="{clone_url}" onclick="this.select()" aria-label="Clone URL">
+    <button class="iconbtn iconbtn--outlined" type="button" data-copy="{clone_url}" aria-label="Copy clone URL" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+  </div>
+  <p class="side__hint">Password = <a href="/pats">personal access token</a></p>
+</section>"##,
+        clone_url = esc(&clone_url),
+    )
+}
+
 fn render_latest_release_card(repo: &Repo, release: &Release) -> String {
     let prerelease = if release.is_prerelease {
         "<span class=\"state-badge release-badge release-badge--prerelease\">Pre-release</span>"
@@ -1337,12 +1487,11 @@ fn render_latest_release_card(repo: &Repo, release: &Release) -> String {
     let now = now_secs();
     format!(
         r##"<section class="side__block">
-  <h3 class="side__label">Latest release</h3>
+  <h3 class="side__label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg>Latest release</h3>
   <div class="side-release">
     <a class="side-release__title" href="/r/{owner}/{name}/releases/tag/{tag}">{title}</a>
     <div class="side-release__meta"><span class="release-tag">{tag}</span>{prerelease}</div>
-    <span class="side-release__age" title="{published_abs}">{published_rel}</span>
-    <span class="side-release__assets">0 assets</span>
+    <span class="side-release__age" title="{published_abs}">Published {published_rel}</span>
   </div>
   <a class="side__more" href="/r/{owner}/{name}/releases">All releases</a>
 </section>"##,
@@ -1388,7 +1537,7 @@ pub(crate) fn render_repo_header_with_parent(
     let badge = if repo.is_private {
         "<span class=\"vis-badge vis-badge--private\">Private</span>"
     } else {
-        "<span class=\"vis-badge\">Public</span>"
+        ""
     };
     let desc = if repo.description.trim().is_empty() {
         String::new()
@@ -1432,11 +1581,11 @@ pub(crate) fn render_repo_header_with_parent(
   {fork_line}
 </header>
 <nav class="tabs" aria-label="Repository sections">
-  <a class="tab{code_active}"{code_current} href="/r/{owner}/{name}">Code{code_ind}</a>
-  <a class="tab{issues_active}"{issues_current} href="/r/{owner}/{name}/issues">Issues <span class="tab__count">{open_issues}</span>{issues_ind}</a>
-  <a class="tab{pulls_active}"{pulls_current} href="/r/{owner}/{name}/pulls">Pull requests <span class="tab__count">{open_pulls}</span>{pulls_ind}</a>
-  <a class="tab{releases_active}"{releases_current} href="/r/{owner}/{name}/releases">Releases <span class="tab__count">{release_count}</span>{releases_ind}</a>
-  <a class="tab{settings_active}"{settings_current} href="/r/{owner}/{name}/settings">Settings{settings_ind}</a>
+  <a class="tab{code_active}"{code_current} href="/r/{owner}/{name}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg>Code{code_ind}</a>
+  <a class="tab{issues_active}"{issues_current} href="/r/{owner}/{name}/issues"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>Issues <span class="tab__count">{open_issues}</span>{issues_ind}</a>
+  <a class="tab{pulls_active}"{pulls_current} href="/r/{owner}/{name}/pulls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7M6 9v12"/></svg>Pull requests <span class="tab__count">{open_pulls}</span>{pulls_ind}</a>
+  <a class="tab{releases_active}"{releases_current} href="/r/{owner}/{name}/releases"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg>Releases <span class="tab__count">{release_count}</span>{releases_ind}</a>
+  <a class="tab{settings_active}"{settings_current} href="/r/{owner}/{name}/settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>Settings{settings_ind}</a>
 </nav>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
@@ -1657,6 +1806,7 @@ fn render_file_browser(
         .map(|commit| {
             format!(
                 r##"<div class="filebox__commit">
+    <span class="avatar avatar--sm" aria-hidden="true">{avatar}</span>
     <span class="filebox__commit-author">{author}</span>
     <a class="filebox__commit-msg" href="/r/{owner}/{name}/commit/{oid}">{subject}</a>
     <span class="filebox__commit-fill"></span>
@@ -1668,6 +1818,7 @@ fn render_file_browser(
                 name = esc(&repo.name),
                 oid = esc(&commit.oid),
                 short = esc(&short_oid(&commit.oid)),
+                avatar = esc(&initials(&commit.author_email)),
                 author = esc(&commit.author_name),
                 subject = esc(&commit.subject),
                 when_abs = esc(&fmt_ts(commit.time)),

@@ -104,9 +104,12 @@ pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
     };
     let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).

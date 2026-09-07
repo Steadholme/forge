@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, Identity};
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_ts, html_with_csrf, page, redirect};
+use crate::handlers::{esc, fmt_rel, fmt_ts, html_with_csrf, page, redirect};
 use crate::model::Pat;
 use crate::{now_secs, random_alnum, AppState};
 
@@ -152,11 +152,15 @@ fn render_pats(
     error: Option<&str>,
     new_secret: Option<&str>,
 ) -> String {
+    let now = now_secs();
     let reveal = match new_secret {
         Some(secret) => format!(
             r##"<div class="token-reveal">
-  <p class="token-reveal__label">New token — copy it now, it will not be shown again:</p>
-  <code class="token-reveal__value">{secret}</code>
+  <p class="token-reveal__label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M15 8l3 3M18 5l2 2"/></svg>New token <span class="token-reveal__once">Shown once — it will not be shown again</span></p>
+  <div class="token-reveal__row">
+    <code class="token-reveal__value">{secret}</code>
+    <button class="btn btn-primary btn-sm" type="button" data-copy="{secret}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>Copy</button>
+  </div>
 </div>"##,
             secret = esc(secret),
         ),
@@ -177,19 +181,21 @@ fn render_pats(
             .map(|p| {
                 format!(
                     r##"<li class="pat-item">
+  <span class="pat-item__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M15 8l3 3M18 5l2 2"/></svg></span>
   <div class="pat-item__head">
     <span class="pat-item__name">{name}</span>
-    <form class="inline-form" method="post" action="/pats/{id}/revoke" onsubmit="return confirm('Revoke this token? Clients using it will stop working.');">
-      <input type="hidden" name="csrf_token" value="{csrf}">
-      <button class="btn btn-danger btn-sm" type="submit">Revoke</button>
-    </form>
+    <span class="pat-item__meta" title="{created_abs}">created {created}</span>
   </div>
-  <span class="pat-item__meta">created {created}</span>
+  <form class="inline-form" method="post" action="/pats/{id}/revoke" onsubmit="return confirm('Revoke this token? Clients using it will stop working.');">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <button class="btn btn-danger btn-sm" type="submit">Revoke</button>
+  </form>
 </li>"##,
                     name = esc(&p.name),
                     id = esc(&p.id),
                     csrf = esc(csrf),
-                    created = esc(&fmt_ts(p.created_at)),
+                    created_abs = esc(&fmt_ts(p.created_at)),
+                    created = esc(&fmt_rel(now, p.created_at)),
                 )
             })
             .collect::<Vec<_>>()
@@ -197,37 +203,37 @@ fn render_pats(
     };
 
     format!(
-        r##"<div class="console__head">
-  <h1>Access tokens</h1>
-  <p class="sub">Personal access tokens authenticate <code>git</code> over HTTPS for {email}. Use the token as the password (any username) when cloning or pushing.</p>
-</div>
-{reveal}
-<div class="layout">
+        r##"<div class="tokens">
+  <div class="tokens__head"><h1>Personal access tokens</h1><span class="muted">{email}</span></div>
+  {reveal}
   <section class="card">
-    <div class="card__head"><h2>Your tokens</h2></div>
-    <div class="card__body"><ul class="pat-list">{list}</ul></div>
+    <div class="card__head"><h2>New token</h2></div>
+    {error_block}
+    <form class="token-form" method="post" action="/pats">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <div class="field">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" maxlength="100" placeholder="e.g. laptop" autocomplete="off" required>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M15 8l3 3M18 5l2 2"/></svg>Generate token</button>
+      </div>
+    </form>
   </section>
   <section class="card">
-    <div class="card__head"><h2>Generate token</h2></div>
-    <div class="card__body">
-      {error_block}
-      <form method="post" action="/pats">
-        <input type="hidden" name="csrf_token" value="{csrf}">
-        <div class="field">
-          <label for="name">Token name</label>
-          <input type="text" id="name" name="name" maxlength="100" placeholder="e.g. laptop" autocomplete="off" required>
-        </div>
-        <div class="actions">
-          <button class="btn btn-primary" type="submit">Generate token</button>
-        </div>
-      </form>
-    </div>
+    <div class="card__head"><h2>Active tokens</h2><span class="tab__count">{count}</span></div>
+    <div class="card__body card__body--list"><ul class="pat-list">{list}</ul></div>
   </section>
 </div>"##,
         email = esc(&who.email),
         reveal = reveal,
-        list = list,
-        error_block = error_block,
+        error_block = if error_block.is_empty() {
+            String::new()
+        } else {
+            format!("<div class=\"card__body\">{error_block}</div>")
+        },
         csrf = esc(csrf),
+        count = pats.len(),
+        list = list,
     )
 }

@@ -62,7 +62,9 @@ impl RegError {
                 (StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", m.clone())
             }
             RegError::ManifestUnknown(m) => (StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", m.clone()),
-            RegError::ManifestInvalid(m) => (StatusCode::BAD_REQUEST, "MANIFEST_INVALID", m.clone()),
+            RegError::ManifestInvalid(m) => {
+                (StatusCode::BAD_REQUEST, "MANIFEST_INVALID", m.clone())
+            }
             RegError::DigestInvalid(m) => (StatusCode::BAD_REQUEST, "DIGEST_INVALID", m.clone()),
             RegError::Unsupported(m) => (StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", m.clone()),
             RegError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "not found".to_string()),

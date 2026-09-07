@@ -14,7 +14,7 @@ use crate::auth::{self, Identity};
 use crate::error::AppError;
 use crate::gitops::TagInfo;
 use crate::handlers::repos::{can_write_repo, header_with_counts_for, load_visible_repo};
-use crate::handlers::{esc, fmt_ts, html_ok, html_with_csrf, page, redirect};
+use crate::handlers::{esc, fmt_rel, fmt_ts, html_ok, html_with_csrf, page, redirect};
 use crate::model::{Release, Repo};
 use crate::{now_secs, random_alnum, AppState};
 
@@ -380,7 +380,7 @@ async fn render_new_page(
 fn render_list(repo: &Repo, releases: &[Release], writer: bool) -> String {
     let new_button = if writer {
         format!(
-            "<a class=\"btn btn-primary btn-sm\" href=\"/r/{owner}/{name}/releases/new\">New release</a>",
+            "<a class=\"btn btn-primary btn-sm\" href=\"/r/{owner}/{name}/releases/new\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\"/></svg>New release</a>",
             owner = esc(&repo.owner_sub),
             name = esc(&repo.name),
         )
@@ -390,55 +390,77 @@ fn render_list(repo: &Repo, releases: &[Release], writer: bool) -> String {
     let rows = if releases.is_empty() {
         "<div class=\"empty\"><div class=\"empty__title\">No releases yet</div></div>".to_string()
     } else {
+        let latest_id = releases
+            .iter()
+            .find(|r| !r.is_draft && !r.is_prerelease)
+            .map(|r| r.id.as_str());
         releases
             .iter()
-            .map(|r| render_release_card(repo, r, true))
+            .map(|r| render_release_card(repo, r, true, latest_id == Some(r.id.as_str())))
             .collect::<String>()
     };
     format!(
-        r##"<section class="card">
-  <div class="card__head"><h2>Releases <span class="tab__count">{count}</span></h2>{new_button}</div>
-  <div class="card__body release-list">{rows}</div>
-</section>"##,
+        r##"<div class="releases-head">
+  <h2>Releases <span class="tab__count">{count}</span></h2>
+  <a class="btn btn-secondary btn-sm" href="/r/{owner}/{name}/branches"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8Z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg>Tags</a>
+  {new_button}
+</div>
+<div class="release-list">{rows}</div>"##,
         count = releases.len(),
+        owner = esc(&repo.owner_sub),
+        name = esc(&repo.name),
         new_button = new_button,
         rows = rows,
     )
 }
 
-fn render_release_card(repo: &Repo, release: &Release, with_summary: bool) -> String {
-    let badges = render_release_badges(release);
+fn render_release_card(repo: &Repo, release: &Release, with_summary: bool, latest: bool) -> String {
+    let mut badges = String::new();
+    if latest {
+        badges.push_str("<span class=\"state-badge release-badge release-badge--latest\">Latest</span>");
+    }
+    badges.push_str(&render_release_badges(release));
     let notes = if with_summary {
         let summary = release_summary(&release.body_md);
         if summary.is_empty() {
-            "<p class=\"muted\">No release notes.</p>".to_string()
+            String::new()
         } else {
             format!("<p class=\"release-card__summary\">{}</p>", esc(&summary))
         }
     } else {
         String::new()
     };
+    let now = now_secs();
     let when = if release.is_draft {
-        "Draft".to_string()
+        "draft".to_string()
     } else {
-        format!("Published {}", fmt_ts(release.published_at))
+        format!(
+            "published <span title=\"{}\">{}</span>",
+            esc(&fmt_ts(release.published_at)),
+            esc(&fmt_rel(now, release.published_at))
+        )
+    };
+    let draft_class = if release.is_draft {
+        " release-card--draft"
+    } else {
+        ""
     };
     format!(
-        r##"<article class="release-card">
+        r##"<article class="release-card{draft_class}">
   <div class="release-card__head">
     <div>
-      <a class="release-card__title" href="/r/{owner}/{name}/releases/tag/{tag}">{title}</a>
+      <a class="release-card__title" href="/r/{owner}/{name}/releases/tag/{tag}"><span class="release-tag">{tag_name}</span>{title}</a>
       <div class="release-card__meta">
-        <span class="release-tag">{tag_name}</span>
+        <span class="avatar avatar--sm" aria-hidden="true">{avatar}</span>
+        <span>{author} · {when}</span>
         <a href="/r/{owner}/{name}/commit/{target}"><code class="oid">{short}</code></a>
-        <span>{when}</span>
       </div>
     </div>
     <div class="release-card__badges">{badges}</div>
   </div>
   {notes}
-  <div class="release-assets"><span class="release-asset muted">No assets.</span></div>
 </article>"##,
+        draft_class = draft_class,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
         tag = esc(&release.tag_name),
@@ -446,7 +468,9 @@ fn render_release_card(repo: &Repo, release: &Release, with_summary: bool) -> St
         tag_name = esc(&release.tag_name),
         target = esc(&release.target_commit),
         short = esc(&crate::handlers::short_oid(&release.target_commit)),
-        when = esc(&when),
+        avatar = esc(&crate::handlers::initials(&release.created_by)),
+        author = esc(&release.created_by),
+        when = when,
         badges = badges,
         notes = notes,
     )
@@ -454,7 +478,7 @@ fn render_release_card(repo: &Repo, release: &Release, with_summary: bool) -> St
 
 fn render_detail(repo: &Repo, release: &Release, writer: bool, csrf: &str) -> String {
     let notes = if release.body_md.trim().is_empty() {
-        "<p class=\"muted\">No release notes.</p>".to_string()
+        String::new()
     } else {
         crate::markdown::render_for_repo(&release.body_md, &repo.owner_sub, &repo.name)
     };
@@ -486,8 +510,7 @@ fn render_detail(repo: &Repo, release: &Release, writer: bool, csrf: &str) -> St
     <div class="release-card__badges">{badges}</div>
   </div>
   <div class="card__body markdown-body">{notes}</div>
-  <div class="card__body release-assets"><span class="release-asset muted">No assets.</span></div>
-  <div class="card__body">{delete_form}</div>
+  {delete_block}
 </section>"##,
         owner = esc(&repo.owner_sub),
         name = esc(&repo.name),
@@ -498,7 +521,11 @@ fn render_detail(repo: &Repo, release: &Release, writer: bool, csrf: &str) -> St
         created = esc(&fmt_ts(release.created_at)),
         badges = render_release_badges(release),
         notes = notes,
-        delete_form = delete_form,
+        delete_block = if delete_form.is_empty() {
+            String::new()
+        } else {
+            format!("<div class=\"card__foot\">{delete_form}</div>")
+        },
     )
 }
 

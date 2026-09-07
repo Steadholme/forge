@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use cellar::config::Config;
 use cellar::blobs::MemoryBlobStore;
+use cellar::config::Config;
 use cellar::store::{InMemoryStore, Store};
 use cellar::{app, AppState};
 use tower::ServiceExt;
@@ -28,7 +28,10 @@ impl Resp {
 async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
     Resp { status, body }
 }
 
@@ -63,7 +66,11 @@ async fn pull_count_increments_only_on_real_manifest_get() {
     )
     .await;
     assert_eq!(put.status, StatusCode::CREATED, "{}", put.text());
-    assert_eq!(store.pull_stat(name).await.unwrap(), None, "PUT must not count as a pull");
+    assert_eq!(
+        store.pull_stat(name).await.unwrap(),
+        None,
+        "PUT must not count as a pull"
+    );
 
     // A HEAD (docker's existence probe) must NOT count.
     let head = send(
@@ -76,7 +83,11 @@ async fn pull_count_increments_only_on_real_manifest_get() {
     )
     .await;
     assert_eq!(head.status, StatusCode::OK);
-    assert_eq!(store.pull_stat(name).await.unwrap(), None, "HEAD must not count as a pull");
+    assert_eq!(
+        store.pull_stat(name).await.unwrap(),
+        None,
+        "HEAD must not count as a pull"
+    );
 
     // A real GET by a docker/oci client counts.
     let get1 = send(
@@ -149,17 +160,59 @@ async fn pull_stats_surface_on_web_console() {
     .await;
 
     // Before any pull: "Never pulled" on the repo detail page.
-    let before = send(&app, Request::builder().method("GET").uri(format!("/r/{name}")).body(Body::empty()).unwrap()).await;
+    let before = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/r/{name}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(before.status, StatusCode::OK);
-    assert!(before.text().contains("Never pulled"), "expected 'Never pulled' pre-pull");
+    assert!(
+        before.text().contains("Never pulled"),
+        "expected 'Never pulled' pre-pull"
+    );
 
     // One real pull.
-    send(&app, Request::builder().method("GET").uri(format!("/v2/{name}/manifests/latest")).body(Body::empty()).unwrap()).await;
+    send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/v2/{name}/manifests/latest"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
 
     // The repo detail page AND the repository list both surface "1 pull · last pulled ...".
-    let detail = send(&app, Request::builder().method("GET").uri(format!("/r/{name}")).body(Body::empty()).unwrap()).await;
-    assert!(detail.text().contains("1 pull"), "repo page missing pull line: {}", detail.text());
+    let detail = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/r/{name}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        detail.text().contains("1 pull"),
+        "repo page missing pull line: {}",
+        detail.text()
+    );
 
-    let index = send(&app, Request::builder().method("GET").uri("/").body(Body::empty()).unwrap()).await;
-    assert!(index.text().contains("1 pull"), "repo list missing pull line");
+    let index = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        index.text().contains("1 pull"),
+        "repo list missing pull line"
+    );
 }

@@ -70,6 +70,7 @@ pub fn app(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route(handlers::APP_CSS_PATH, get(handlers::app_css_asset))
         .route("/signin", get(handlers::signin))
         .route("/", get(handlers::repos::index))
         .route(
@@ -342,6 +343,12 @@ async fn require_auth_for_writes(
     if path.starts_with("/git/") {
         return next.run(req).await;
     }
+    // Commit statuses are a machine-only write path. The handler performs a fail-closed,
+    // constant-time Bearer-token check; let the request reach it without fabricating a gateway
+    // identity or weakening the SSO gate for any other mutation.
+    if *req.method() == axum::http::Method::POST && is_commit_status_write_path(&path) {
+        return next.run(req).await;
+    }
 
     let who = auth::identity(req.headers());
     if who.is_authenticated() {
@@ -364,6 +371,19 @@ async fn require_auth_for_writes(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
     handlers::redirect(&format!("/signin?return={}", url_encode(return_to)))
+}
+
+fn is_commit_status_write_path(path: &str) -> bool {
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    segments.len() == 5
+        && segments[0] == "r"
+        && !segments[1].is_empty()
+        && !segments[2].is_empty()
+        && segments[3] == "statuses"
+        && !segments[4].is_empty()
 }
 
 /// Middleware enforcing [`auth::gateway_identity_ok`] — 401 on a missing/invalid signature.
@@ -476,4 +496,23 @@ pub fn random_alnum(len: usize) -> String {
         .iter()
         .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_commit_status_write_path;
+
+    #[test]
+    fn machine_status_bypass_is_exactly_one_route_shape() {
+        assert!(is_commit_status_write_path(
+            "/r/w33d/siteflow-smoke/statuses/deadbeef"
+        ));
+        assert!(!is_commit_status_write_path(
+            "/r/w33d/siteflow-smoke/settings"
+        ));
+        assert!(!is_commit_status_write_path(
+            "/r/w33d/siteflow-smoke/statuses/deadbeef/extra"
+        ));
+        assert!(!is_commit_status_write_path("/api/statuses/deadbeef"));
+    }
 }

@@ -59,7 +59,10 @@ pub fn index_platforms(raw: &str) -> Vec<String> {
         if let Some(arr) = v.get("manifests").and_then(|m| m.as_array()) {
             for m in arr {
                 let p = m.get("platform");
-                let os = p.and_then(|p| p.get("os")).and_then(|s| s.as_str()).unwrap_or("");
+                let os = p
+                    .and_then(|p| p.get("os"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
                 let arch = p
                     .and_then(|p| p.get("architecture"))
                     .and_then(|s| s.as_str())
@@ -89,7 +92,11 @@ pub fn index_platforms(raw: &str) -> Vec<String> {
 pub fn manifest_blob_digests(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-        if let Some(d) = v.get("config").and_then(|c| c.get("digest")).and_then(|s| s.as_str()) {
+        if let Some(d) = v
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|s| s.as_str())
+        {
             out.push(d.to_string());
         }
         if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
@@ -155,7 +162,11 @@ pub fn manifest_layers(raw: &str) -> Vec<Descriptor> {
 fn descriptor_from(v: &serde_json::Value) -> Option<Descriptor> {
     let digest = v.get("digest").and_then(|s| s.as_str())?;
     Some(Descriptor {
-        media_type: v.get("mediaType").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+        media_type: v
+            .get("mediaType")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
         digest: digest.to_string(),
         size: v.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
     })
@@ -184,7 +195,10 @@ pub fn index_entries(raw: &str) -> Vec<IndexEntry> {
                     continue;
                 };
                 let p = m.get("platform");
-                let os = p.and_then(|p| p.get("os")).and_then(|s| s.as_str()).unwrap_or("");
+                let os = p
+                    .and_then(|p| p.get("os"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
                 let arch = p
                     .and_then(|p| p.get("architecture"))
                     .and_then(|s| s.as_str())
@@ -193,16 +207,21 @@ pub fn index_entries(raw: &str) -> Vec<IndexEntry> {
                     .and_then(|p| p.get("variant"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("");
-                let platform = if os == "unknown" || arch == "unknown" || (os.is_empty() && arch.is_empty()) {
-                    String::new()
-                } else if variant.is_empty() {
-                    format!("{os}/{arch}")
-                } else {
-                    format!("{os}/{arch}/{variant}")
-                };
+                let platform =
+                    if os == "unknown" || arch == "unknown" || (os.is_empty() && arch.is_empty()) {
+                        String::new()
+                    } else if variant.is_empty() {
+                        format!("{os}/{arch}")
+                    } else {
+                        format!("{os}/{arch}/{variant}")
+                    };
                 out.push(IndexEntry {
                     digest: digest.to_string(),
-                    media_type: m.get("mediaType").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    media_type: m
+                        .get("mediaType")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     size: m.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
                     platform,
                 });
@@ -377,7 +396,11 @@ pub struct TagDetail {
 pub fn image_size(raw: &str) -> i64 {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
         let mut total: i64 = 0;
-        if let Some(c) = v.get("config").and_then(|c| c.get("size")).and_then(|s| s.as_i64()) {
+        if let Some(c) = v
+            .get("config")
+            .and_then(|c| c.get("size"))
+            .and_then(|s| s.as_i64())
+        {
             total += c;
         }
         if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
@@ -400,7 +423,8 @@ mod tests {
 
     #[test]
     fn image_size_sums_config_and_layers() {
-        let raw = r#"{"schemaVersion":2,"config":{"size":1000},"layers":[{"size":2000},{"size":500}]}"#;
+        let raw =
+            r#"{"schemaVersion":2,"config":{"size":1000},"layers":[{"size":2000},{"size":500}]}"#;
         assert_eq!(image_size(raw), 3500);
     }
 
@@ -455,7 +479,10 @@ mod tests {
         let config = manifest_config(raw).unwrap();
         assert_eq!(config.digest, "sha256:cfg");
         assert_eq!(config.size, 1000);
-        assert_eq!(config.media_type, "application/vnd.oci.image.config.v1+json");
+        assert_eq!(
+            config.media_type,
+            "application/vnd.oci.image.config.v1+json"
+        );
         let layers = manifest_layers(raw);
         assert_eq!(layers.len(), 2);
         assert_eq!(layers[0].digest, "sha256:l1");
@@ -500,9 +527,15 @@ mod tests {
         };
         assert!(base.may_push("team/app"));
         assert!(!base.may_push("other/app")); // pattern miss
-        let pull_only = RobotAccount { scope: ROBOT_SCOPE_PULL.into(), ..base.clone() };
+        let pull_only = RobotAccount {
+            scope: ROBOT_SCOPE_PULL.into(),
+            ..base.clone()
+        };
         assert!(!pull_only.may_push("team/app")); // pull scope never pushes
-        let disabled = RobotAccount { enabled: false, ..base.clone() };
+        let disabled = RobotAccount {
+            enabled: false,
+            ..base.clone()
+        };
         assert!(!disabled.may_push("team/app")); // disabled never pushes
     }
 

@@ -136,6 +136,7 @@ pub async fn handle(
                 let actor = remote_user.as_deref().unwrap_or(&repo.owner_sub);
                 webhooks::emit_push(&state, &repo, actor);
                 deploy::emit_auto_deploy(&state, &repo, actor, &body);
+                deploy::emit_auto_actions(&state, &repo, actor, &body);
                 deploy::emit_pr_previews(&state, &repo, actor, &body);
             }
             cgi_to_response(cgi)

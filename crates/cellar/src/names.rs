@@ -101,7 +101,8 @@ pub fn is_valid_robot_name(n: &str) -> bool {
     if !is_alnum(b[0]) || !is_alnum(b[b.len() - 1]) {
         return false;
     }
-    b.iter().all(|&c| is_alnum(c) || matches!(c, b'.' | b'_' | b'-'))
+    b.iter()
+        .all(|&c| is_alnum(c) || matches!(c, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]

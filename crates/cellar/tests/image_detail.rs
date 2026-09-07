@@ -27,16 +27,29 @@ impl Resp {
 async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
     Resp { status, body }
 }
 
 fn get(_app: &axum::Router, uri: &str) -> Request<Body> {
-    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// PUT a manifest body at `reference` with an explicit `Content-Type`.
-async fn put_manifest(app: &axum::Router, name: &str, reference: &str, ctype: &str, body: &str) -> Resp {
+async fn put_manifest(
+    app: &axum::Router,
+    name: &str,
+    reference: &str,
+    ctype: &str,
+    body: &str,
+) -> Resp {
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/v2/{name}/manifests/{reference}"))
@@ -87,20 +100,34 @@ async fn image_manifest_detail_by_tag_and_digest() {
     );
     // The tag pointing at this manifest is listed, linking back to the repo.
     assert!(html.contains(">latest</a>"), "detail missing tag chip");
-    assert!(html.contains(&format!("href=\"/r/{name}\"")), "detail missing back-to-repo link");
+    assert!(
+        html.contains(&format!("href=\"/r/{name}\"")),
+        "detail missing back-to-repo link"
+    );
 
     // 2. Same page resolved BY DIGEST (percent-encoded colon, as the links emit it).
     let dref = digest.replace(':', "%3A");
     let by_digest = send(&app, get(&app, &format!("/m/{name}?ref={dref}"))).await;
-    assert_eq!(by_digest.status, StatusCode::OK, "by digest: {}", by_digest.text());
+    assert_eq!(
+        by_digest.status,
+        StatusCode::OK,
+        "by digest: {}",
+        by_digest.text()
+    );
     assert!(by_digest.text().contains(OCI_MANIFEST));
 
     // 3. The repository page links each tag AND its digest to the manifest detail page.
     let repo = send(&app, get(&app, &format!("/r/{name}"))).await;
     assert_eq!(repo.status, StatusCode::OK);
     let rhtml = repo.text();
-    assert!(rhtml.contains(&format!("/m/{name}?ref=latest")), "repo page missing tag->manifest link");
-    assert!(rhtml.contains(&format!("/m/{name}?ref={dref}")), "repo page missing digest->manifest link");
+    assert!(
+        rhtml.contains(&format!("/m/{name}?ref=latest")),
+        "repo page missing tag->manifest link"
+    );
+    assert!(
+        rhtml.contains(&format!("/m/{name}?ref={dref}")),
+        "repo page missing digest->manifest link"
+    );
 }
 
 #[tokio::test]
@@ -128,21 +155,40 @@ async fn manifest_list_detail_lists_platforms() {
         armlen = arm64.len(),
     );
     let put_idx = put_manifest(&app, name, "latest", OCI_INDEX, &index).await;
-    assert_eq!(put_idx.status, StatusCode::CREATED, "index: {}", put_idx.text());
+    assert_eq!(
+        put_idx.status,
+        StatusCode::CREATED,
+        "index: {}",
+        put_idx.text()
+    );
 
     let detail = send(&app, get(&app, &format!("/m/{name}?ref=latest"))).await;
-    assert_eq!(detail.status, StatusCode::OK, "index detail: {}", detail.text());
+    assert_eq!(
+        detail.status,
+        StatusCode::OK,
+        "index detail: {}",
+        detail.text()
+    );
     let html = detail.text();
-    assert!(html.contains("Platforms"), "index detail missing platforms section");
+    assert!(
+        html.contains("Platforms"),
+        "index detail missing platforms section"
+    );
     assert!(html.contains("linux/amd64"), "missing amd64 platform");
-    assert!(html.contains("linux/arm64/v8"), "missing arm64 platform + variant");
+    assert!(
+        html.contains("linux/arm64/v8"),
+        "missing arm64 platform + variant"
+    );
     // Each child digest links to ITS OWN manifest detail page (list -> image manifests).
     let arm_ref = arm64_digest.replace(':', "%3A");
     assert!(
         html.contains(&format!("/m/{name}?ref={arm_ref}")),
         "index detail missing child manifest link"
     );
-    assert!(html.contains("manifest list"), "index detail missing kind badge");
+    assert!(
+        html.contains("manifest list"),
+        "index detail missing kind badge"
+    );
 }
 
 #[tokio::test]
@@ -152,7 +198,10 @@ async fn unknown_repo_and_tag_render_branded_404() {
     // Unknown repository.
     let ghost = send(&app, get(&app, "/m/ghost?ref=latest")).await;
     assert_eq!(ghost.status, StatusCode::NOT_FOUND);
-    assert!(ghost.text().contains("No repository"), "expected branded not-found");
+    assert!(
+        ghost.text().contains("No repository"),
+        "expected branded not-found"
+    );
 
     // Existing repo, unknown tag.
     let name = "library/present";
@@ -160,5 +209,8 @@ async fn unknown_repo_and_tag_render_branded_404() {
     put_manifest(&app, name, "latest", OCI_MANIFEST, &manifest).await;
     let missing = send(&app, get(&app, &format!("/m/{name}?ref=nope"))).await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
-    assert!(missing.text().contains("No tag"), "expected unknown-tag not-found");
+    assert!(
+        missing.text().contains("No tag"),
+        "expected unknown-tag not-found"
+    );
 }

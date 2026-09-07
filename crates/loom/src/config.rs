@@ -19,6 +19,7 @@ pub const DEFAULT_SITEFLOW_LOOM_CLONE_BASE_URL: &str = "https://git.w33d.xyz/git
 
 /// Default placeholder domain for SiteFlow preview URLs. This must not be under `w33d.xyz`.
 pub const DEFAULT_SITEFLOW_BASE_DOMAIN: &str = "sites.holdfast.internal";
+pub const DEFAULT_SITEFLOW_HOST_NAMESPACE: &str = "";
 
 /// Default cistern provisioning endpoint (`CISTERN_PROVISION_URL`); internal service address.
 pub const DEFAULT_CISTERN_PROVISION_URL: &str = "http://cistern:9370/provision";
@@ -61,6 +62,8 @@ pub struct Config {
     pub siteflow_clone_base_url: String,
     /// Base domain used to render placeholder preview URLs (`SITEFLOW_BASE_DOMAIN`).
     pub siteflow_base_domain: String,
+    /// Optional single-label namespace prepended to SiteFlow deployment hostnames.
+    pub siteflow_host_namespace: String,
     /// Default auto-deploy setting for newly saved deploy configs.
     pub auto_deploy_default: bool,
     /// Cistern provisioning endpoint (`CISTERN_PROVISION_URL`) called to lazily open a database
@@ -69,6 +72,10 @@ pub struct Config {
     /// Bearer token for Loom -> cistern provisioning calls (`CISTERN_PROVISION_TOKEN`). Empty
     /// disables lazy database provisioning (no outbound call is made).
     pub cistern_provision_token: String,
+    /// Internal Anvil URL (`ANVIL_API_URL`). Empty disables push-triggered workflows.
+    pub anvil_api_url: String,
+    /// Bearer token for Loom -> Anvil machine calls (`ANVIL_API_TOKEN`).
+    pub anvil_api_token: String,
     /// Global estate webhook sink (`ESTATE_WEBHOOK_URL`) for internal bridge delivery.
     pub estate_webhook_url: Option<String>,
     /// Shared secret for signing estate webhook deliveries (`ESTATE_WEBHOOK_SECRET`).
@@ -89,9 +96,12 @@ impl Config {
             siteflow_api_token: String::new(),
             siteflow_clone_base_url: DEFAULT_SITEFLOW_LOOM_CLONE_BASE_URL.to_string(),
             siteflow_base_domain: DEFAULT_SITEFLOW_BASE_DOMAIN.to_string(),
+            siteflow_host_namespace: DEFAULT_SITEFLOW_HOST_NAMESPACE.to_string(),
             auto_deploy_default: false,
             cistern_provision_url: DEFAULT_CISTERN_PROVISION_URL.to_string(),
             cistern_provision_token: String::new(),
+            anvil_api_url: String::new(),
+            anvil_api_token: String::new(),
             estate_webhook_url: None,
             estate_webhook_secret: None,
         }
@@ -130,6 +140,9 @@ impl Config {
         if let Some(v) = env_nonempty("SITEFLOW_BASE_DOMAIN") {
             config.siteflow_base_domain = v;
         }
+        if let Some(v) = env_nonempty("SITEFLOW_HOST_NAMESPACE") {
+            config.siteflow_host_namespace = v;
+        }
         if let Some(v) = env_nonempty("SITEFLOW_AUTO_DEPLOY_DEFAULT") {
             config.auto_deploy_default = parse_bool(&v);
         }
@@ -138,6 +151,12 @@ impl Config {
         }
         if let Some(v) = env_nonempty("CISTERN_PROVISION_TOKEN") {
             config.cistern_provision_token = v;
+        }
+        if let Some(v) = env_nonempty("ANVIL_API_URL") {
+            config.anvil_api_url = v;
+        }
+        if let Some(v) = env_nonempty("ANVIL_API_TOKEN") {
+            config.anvil_api_token = v;
         }
         if let Some(v) = env_nonempty("ESTATE_WEBHOOK_URL") {
             config.estate_webhook_url = Some(v);

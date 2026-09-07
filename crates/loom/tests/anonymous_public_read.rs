@@ -214,6 +214,9 @@ async fn anonymous_reads_public_repos_and_private_repos_404() {
 
     let home = send(&app, get("/", None)).await;
     assert_eq!(home.status, StatusCode::OK);
+    assert!(home
+        .body
+        .contains(&format!(r#"href="{}""#, loom::handlers::APP_CSS_PATH)));
     assert!(home.body.contains(r#"href="/r/alice/pub""#));
     assert!(!home.body.contains("alice/secret"));
     assert!(home
@@ -229,6 +232,28 @@ async fn anonymous_reads_public_repos_and_private_repos_404() {
 
     let private_repo = send(&app, get("/r/alice/secret", None)).await;
     assert_eq!(private_repo.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stylesheet_is_public_and_immutable() {
+    let app = app(temp_state());
+    let css = send(&app, get(loom::handlers::APP_CSS_PATH, None)).await;
+    assert_eq!(css.status, StatusCode::OK);
+    assert_eq!(css.content_type(), "text/css; charset=utf-8");
+    assert_eq!(
+        css.headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(
+        css.headers
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        "nosniff"
+    );
 }
 
 #[tokio::test]

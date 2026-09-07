@@ -38,7 +38,8 @@ pub async fn fetch_text(url: &str, timeout: Duration) -> Option<String> {
 /// terminator). `Connection: close` lets us read to EOF without parsing the length. Only plain
 /// `http://` targets are supported (the Beacon hop is in-network plaintext).
 async fn fetch_body(url: &str) -> std::io::Result<String> {
-    let (host, port, path) = parse_http_url(url).ok_or_else(|| io_err("invalid or non-http URL"))?;
+    let (host, port, path) =
+        parse_http_url(url).ok_or_else(|| io_err("invalid or non-http URL"))?;
     let mut stream = TcpStream::connect((host.as_str(), port)).await?;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: atlas/0.1\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
@@ -89,7 +90,11 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
     if host.is_empty() {
         return None;
     }
-    let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
+    };
     Some((host, port, path))
 }
 

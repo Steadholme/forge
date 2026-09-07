@@ -60,7 +60,9 @@ mod tests {
     #[test]
     fn digest_validation() {
         assert!(is_valid_digest(&sha256_digest(b"hello")));
-        assert!(is_valid_digest("sha256:0000000000000000000000000000000000000000000000000000000000000000"));
+        assert!(is_valid_digest(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
         assert!(!is_valid_digest("sha256:TOOSHORT"));
         assert!(!is_valid_digest("sha256:ABC")); // uppercase rejected
         assert!(!is_valid_digest("md5:abc"));

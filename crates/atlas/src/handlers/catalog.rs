@@ -19,7 +19,7 @@ use crate::auth;
 use crate::beacon;
 use crate::error::AppError;
 use crate::handlers::{
-    app_css, auth_cat, auth_word, esc, fmt_date, status_label, status_pill, status_slug, topbar,
+    auth_cat, auth_word, esc, fmt_date, status_label, status_pill, status_slug, topbar,
 };
 use crate::inventory::{self, auth_slug, Inventory, ServiceEntry};
 use crate::store::Service;
@@ -101,7 +101,6 @@ pub async fn index(
     }
 
     let page = CATALOG_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{TOPBAR}}", &topbar("Catalog", &email, theme))
@@ -166,7 +165,6 @@ pub async fn detail(
     };
 
     let page = DETAIL_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{TOPBAR}}", &topbar("Service", &email, theme))
@@ -248,7 +246,6 @@ pub async fn graph(
 
     let svg = render_graph_svg(&inv);
     let page = GRAPH_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{TOPBAR}}", &topbar("Topology", &email, theme))
