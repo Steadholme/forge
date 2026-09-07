@@ -4948,3 +4948,104 @@ async fn issue_toggle_json_flips_state_with_same_csrf_gate() {
     .await;
     assert_eq!(no_csrf.status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn issue_forms_accept_several_labels_at_once() {
+    let state = temp_state();
+    let store = state.store.clone();
+    let app = app(state);
+    create_repo(&app, "alice", "proj", "").await;
+    let repo = store.get_repo("alice", "proj").await.unwrap().unwrap();
+
+    let settings = send(&app, get("/r/alice/proj/settings", Some("alice"))).await;
+    let csrf = settings.csrf_cookie().unwrap();
+    for (name, color) in [("bug", "d73a4a"), ("gateway", "0e8a16"), ("mobile", "fbca04")] {
+        let created = send(
+            &app,
+            post_form(
+                "/r/alice/proj/settings/labels",
+                &[("csrf_token", &csrf), ("name", name), ("color", color)],
+                &csrf,
+                Some("alice"),
+            ),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::FOUND);
+    }
+    let labels = store.list_labels(&repo.id).await.unwrap();
+    let id_of = |name: &str| labels.iter().find(|l| l.name == name).unwrap().id.clone();
+    let (bug, gateway, mobile) = (id_of("bug"), id_of("gateway"), id_of("mobile"));
+
+    // A checkbox group posts one `labels` field per checked box.
+    let issues_page = send(&app, get("/r/alice/proj/issues", Some("alice"))).await;
+    let csrf = issues_page.csrf_cookie().unwrap();
+    let opened = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues",
+            &[
+                ("csrf_token", &csrf),
+                ("title", "Two labels"),
+                ("body", ""),
+                ("labels", &bug),
+                ("labels", &gateway),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(opened.status, StatusCode::FOUND, "{}", opened.body);
+    let detail = send(&app, get("/r/alice/proj/issues/1", Some("alice"))).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    let side = &detail.body[detail.body.find("<aside class=\"side\">").unwrap()..];
+    assert!(side.contains(">bug</span>"));
+    assert!(side.contains(">gateway</span>"));
+    assert!(!side.contains(">mobile</span>"));
+
+    // Metadata edits replace the whole set, again from repeated fields.
+    let updated = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/metadata",
+            &[
+                ("csrf_token", &csrf),
+                ("assignee", ""),
+                ("milestone_id", ""),
+                ("labels", &gateway),
+                ("labels", &mobile),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::FOUND, "{}", updated.body);
+    let detail = send(&app, get("/r/alice/proj/issues/1", Some("alice"))).await;
+    let side = &detail.body[detail.body.find("<aside class=\"side\">").unwrap()..];
+    assert!(!side.contains(">bug</span>"));
+    assert!(side.contains(">gateway</span>"));
+    assert!(side.contains(">mobile</span>"));
+
+    // A single checked box still arrives as a scalar and keeps working.
+    let single = send(
+        &app,
+        post_form(
+            "/r/alice/proj/issues/1/metadata",
+            &[
+                ("csrf_token", &csrf),
+                ("assignee", ""),
+                ("milestone_id", ""),
+                ("labels", &bug),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(single.status, StatusCode::FOUND);
+    let detail = send(&app, get("/r/alice/proj/issues/1", Some("alice"))).await;
+    let side = &detail.body[detail.body.find("<aside class=\"side\">").unwrap()..];
+    assert!(side.contains(">bug</span>"));
+    assert!(!side.contains(">gateway</span>"));
+}

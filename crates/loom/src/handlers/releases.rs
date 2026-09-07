@@ -7,7 +7,8 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::{Form, Json};
+use axum::Json;
+use axum_extra::extract::Form;
 use serde::Deserialize;
 
 use crate::auth::{self, Identity};

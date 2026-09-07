@@ -19,6 +19,10 @@ odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/cairn/pastefire): Method/Path/State/Query extractors,
 # raw-body (Bytes) extraction for the git smart-HTTP packs, server-rendered HTML.
 axum = "0.8"
+# `axum_extra::extract::Form` (serde_html_form) accepts repeated keys (`labels=a&labels=b`) as a
+# sequence — plain `axum::Form` (serde_urlencoded) rejects them as a duplicate field, which broke
+# multi-label checkbox groups on the issue / pull-request forms.
+axum-extra = { version = "0.10", default-features = false, features = ["form"] }
 # Async runtime axum runs on. `process` spawns `git`/`git-http-backend` as async children (stdin
 # written concurrently with stdout read, so a large push never deadlocks the pipe); `io-util`
 # for AsyncWriteExt. The Store trait is async: handlers `.await` it directly and PgStore uses
