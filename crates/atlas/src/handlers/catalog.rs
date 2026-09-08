@@ -8,6 +8,7 @@
 //! RESILIENCE: the route table and Beacon are fetched independently; a failure of either degrades
 //! (a banner / "unavailable" pills) but NEVER errors the page.
 
+use crate::handlers::APP_CSS_PATH;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -101,11 +102,13 @@ pub async fn index(
     }
 
     let page = CATALOG_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{TOPBAR}}", &topbar("Catalog", &email, theme))
         .replace("{{BANNER}}", &banner)
         .replace("{{SUMMARY}}", &summary)
+        .replace("{{COUNT}}", &inv.services_total.to_string())
         .replace("{{SERVICES}}", &rows);
     Ok(Html(page).into_response())
 }
@@ -165,6 +168,7 @@ pub async fn detail(
     };
 
     let page = DETAIL_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{TOPBAR}}", &topbar("Service", &email, theme))
@@ -246,6 +250,7 @@ pub async fn graph(
 
     let svg = render_graph_svg(&inv);
     let page = GRAPH_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{TOPBAR}}", &topbar("Topology", &email, theme))
@@ -273,20 +278,34 @@ pub async fn api_inventory(
 // ---------------------------------------------------------------------------
 
 /// Compact survey provenance derived only from the assembled inventory.
+/// The six counters above the ledger. Each is a value under its name; the Beacon tile shows the
+/// online fraction, or an em dash when Beacon could not be reached — never a zero, which would
+/// read as "everything is down".
 fn render_cartouche(inv: &Inventory) -> String {
-    let online = if inv.beacon_reached {
-        format!("Beacon {} / {} online", inv.beacon_up, inv.beacon_total)
+    let (beacon_value, beacon_label) = if inv.beacon_reached {
+        (
+            format!("{} / {}", inv.beacon_up, inv.beacon_total),
+            "Beacon online",
+        )
     } else {
-        "Beacon status unavailable".to_string()
+        ("—".to_string(), "Beacon unreachable")
     };
     format!(
-        r#"<p class="survey__cartouche">Survey of {services} services · {routes} routes — {sso} SSO · {public} public · {bearer} bearer · {online}</p>"#,
+        r#"<div class="survey__cartouche stat-grid">
+  <div class="stat"><div class="stat__value">{services}</div><div class="stat__label">Services</div></div>
+  <div class="stat"><div class="stat__value">{routes}</div><div class="stat__label">Routes</div></div>
+  <div class="stat"><div class="stat__value">{sso}</div><div class="stat__label">SSO</div></div>
+  <div class="stat"><div class="stat__value">{public}</div><div class="stat__label">Public</div></div>
+  <div class="stat"><div class="stat__value">{bearer}</div><div class="stat__label">Bearer</div></div>
+  <div class="stat stat--accent"><div class="stat__value">{beacon_value}</div><div class="stat__label">{beacon_label}</div></div>
+</div>"#,
         services = inv.services_total,
         routes = inv.routes_total,
         sso = inv.sso_count,
         public = inv.public_count,
         bearer = inv.bearer_count,
-        online = esc(&online),
+        beacon_value = esc(&beacon_value),
+        beacon_label = beacon_label,
     )
 }
 

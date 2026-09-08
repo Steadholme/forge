@@ -18,7 +18,7 @@ use crate::inventory::auth_slug;
 /// Atlas-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/atlas-20260821.css";
+pub const APP_CSS_PATH: &str = "/assets/atlas-20260908.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 

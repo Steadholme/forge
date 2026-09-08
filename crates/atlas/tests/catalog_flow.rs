@@ -44,7 +44,13 @@ async fn full_catalog_flow_in_memory() {
     // --- catalog renders the discovered estate -----------------------------
     let (status, body) = call(&state, get_auth("/", "u_op", "op@hf")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Estate Catalog"));
+    assert!(body.contains("Estate catalog"));
+    // The handler emits <tr> rows; the template must supply the table around them, or the
+    // browser drops the row structure and reflows the cells.
+    assert!(
+        body.contains(r#"<table class="ledger">"#),
+        "ledger rows need their table"
+    );
     assert!(body.contains(&format!(r#"href="{}""#, atlas::handlers::APP_CSS_PATH)));
     // Demo seed groups by upstream service: inkwell, cellar, aperture, etc. are present.
     assert!(body.contains("inkwell"), "inkwell service discovered");
@@ -60,7 +66,7 @@ async fn full_catalog_flow_in_memory() {
     );
     assert!(body.contains("<tr class=\"ledger__row\""));
     assert!(body.contains("data-status=\"unavailable\""));
-    assert!(body.contains("class=\"survey__cartouche\""));
+    assert!(body.contains("class=\"survey__cartouche stat-grid\""));
     assert!(!body.contains("class=\"metrics\""));
     assert!(!body.contains("class=\"svc-card"));
     assert!(!body.contains("style=\"--abadge:"));

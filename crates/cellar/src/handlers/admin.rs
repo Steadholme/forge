@@ -14,6 +14,7 @@
 //! every manifest row and blob (metadata + bytes) that nothing live references, reporting the bytes
 //! freed. All producer-supplied text (repo names, digests) is HTML-escaped on render.
 
+use crate::handlers::APP_CSS_PATH;
 use std::collections::{HashMap, HashSet};
 
 use axum::extract::State;
@@ -340,13 +341,14 @@ fn render_admin(who: &Identity, view: &AdminView, csrf: &str, notice: &str) -> S
         )
     };
     ADMIN_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace(
             "{{USERBOX}}",
-            &userbox("Registry admin", Some(&who.email), who.theme),
+            &userbox("Admin", Some(&who.email), who.theme),
         )
         .replace("{{TABS}}", &admin_tabs("overview"))
         .replace("{{NOTICE}}", notice)

@@ -22,7 +22,7 @@ use axum::response::{Html, IntoResponse, Response};
 /// Cellar-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/cellar-20260821.css";
+pub const APP_CSS_PATH: &str = "/assets/cellar-20260908.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -211,24 +211,50 @@ fn user_menu(email: Option<&str>) -> String {
 /// The Odyssey v2 app-bar: a brand lockup (Cellar's package tile + wordmark), the Repositories nav,
 /// an "All apps" waffle to the apex portal, and the avatar menu. Shared by every page so the chrome
 /// stays identical across the estate. (`_title` is retained for a uniform signature.)
-pub fn userbox(_title: &str, email: Option<&str>, theme: &str) -> String {
+pub fn userbox(active: &str, email: Option<&str>, theme: &str) -> String {
     format!(
         r##"<a class="appbar__brand" href="/" aria-label="Steadholme Registry">
   <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg></span>
   <span class="appbar__name"><b>Cellar</b><span>registry.w33d.xyz</span></span>
 </a>
-<nav class="appbar__nav" aria-label="Cellar sections">
-  <a class="appnav is-active" href="/" data-wire-off><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12.83 2.18 8 4A2 2 0 0 1 22 8v8a2 2 0 0 1-1.17 1.82l-8 4a2 2 0 0 1-1.66 0l-8-4A2 2 0 0 1 2 16V8a2 2 0 0 1 1.17-1.82l8-4a2 2 0 0 1 1.66 0Z"/><path d="m7 5 10 5"/></svg>Repositories</a>
-</nav>
+<nav class="appbar__nav" aria-label="Cellar sections">{nav}</nav>
 <div class="appbar__spacer"></div>
 <div class="appbar__right">
   <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
   {switcher}
   {user}
 </div>"##,
+        nav = nav_pills(active),
         switcher = theme_switcher(theme),
         user = user_menu(email),
     )
+}
+
+/// The four console sections, in app-bar order. `active` is the page key the caller passes to
+/// [`userbox`]; an unknown key simply marks nothing, so a new page cannot light the wrong pill.
+pub const NAV: [(&str, &str); 4] = [
+    ("Repositories", "/"),
+    ("Admin", "/admin"),
+    ("Retention", "/retention"),
+    ("Robots", "/robots"),
+];
+
+fn nav_pills(active: &str) -> String {
+    NAV.iter()
+        .map(|(label, href)| {
+            format!(
+                r#"<a class="appnav{state}" href="{href}" data-wire-off{aria}>{label}</a>"#,
+                state = if *label == active { " is-active" } else { "" },
+                aria = if *label == active {
+                    r#" aria-current="page""#
+                } else {
+                    ""
+                },
+                href = href,
+                label = label,
+            )
+        })
+        .collect()
 }
 
 fn theme_switcher(current: &str) -> String {
@@ -267,10 +293,11 @@ pub fn render_error(
     email: Option<&str>,
 ) -> (StatusCode, Html<String>) {
     let body = ERROR_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr("light"))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta("light"))
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Registry", email, "light"))
+        .replace("{{USERBOX}}", &userbox("Repositories", email, "light"))
         .replace("{{STATUS}}", &status.as_u16().to_string())
         .replace("{{HEADING}}", &esc(heading))
         .replace("{{MESSAGE}}", &esc(message));

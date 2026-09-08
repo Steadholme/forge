@@ -5,31 +5,52 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="{{COLOR_SCHEME}}">
   <title>Catalog · Atlas · Steadholme</title>
-  <link rel="stylesheet" href="/assets/atlas-20260821.css">
+  <link rel="stylesheet" href="{{CSS_PATH}}">
 </head>
 <body class="page-console">
 {{TOPBAR}}
 <main class="console">
   <div class="console__head console__head--row">
     <div>
-      <h1>Estate Catalog</h1>
-      <p class="sub">Every public service in the Steadholme estate — discovered from the gateway route table, overlaid with live status and operator notes.</p>
+      <h1>Estate catalog</h1>
     </div>
     <div class="console__actions">
-      <a class="btn btn-secondary" href="/graph">Topology</a>
-      <a class="btn btn-ghost" href="/api/inventory">Inventory JSON</a>
+      <a class="btn btn-primary" href="/graph">Open topology</a>
+      <a class="btn btn-secondary" href="/api/inventory">Inventory JSON</a>
     </div>
   </div>
   {{BANNER}}
   {{SUMMARY}}
-  <div class="svc-grid">
-    {{SERVICES}}
-  </div>
+  <section class="card" aria-labelledby="services-h">
+    <div class="card__head"><h2 id="services-h">Services</h2><span class="card__count">{{COUNT}}</span></div>
+    <div class="table-scroll">
+      <table class="ledger">
+        <thead>
+          <tr>
+            <th class="ledger__status" scope="col">Status</th>
+            <th class="ledger__svc" scope="col">Service</th>
+            <th class="ledger__exposure" scope="col">Address</th>
+            <th class="ledger__auth" scope="col">Auth</th>
+            <th class="ledger__routes" scope="col">Routes</th>
+            <th class="ledger__owner" scope="col">Owner</th>
+            <th class="ledger__tier" scope="col">Tier</th>
+            <th class="ledger__notes" scope="col">Notes</th>
+            <th class="ledger__act" scope="col"><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{SERVICES}}
+        </tbody>
+      </table>
+    </div>
+  </section>
 </main>
 
-<footer class="site-foot">
-  <span>Steadholme · Atlas</span>
-  <span>Estate ops atlas · part of the Steadholme estate</span>
+<footer class="v2-foot">
+  <span class="v2-foot__lead">Steadholme · Atlas · atlas.w33d.xyz</span>
+  <a href="https://status.w33d.xyz">Status</a>
+  <a href="/api/inventory">Inventory JSON</a>
+  <a href="https://w33d.xyz">All apps</a>
 </footer>
 </body>
 </html>

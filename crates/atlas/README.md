@@ -52,3 +52,30 @@ a down Watchtower never blocks a request.
 CARGO_BUILD_JOBS=2 cargo check --all-targets
 cargo test
 ```
+
+## Frontend (v2, 2026-09-08)
+
+The catalog and topology follow the shared Steadholme v2 system implemented from
+the Figma file `WEvMEr2ipkzOquuSsGRG3d` (Atlas, cerulean accent).
+`/assets/atlas-20260908.css` is `crates/odyssey`'s canonical layer, then this
+crate's `static/service.css`; bump the date in `src/handlers/mod.rs` when the
+CSS changes.
+
+Two rendering bugs were fixed here, both pre-existing.
+
+The catalog handler emits `<tr class="ledger__row">` rows — its own comment says
+the template supplies the table — but the template wrapped them in a
+`<div class="svc-grid">`. A browser drops row structure that is not inside a
+table, so every cell reflowed into a two-column masonry and the catalog was
+unreadable. The template now supplies the table, its head and its column names,
+and `tests/catalog_flow.rs` asserts the table is there.
+
+The topology renderer emits `data-auth` on every edge and node so the diagram
+can be coloured by auth mode, and the legend inlines the four colours. Nothing
+styled `.gedge` or `.gnode__mark`, so the edges were invisible and every node
+painted default black. Those rules now live in the stylesheet, using the same
+hexes the legend inlines.
+
+The six counters above the ledger replaced the prose survey line. The Beacon
+tile shows an em dash when Beacon is unreachable, never a zero — a zero would
+read as "everything is down".

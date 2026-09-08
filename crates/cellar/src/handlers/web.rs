@@ -6,6 +6,7 @@
 //! delete a tag (the one state-changing web action, double-submit CSRF protected). All
 //! producer-supplied text (repo names, tags, media types, digests) is HTML-escaped on render.
 
+use crate::handlers::APP_CSS_PATH;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -326,6 +327,7 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
         n => format!("{n} repositories"),
     };
     INDEX_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace(
@@ -335,7 +337,7 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace(
             "{{USERBOX}}",
-            &userbox("Registry", Some(&who.email), who.theme),
+            &userbox("Repositories", Some(&who.email), who.theme),
         )
         .replace("{{HOST}}", &esc(host))
         .replace("{{COUNT}}", &esc(&count))
@@ -343,18 +345,23 @@ fn render_index(who: &Identity, repos: &[RepoSummary], host: &str) -> String {
         .replace("{{ROWS}}", &render_repo_rows(repos, host))
 }
 
+/// The four counters above the repository table: what the registry holds, and how much of the
+/// volume it occupies. Each is a value under its name — nothing here is a sentence.
 fn render_index_statbar(repos: &[RepoSummary]) -> String {
+    let images: i64 = repos.iter().map(|r| r.manifest_count).sum();
+    let tags: i64 = repos.iter().map(|r| r.tag_count).sum();
     let total_size: i64 = repos.iter().map(|r| r.total_size).sum();
-    let total_pulls: i64 = repos.iter().map(|r| r.pulls).sum();
     format!(
         "<div class=\"cl-statbar stat-grid\">\
-           <div class=\"stat\"><div class=\"stat__label\">Repositories</div><div class=\"stat__value\">{repos}</div></div>\
-           <div class=\"stat\"><div class=\"stat__label\">Total size</div><div class=\"stat__value\">{size}</div></div>\
-           <div class=\"stat\"><div class=\"stat__label\">Total pulls</div><div class=\"stat__value\">{pulls}</div></div>\
+           <div class=\"stat\"><div class=\"stat__value\">{repos}</div><div class=\"stat__label\">Repositories</div></div>\
+           <div class=\"stat\"><div class=\"stat__value\">{images}</div><div class=\"stat__label\">Images</div></div>\
+           <div class=\"stat stat--accent\"><div class=\"stat__value\">{tags}</div><div class=\"stat__label\">Tags</div></div>\
+           <div class=\"stat\"><div class=\"stat__value\">{size}</div><div class=\"stat__label\">Storage</div></div>\
          </div>",
         repos = repos.len(),
+        images = images,
+        tags = tags,
         size = esc(&human_size(total_size)),
-        pulls = total_pulls,
     )
 }
 
@@ -439,6 +446,7 @@ fn render_repo(
     let sample_tag = tags.first().map(|t| t.tag.as_str()).unwrap_or("latest");
     let pull_cmd = format!("docker pull {host}/{name}:{sample_tag}");
     REPO_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace(
@@ -449,7 +457,7 @@ fn render_repo(
         .replace("{{LAYERS}}", LAYERS_SVG)
         .replace(
             "{{USERBOX}}",
-            &userbox("Registry", Some(&who.email), who.theme),
+            &userbox("Repositories", Some(&who.email), who.theme),
         )
         .replace("{{NAME}}", &esc(name))
         .replace("{{COUNT}}", &esc(&count))
@@ -584,6 +592,7 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
         digest = v.digest
     );
     MANIFEST_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace(
@@ -594,7 +603,7 @@ fn render_manifest(who: &Identity, v: &ManifestView, host: &str) -> String {
         .replace("{{LAYERS}}", LAYERS_SVG)
         .replace(
             "{{USERBOX}}",
-            &userbox("Registry", Some(&who.email), who.theme),
+            &userbox("Repositories", Some(&who.email), who.theme),
         )
         .replace("{{SUBTITLE}}", &esc(&subtitle))
         .replace("{{PULL_CMD}}", &esc(&pull_cmd))

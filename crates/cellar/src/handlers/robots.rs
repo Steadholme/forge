@@ -9,6 +9,7 @@
 //! Gated by [`auth::require_admin`]; every state-changing POST is double-submit CSRF checked. All
 //! producer-supplied text (names, patterns) is HTML-escaped on render.
 
+use crate::handlers::APP_CSS_PATH;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -249,12 +250,13 @@ fn render(
         n => format!("{n} robots"),
     };
     ROBOTS_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace(
             "{{USERBOX}}",
-            &userbox("Registry admin", Some(&who.email), who.theme),
+            &userbox("Robots", Some(&who.email), who.theme),
         )
         .replace("{{TABS}}", &admin_tabs("robots"))
         .replace("{{NOTICE}}", notice)

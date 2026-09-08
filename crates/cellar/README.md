@@ -86,3 +86,22 @@ docker pull registry.w33d.xyz/alpine:latest
 - `DELETE /v2/.../manifests|blobs` 协议删除（可选；改由 Web 控制台删 tag 替代）。
 - Helm chart / 超出镜像范围的 OCI artifact、manifest list/index 的深度校验、`tags`/`_catalog`
   分页。
+
+## Frontend (v2, 2026-09-08)
+
+The console follows the shared Steadholme v2 system implemented from the Figma
+file `wogB7QkRqo0LZ8CF8b8sjs` (Cellar, indigo accent). `/assets/cellar-20260908.css`
+is `crates/odyssey`'s canonical layer, then this crate's `static/service.css`;
+bump the date in `src/handlers/mod.rs` when the CSS changes. Every template
+fills `{{CSS_PATH}}` from that constant.
+
+`static/service.css` is generated: the v2 kit base, then this crate's own layer
+unchanged, then a short retint. The layer carries its own bronze accent (and a
+dark remap of it), so the indigo the design calls for is re-pointed after it —
+before it, the layer would win.
+
+The app bar carries all four console sections (Repositories, Admin, Retention,
+Robots); each page passes its own key to `userbox`, and an unknown key lights
+nothing. The counters above the table are Repositories, Images, Tags and
+Storage, matching the design. The eyebrow and the intro paragraph are gone: the
+page title names the page and the command strip states the endpoint.

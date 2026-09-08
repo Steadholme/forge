@@ -12,6 +12,7 @@
 //! through the shared GC sweep ([`crate::handlers::admin::run_gc`]), auditing the result. All
 //! producer-supplied text (patterns, repos, tags) is HTML-escaped on render.
 
+use crate::handlers::APP_CSS_PATH;
 use std::collections::HashSet;
 
 use axum::extract::State;
@@ -402,12 +403,13 @@ fn render(
         n => format!("{n} rules"),
     };
     RETENTION_HTML
+        .replace("{{CSS_PATH}}", APP_CSS_PATH)
         .replace("{{THEME}}", odyssey::html_theme_attr(who.theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(who.theme))
         .replace("{{JS}}", &format!("{}\n{}", odyssey::MOTION_JS, APP_JS))
         .replace(
             "{{USERBOX}}",
-            &userbox("Registry admin", Some(&who.email), who.theme),
+            &userbox("Retention", Some(&who.email), who.theme),
         )
         .replace("{{TABS}}", &admin_tabs("retention"))
         .replace("{{NOTICE}}", notice)
