@@ -290,16 +290,18 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light dark">
 <title>{code} {reason} · Atlas</title><link rel="stylesheet" href="{css_path}"></head>
-<body class="page-reading">
+<body class="page-v2">
 {topbar}
-<main class="reader">
-  <div class="error-card">
-    <div class="error-card__code">{code}</div>
-    <h1 class="error-card__title">{reason}</h1>
-    <p class="error-card__msg">{msg}</p>
+<main class="v2-page" id="main" tabindex="-1">
+  <div class="status-wrap">
+   <div class="status-tile">
+    <div class="status-tile__code">{code}</div>
+    <h1 class="status-tile__heading">{reason}</h1>
+    <p class="status-tile__detail">{msg}</p>
     <a class="btn btn-primary" href="/">Back to the catalog</a>
+   </div>
   </div>
 </main>
 <footer class="site-foot">
