@@ -22,7 +22,7 @@ use axum::response::{Html, IntoResponse, Response};
 /// Cellar-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/cellar-20260908.css";
+pub const APP_CSS_PATH: &str = "/assets/cellar-20260909.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -213,14 +213,15 @@ fn user_menu(email: Option<&str>) -> String {
 /// stays identical across the estate. (`_title` is retained for a uniform signature.)
 pub fn userbox(active: &str, email: Option<&str>, theme: &str) -> String {
     format!(
-        r##"<a class="appbar__brand" href="/" aria-label="Steadholme Registry">
-  <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg></span>
-  <span class="appbar__name"><b>Cellar</b><span>registry.w33d.xyz</span></span>
+        r##"<a class="suitebar__brand" href="/" aria-label="Steadholme Registry">
+  <span class="brand-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 9.4 7.5 4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg></span>
+  <span class="suitebar__name"><b>Steadholme</b><span>Container registry</span></span>
 </a>
-<nav class="appbar__nav" aria-label="Cellar sections">{nav}</nav>
-<div class="appbar__spacer"></div>
-<div class="appbar__right">
-  <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+<span class="suitebar__host">registry.w33d.xyz</span>
+<nav class="surfaces" aria-label="Cellar pages">{nav}</nav>
+<span class="suitebar__spacer"></span>
+<div class="suitebar__right">
+  <a class="allapps" href="https://w33d.xyz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>All apps</span></a>
   {switcher}
   {user}
 </div>"##,
@@ -243,7 +244,7 @@ fn nav_pills(active: &str) -> String {
     NAV.iter()
         .map(|(label, href)| {
             format!(
-                r#"<a class="appnav{state}" href="{href}" data-wire-off{aria}>{label}</a>"#,
+                r#"<a class="surf{state}" href="{href}" data-wire-off{aria}>{label}</a>"#,
                 state = if *label == active { " is-active" } else { "" },
                 aria = if *label == active {
                     r#" aria-current="page""#

@@ -7,12 +7,13 @@
   <title>Admin · Cellar · Steadholme</title>
   <link rel="stylesheet" href="{{CSS_PATH}}">
 </head>
-<body class="page-console">
-  <header class="appbar">{{USERBOX}}</header>
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to main content</a>
+  <header class="suitebar">{{USERBOX}}</header>
 
-  <main class="console">
-    <div class="console__head console__head--row">
-      <div>
+  <main class="v2-page" id="main" tabindex="-1">
+    <div class="pagehead">
+      <div class="pagehead__titles">
         <h1>Registry administration</h1>
         <p class="sub">Storage accounting for every repository, and garbage collection to reclaim
           disk from untagged and orphaned images.</p>

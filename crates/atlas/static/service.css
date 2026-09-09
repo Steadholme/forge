@@ -479,3 +479,15 @@
 .ghub__ring { stroke:var(--accent); stroke-width:2; }
 :root[data-theme="dark"] .gedge { opacity:.6; }
 :root[data-theme="dark"] .gnode__mark { stroke:var(--surface); }
+
+/* Odyssey provides no skip link; the v2 shell expects one. */
+.skip-link {
+  position:absolute; left:8px; top:-48px; z-index:100;
+  display:inline-flex; align-items:center; height:36px; padding:0 14px;
+  border-radius:var(--r-sm,8px); background:var(--surface); color:var(--ink);
+  border:1px solid var(--border-2); font-size:13px; font-weight:600;
+  text-decoration:none; transition:top .12s ease;
+}
+.skip-link:focus { top:8px; outline:2px solid var(--accent); outline-offset:2px; }
+/* The old console container must not re-assert its width inside .v2-page. */
+.page-v2 .console { max-width:none; padding:0; }

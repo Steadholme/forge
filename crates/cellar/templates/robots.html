@@ -7,12 +7,13 @@
   <title>Robot accounts · Cellar · Steadholme</title>
   <link rel="stylesheet" href="{{CSS_PATH}}">
 </head>
-<body class="page-console">
-  <header class="appbar">{{USERBOX}}</header>
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to main content</a>
+  <header class="suitebar">{{USERBOX}}</header>
 
-  <main class="console">
-    <div class="console__head console__head--row">
-      <div>
+  <main class="v2-page" id="main" tabindex="-1">
+    <div class="pagehead">
+      <div class="pagehead__titles">
         <h1>Robot accounts</h1>
         <p class="sub">Machine credentials for <code>docker login</code>, scoped to <b>pull</b> or
           <b>push + pull</b> on matching repositories. They are an additional credential alongside the

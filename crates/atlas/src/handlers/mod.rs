@@ -18,7 +18,7 @@ use crate::inventory::auth_slug;
 /// Atlas-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/atlas-20260908.css";
+pub const APP_CSS_PATH: &str = "/assets/atlas-20260909.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -127,28 +127,29 @@ fn user_menu(email: &str) -> String {
 pub fn topbar(page_title: &str, email: &str, theme: &str) -> String {
     let topology_active = page_title == "Topology";
     let catalog_cls = if topology_active {
-        "appnav"
+        "surf"
     } else {
-        "appnav is-active"
+        "surf is-active"
     };
     let topology_cls = if topology_active {
-        "appnav is-active"
+        "surf is-active"
     } else {
-        "appnav"
+        "surf"
     };
     format!(
-        r##"<header class="appbar">
-  <a class="appbar__brand" href="/" aria-label="Steadholme Atlas">
-    <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span>
-    <span class="appbar__name"><b>Atlas</b><span>atlas.w33d.xyz</span></span>
+        r##"<header class="suitebar">
+  <a class="suitebar__brand" href="/" aria-label="Steadholme Atlas">
+    <span class="brand-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span>
+    <span class="suitebar__name"><b>Steadholme</b><span>Estate inventory</span></span>
   </a>
-  <nav class="appbar__nav" aria-label="Atlas sections">
+  <span class="suitebar__host">atlas.w33d.xyz</span>
+  <nav class="surfaces" aria-label="Atlas pages">
     <a class="{catalog_cls}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Catalog</a>
     <a class="{topology_cls}" href="/graph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>Topology</a>
   </nav>
-  <div class="appbar__spacer"></div>
-  <div class="appbar__right">
-    <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+  <span class="suitebar__spacer"></span>
+  <div class="suitebar__right">
+    <a class="allapps" href="https://w33d.xyz"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>All apps</span></a>
     {switcher}
     {user}
   </div>
